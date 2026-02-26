@@ -203,7 +203,40 @@ Diagnostics::BaseReadParameters ()
         m_varnames_fields.clear();
     }
 
-    m_varnames = m_varnames_fields;
+    // Expand P_ entries into 6 pressure tensor components in m_varnames.
+    // m_varnames_fields retains the single "P_species" entry (one functor slot),
+    // while m_varnames has 6 entries (Pxx_, Pxy_, Pxz_, Pyy_, Pyz_, Pzz_).
+    // Also validate species names and store species indices for P_ entries.
+    {
+        amrex::Vector<std::string> expanded_varnames;
+        for (const auto& f : m_varnames_fields) {
+            if (f.rfind("P_", 0) == 0) {
+                const std::string sp = f.substr(2);
+                // Validate species name
+                bool species_name_is_wrong = true;
+                for (int i = 0, n = int(m_all_species_names.size()); i < n; i++) {
+                    if (sp == m_all_species_names[i]) {
+                        m_P_per_species_index.push_back(i);
+                        species_name_is_wrong = false;
+                    }
+                }
+                WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
+                    !species_name_is_wrong,
+                    "Input error: string " + f + " in " + m_diag_name
+                    + ".fields_to_plot does not match any species"
+                );
+                expanded_varnames.push_back("Pxx_" + sp);
+                expanded_varnames.push_back("Pxy_" + sp);
+                expanded_varnames.push_back("Pxz_" + sp);
+                expanded_varnames.push_back("Pyy_" + sp);
+                expanded_varnames.push_back("Pyz_" + sp);
+                expanded_varnames.push_back("Pzz_" + sp);
+            } else {
+                expanded_varnames.push_back(f);
+            }
+        }
+        m_varnames = expanded_varnames;
+    }
     // Generate names of averaged particle fields and append to m_varnames
     for (const auto& fname : m_pfield_varnames) {
         for (const auto& sname : m_pfield_species) {
