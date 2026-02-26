@@ -2033,6 +2033,138 @@ WarpXParticleContainer::GetAverageNGPTemperature (int lev)
     return temperature;
 }
 
+void
+WarpXParticleContainer::DepositNGPPressureTensor (amrex::MultiFab* ptensor, const int lev)
+{
+
+    WARPX_ALWAYS_ASSERT_WITH_MESSAGE(m_mass > 0.,
+        "The pressure tensor can not be calculated for a massless species.");
+
+    // Temporary cell-centered, multi-component MultiFab for storing particle sums
+    // comp 0: sum(w), comp 1: sum(w*ux), comp 2: sum(w*uy), comp 3: sum(w*uz)
+    int const sum_comps = 4;
+    amrex::MultiFab sum_mf(ptensor->boxArray(), ptensor->DistributionMap(), sum_comps, ptensor->nGrowVect());
+    sum_mf.setVal(0., 0, sum_comps, sum_mf.nGrowVect());
+
+    // Pass 1: Calculate the average velocity <u> per cell
+    ParticleToMesh(*this, sum_mf, lev,
+            [=] AMREX_GPU_DEVICE (const WarpXParticleContainer::SuperParticleType& p,
+                amrex::Array4<amrex::Real> const& sum_array,
+                amrex::GpuArray<amrex::Real,AMREX_SPACEDIM> const& plo,
+                amrex::GpuArray<amrex::Real,AMREX_SPACEDIM> const& dxi)
+            {
+                const auto [ii, jj, kk] = amrex::getParticleCell(p, plo, dxi).dim3();
+
+                amrex::ParticleReal const w  = p.rdata(PIdx::w);
+                amrex::ParticleReal const ux = p.rdata(PIdx::ux);
+                amrex::ParticleReal const uy = p.rdata(PIdx::uy);
+                amrex::ParticleReal const uz = p.rdata(PIdx::uz);
+                amrex::Gpu::Atomic::AddNoRet(&sum_array(ii, jj, kk, 0), (amrex::Real)(w));
+                amrex::Gpu::Atomic::AddNoRet(&sum_array(ii, jj, kk, 1), (amrex::Real)(w*ux));
+                amrex::Gpu::Atomic::AddNoRet(&sum_array(ii, jj, kk, 2), (amrex::Real)(w*uy));
+                amrex::Gpu::Atomic::AddNoRet(&sum_array(ii, jj, kk, 3), (amrex::Real)(w*uz));
+            });
+
+    // Divide by total weight to get mean velocities
+#ifdef AMREX_USE_OMP
+#pragma omp parallel if (amrex::Gpu::notInLaunchRegion())
+#endif
+    for (amrex::MFIter mfi(sum_mf, amrex::TilingIfNotGPU()); mfi.isValid(); ++mfi)
+    {
+        const amrex::Box& box = mfi.tilebox();
+        amrex::Array4<amrex::Real> const& sum_array = sum_mf.array(mfi);
+        amrex::ParallelFor(box,
+                [=] AMREX_GPU_DEVICE (int i, int j, int k) {
+                    if (sum_array(i,j,k,0) > 0) {
+                        const amrex::Real invsum = 1._rt/sum_array(i,j,k,0);
+                        sum_array(i,j,k,1) *= invsum;
+                        sum_array(i,j,k,2) *= invsum;
+                        sum_array(i,j,k,3) *= invsum;
+                    }
+                });
+    }
+
+    // Pass 2: Calculate the 6 tensor components sum(w * du_i * du_j)
+    // ptensor has 6 components: xx, xy, xz, yy, yz, zz
+    const auto plo = Geom(lev).ProbLoArray();
+    const auto dxi = Geom(lev).InvCellSizeArray();
+#ifdef AMREX_USE_OMP
+#pragma omp parallel if (amrex::Gpu::notInLaunchRegion())
+#endif
+    for (WarpXParIter pti(*this, lev); pti.isValid(); ++pti)
+    {
+        const long np = pti.numParticles();
+        auto& tile = pti.GetParticleTile();
+        auto ptd = tile.getParticleTileData();
+        amrex::ParticleReal* wp = pti.GetAttribs(PIdx::w).dataPtr();
+        amrex::ParticleReal* uxp = pti.GetAttribs(PIdx::ux).dataPtr();
+        amrex::ParticleReal* uyp = pti.GetAttribs(PIdx::uy).dataPtr();
+        amrex::ParticleReal* uzp = pti.GetAttribs(PIdx::uz).dataPtr();
+
+        amrex::Array4<amrex::Real> const& sum_array = sum_mf.array(pti);
+        amrex::Array4<amrex::Real> const& pt_array = ptensor->array(pti);
+
+        amrex::ParallelFor(np,
+            [=] AMREX_GPU_DEVICE (long ip) {
+                const auto p = WarpXParticleContainer::ParticleType(ptd, ip);
+                const auto [ii, jj, kk] = getParticleCell(p, plo, dxi).dim3();
+
+                const amrex::ParticleReal w  = wp[ip];
+                const amrex::ParticleReal dux = uxp[ip] - sum_array(ii, jj, kk, 1);
+                const amrex::ParticleReal duy = uyp[ip] - sum_array(ii, jj, kk, 2);
+                const amrex::ParticleReal duz = uzp[ip] - sum_array(ii, jj, kk, 3);
+
+                amrex::Gpu::Atomic::AddNoRet(&pt_array(ii, jj, kk, 0), (amrex::Real)(w*dux*dux)); // xx
+                amrex::Gpu::Atomic::AddNoRet(&pt_array(ii, jj, kk, 1), (amrex::Real)(w*dux*duy)); // xy
+                amrex::Gpu::Atomic::AddNoRet(&pt_array(ii, jj, kk, 2), (amrex::Real)(w*dux*duz)); // xz
+                amrex::Gpu::Atomic::AddNoRet(&pt_array(ii, jj, kk, 3), (amrex::Real)(w*duy*duy)); // yy
+                amrex::Gpu::Atomic::AddNoRet(&pt_array(ii, jj, kk, 4), (amrex::Real)(w*duy*duz)); // yz
+                amrex::Gpu::Atomic::AddNoRet(&pt_array(ii, jj, kk, 5), (amrex::Real)(w*duz*duz)); // zz
+            });
+    }
+
+    // Finalize: divide by sum(w) and multiply by mass/q_e to get eV
+    amrex::ParticleReal mass = m_mass;
+#ifdef AMREX_USE_OMP
+#pragma omp parallel if (amrex::Gpu::notInLaunchRegion())
+#endif
+    for (amrex::MFIter mfi(sum_mf, amrex::TilingIfNotGPU()); mfi.isValid(); ++mfi)
+    {
+        const amrex::Box& box = mfi.tilebox();
+        amrex::Array4<amrex::Real> const& sum_array = sum_mf.array(mfi);
+        amrex::Array4<amrex::Real> const& pt_array = ptensor->array(mfi);
+        amrex::ParallelFor(box,
+            [=] AMREX_GPU_DEVICE (int i, int j, int k) {
+                if (sum_array(i,j,k,0) > 0) {
+                    const amrex::Real invsum = 1._rt/sum_array(i,j,k,0);
+                    const amrex::Real factor = mass*invsum/PhysConst::q_e;
+                    for (int comp = 0; comp < 6; ++comp) {
+                        pt_array(i,j,k,comp) *= factor;
+                    }
+                }
+            });
+    }
+
+}
+
+std::unique_ptr<amrex::MultiFab>
+WarpXParticleContainer::GetAverageNGPPressureTensor (int lev)
+{
+    auto const& ba = m_gdb->ParticleBoxArray(lev);
+    auto const& dm = m_gdb->DistributionMap(lev);
+
+    int const ncomps = 6;
+    int const ng = 0;
+    auto ptensor = std::make_unique<amrex::MultiFab>(ba, dm, ncomps, ng);
+    ptensor->setVal(0., 0, ncomps, ptensor->nGrowVect());
+
+    if (m_mass > 0.) {
+        DepositNGPPressureTensor(ptensor.get(), lev);
+    }
+
+    return ptensor;
+}
+
 /* \brief Calculate number density from the particles
  * \param number_density Full array of number density
  * \param lev         Level of box that contains particles
