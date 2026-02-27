@@ -373,6 +373,9 @@ public:
     void DepositNGPPressureTensor (amrex::MultiFab* ptensor, const int lev);
     std::unique_ptr<amrex::MultiFab> GetAverageNGPPressureTensor (int lev);
 
+    void DepositNGPHeatFlux (amrex::MultiFab* heatflux, const int lev);
+    std::unique_ptr<amrex::MultiFab> GetAverageNGPHeatFlux (int lev);
+
     void DepositNumberDensity (amrex::MultiFab* number_density, const int lev);
     std::unique_ptr<amrex::MultiFab> GetNumberDensity (int lev);
 
