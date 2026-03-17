@@ -693,6 +693,9 @@ void WarpX::HandleParticlesAtBoundaries (int step, amrex::Real cur_time, int num
         m_particle_boundary_buffer->gatherParticlesFromEmbeddedBoundaries(
             *mypc, m_fields.get_mr_levels(FieldType::distance_to_eb, finest_level));
         mypc->deleteInvalidParticles();
+        if (eb_particle_boundary == ParticleBoundaryType::Reflecting) {
+            mypc->Redistribute();
+        }
     }
 
     if (sort_intervals.contains(step+1)) {
