@@ -2123,24 +2123,24 @@ WarpXParticleContainer::DepositNGPPressureTensor (amrex::MultiFab* ptensor, cons
             });
     }
 
-    // Finalize: divide by sum(w) and multiply by mass/q_e to get eV
+    // Finalize: divide by cell volume and multiply by mass to get pressure in Pa
     amrex::ParticleReal mass = m_mass;
+    const amrex::Real inv_cell_volume = 1._rt / (AMREX_D_TERM(
+        Geom(lev).CellSize(0),
+        * Geom(lev).CellSize(1),
+        * Geom(lev).CellSize(2)));
 #ifdef AMREX_USE_OMP
 #pragma omp parallel if (amrex::Gpu::notInLaunchRegion())
 #endif
     for (amrex::MFIter mfi(sum_mf, amrex::TilingIfNotGPU()); mfi.isValid(); ++mfi)
     {
         const amrex::Box& box = mfi.tilebox();
-        amrex::Array4<amrex::Real> const& sum_array = sum_mf.array(mfi);
         amrex::Array4<amrex::Real> const& pt_array = ptensor->array(mfi);
         amrex::ParallelFor(box,
             [=] AMREX_GPU_DEVICE (int i, int j, int k) {
-                if (sum_array(i,j,k,0) > 0) {
-                    const amrex::Real invsum = 1._rt/sum_array(i,j,k,0);
-                    const amrex::Real factor = mass*invsum/PhysConst::q_e;
-                    for (int comp = 0; comp < 6; ++comp) {
-                        pt_array(i,j,k,comp) *= factor;
-                    }
+                const amrex::Real factor = mass * inv_cell_volume;
+                for (int comp = 0; comp < 6; ++comp) {
+                    pt_array(i,j,k,comp) *= factor;
                 }
             });
     }

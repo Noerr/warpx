@@ -9,11 +9,11 @@
  * \brief Functor to calculate per-cell pressure tensor from particle data.
  *
  * Computes the 6 independent components of the symmetric pressure tensor
- * P_ij = mass * <(u_i - <u_i>)(u_j - <u_j>)> / q_e  [eV]
- * where u = gamma*v is the 4-velocity / c.
+ * P_ij = n * mass * <(u_i - <u_i>)(u_j - <u_j>)>  [Pa]
+ * where u = gamma*v is the 4-velocity, n is the number density,
+ * and the average is weighted over macro-particles in each cell.
  *
  * Output components (in order): Pxx, Pxy, Pxz, Pyy, Pyz, Pzz
- * The trace (Pxx + Pyy + Pzz) / 3 equals the scalar temperature T.
  */
 class PressureTensorFunctor final : public ComputeDiagFunctor
 {
