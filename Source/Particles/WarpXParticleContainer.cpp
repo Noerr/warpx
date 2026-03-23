@@ -2253,24 +2253,24 @@ WarpXParticleContainer::DepositNGPHeatFlux (amrex::MultiFab* heatflux, const int
             });
     }
 
-    // Finalize: divide by sum(w) and multiply by mass/(2*q_e) to get eV * c
+    // Finalize: divide by cell volume and multiply by mass/2 to get heat flux in W/m^2
     amrex::ParticleReal mass = m_mass;
+    const amrex::Real inv_cell_volume = 1._rt / (AMREX_D_TERM(
+        Geom(lev).CellSize(0),
+        * Geom(lev).CellSize(1),
+        * Geom(lev).CellSize(2)));
 #ifdef AMREX_USE_OMP
 #pragma omp parallel if (amrex::Gpu::notInLaunchRegion())
 #endif
     for (amrex::MFIter mfi(sum_mf, amrex::TilingIfNotGPU()); mfi.isValid(); ++mfi)
     {
         const amrex::Box& box = mfi.tilebox();
-        amrex::Array4<amrex::Real> const& sum_array = sum_mf.array(mfi);
         amrex::Array4<amrex::Real> const& hf_array = heatflux->array(mfi);
         amrex::ParallelFor(box,
             [=] AMREX_GPU_DEVICE (int i, int j, int k) {
-                if (sum_array(i,j,k,0) > 0) {
-                    const amrex::Real invsum = 1._rt/sum_array(i,j,k,0);
-                    const amrex::Real factor = mass*invsum/(2._rt*PhysConst::q_e);
-                    for (int comp = 0; comp < 3; ++comp) {
-                        hf_array(i,j,k,comp) *= factor;
-                    }
+                const amrex::Real factor = mass * inv_cell_volume / 2._rt;
+                for (int comp = 0; comp < 3; ++comp) {
+                    hf_array(i,j,k,comp) *= factor;
                 }
             });
     }

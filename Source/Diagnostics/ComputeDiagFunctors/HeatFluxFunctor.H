@@ -9,8 +9,9 @@
  * \brief Functor to calculate per-cell heat flux vector from particle data.
  *
  * Computes the 3 components of the heat flux vector
- * Q_i = (mass / 2) * <|u - <u>|^2 * (u_i - <u_i>)> / q_e  [eV * c]
- * where u = gamma*v is the 4-velocity.
+ * Q_i = (n * mass / 2) * <|u - <u>|^2 * (u_i - <u_i>)>  [W/m^2]
+ * where u = gamma*v is the 4-velocity, n is the number density,
+ * and the average is weighted over macro-particles in each cell.
  *
  * Output components (in order): Qx, Qy, Qz
  */
