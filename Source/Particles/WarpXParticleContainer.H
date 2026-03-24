@@ -415,6 +415,18 @@ public:
     void DepositTotalNGPTemperature (int lev);
     void CalculateNuei(amrex::MultiFab & species_nuei,
                        WarpXParticleContainer const & electron_species, int lev);
+    void DepositTotalNGPTemperature (amrex::MultiFab* temperature, const int lev);
+    std::unique_ptr<amrex::MultiFab> GetAverageNGPTemperature (int lev);
+
+    void DepositNGPPressureTensor (amrex::MultiFab* ptensor, const int lev);
+    std::unique_ptr<amrex::MultiFab> GetAverageNGPPressureTensor (int lev);
+
+    void DepositNGPHeatFlux (amrex::MultiFab* heatflux, const int lev);
+    std::unique_ptr<amrex::MultiFab> GetAverageNGPHeatFlux (int lev);
+
+    void DepositNumberDensity (amrex::MultiFab* number_density, const int lev);
+    std::unique_ptr<amrex::MultiFab> GetNumberDensity (int lev);
+
     std::unique_ptr<amrex::MultiFab> GetDebyeLength (int lev);
 
     void DepositNumberDensity (amrex::MultiFab* number_density, int lev);
