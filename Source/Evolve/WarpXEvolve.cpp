@@ -170,6 +170,10 @@ WarpX::Evolve (int numsteps)
         ABLASTR_PROFILE("WarpX::Evolve::step");
         const auto evolve_time_beg_step = static_cast<Real>(amrex::second());
 
+        // Timer-based self-signal (env-var-driven). May call std::raise on
+        // rank 0 to set the same flags an external signal would have set.
+        SignalHandling::CheckTimers();
+
         // Check and clear signal flags and asynchronously broadcast them from process 0
         SignalHandling::CheckSignals();
 
