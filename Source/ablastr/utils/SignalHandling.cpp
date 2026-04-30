@@ -10,8 +10,12 @@
 
 #include <AMReX_ParallelDescriptor.H>
 #include <AMReX_IParser.H>
+#include <AMReX_Print.H>
+#include <AMReX_Utility.H>
 
 #include <cctype>
+#include <cstdlib>
+#include <limits>
 
 // For sigaction() et al.
 #if defined(__linux__) || defined(__APPLE__)
@@ -27,6 +31,15 @@ bool SignalHandling::signal_actions_requested[SIGNAL_REQUESTS_SIZE];
 #if defined(AMREX_USE_MPI)
 MPI_Request SignalHandling::signal_mpi_ibcast_request;
 #endif
+
+// Timer-based self-signaling state (rank 0 only).
+double SignalHandling::m_timer_wall_start = 0.0;
+int    SignalHandling::m_timer_break_after_seconds = -1;
+int    SignalHandling::m_timer_checkpoint_every_seconds = -1;
+int    SignalHandling::m_timer_break_signal = -1;
+int    SignalHandling::m_timer_checkpoint_signal = -1;
+bool   SignalHandling::m_timer_break_fired = false;
+double SignalHandling::m_timer_next_checkpoint_at = 0.0;
 
 int
 SignalHandling::parseSignalNameToNumber (const std::string &str)
@@ -206,6 +219,139 @@ void
 SignalHandling::SignalSetFlag (int signal_number)
 {
     signal_received_flags[signal_number] = true;
+}
+
+void
+SignalHandling::InitTimers ()
+{
+#if defined(__linux__) || defined(__APPLE__)
+    // Timer state lives only on rank 0 — that is the only rank with a real
+    // signal handler installed. Other ranks have no work to do here and
+    // CheckTimers() will short-circuit on them.
+    if (amrex::ParallelDescriptor::MyProc() != 0) {
+        return;
+    }
+
+    // Helper: parse env var to non-negative int. Returns -1 if unset, empty,
+    // or invalid (with a warning in the latter case).
+    auto read_env_int = [] (const char* name) -> int {
+        const char* val = std::getenv(name);
+        if (val == nullptr || val[0] == '\0') {
+            return -1;
+        }
+        char* end = nullptr;
+        const long n = std::strtol(val, &end, 10);
+        if (end == val || *end != '\0' || n < 0
+            || n > std::numeric_limits<int>::max())
+        {
+            amrex::Print() << "[Self-signal timer] WARNING: " << name << "="
+                           << val << " is not a valid non-negative integer; "
+                           << "ignoring.\n";
+            return -1;
+        }
+        return static_cast<int>(n);
+    };
+
+    m_timer_break_after_seconds      = read_env_int("WARPX_BREAK_AFTER_SECONDS");
+    m_timer_checkpoint_every_seconds = read_env_int("WARPX_CHECKPOINT_EVERY_SECONDS");
+
+    // Helper: find the first signal number (1..NUM_SIGNALS-1) that is
+    // configured to trigger the given action. Returns -1 if none.
+    auto first_signal = [] (int action) -> int {
+        for (int sig = 1; sig < NUM_SIGNALS; ++sig) {
+            if (signal_conf_requests[action][sig]) { return sig; }
+        }
+        return -1;
+    };
+
+    if (m_timer_break_after_seconds >= 0) {
+        m_timer_break_signal = first_signal(SIGNAL_REQUESTS_BREAK);
+        if (m_timer_break_signal < 0) {
+            amrex::Print() << "[Self-signal timer] WARNING: "
+                           << "WARPX_BREAK_AFTER_SECONDS="
+                           << m_timer_break_after_seconds
+                           << " is set, but warpx.break_signals is empty — "
+                           << "disabling break timer.\n";
+            m_timer_break_after_seconds = -1;
+        } else {
+            amrex::Print() << "[Self-signal timer] "
+                           << "WARPX_BREAK_AFTER_SECONDS="
+                           << m_timer_break_after_seconds
+                           << " mapped to signal " << m_timer_break_signal
+                           << "\n";
+        }
+    }
+
+    if (m_timer_checkpoint_every_seconds >= 0) {
+        m_timer_checkpoint_signal = first_signal(SIGNAL_REQUESTS_CHECKPOINT);
+        if (m_timer_checkpoint_signal < 0) {
+            amrex::Print() << "[Self-signal timer] WARNING: "
+                           << "WARPX_CHECKPOINT_EVERY_SECONDS="
+                           << m_timer_checkpoint_every_seconds
+                           << " is set, but warpx.checkpoint_signals is empty"
+                           << " — disabling checkpoint timer.\n";
+            m_timer_checkpoint_every_seconds = -1;
+        } else {
+            amrex::Print() << "[Self-signal timer] "
+                           << "WARPX_CHECKPOINT_EVERY_SECONDS="
+                           << m_timer_checkpoint_every_seconds
+                           << " mapped to signal "
+                           << m_timer_checkpoint_signal << "\n";
+        }
+    }
+
+    // Anchor wall-time start; first checkpoint fires at +interval (relative).
+    m_timer_wall_start = amrex::second();
+    m_timer_next_checkpoint_at =
+        static_cast<double>(m_timer_checkpoint_every_seconds);
+    m_timer_break_fired = false;
+#endif
+}
+
+void
+SignalHandling::CheckTimers ()
+{
+#if defined(__linux__) || defined(__APPLE__)
+    // Rank 0 only. Other ranks pick up the action via the existing per-step
+    // MPI_Ibcast inside CheckSignals().
+    if (amrex::ParallelDescriptor::MyProc() != 0) {
+        return;
+    }
+    // Cheap fast-path when both timers are disabled (the common case).
+    if (m_timer_break_after_seconds < 0
+        && m_timer_checkpoint_every_seconds < 0)
+    {
+        return;
+    }
+
+    const double elapsed = amrex::second() - m_timer_wall_start;
+
+    // Break: one-shot.
+    if (m_timer_break_after_seconds >= 0
+        && !m_timer_break_fired
+        && elapsed >= static_cast<double>(m_timer_break_after_seconds))
+    {
+        amrex::Print() << "[Self-signal timer] WARPX_BREAK_AFTER_SECONDS "
+                       << "reached at wall=" << elapsed
+                       << "s — sending signal " << m_timer_break_signal
+                       << "\n";
+        m_timer_break_fired = true;
+        std::raise(m_timer_break_signal);
+    }
+
+    // Checkpoint: repeating; advance threshold by interval after each fire.
+    if (m_timer_checkpoint_every_seconds >= 0
+        && elapsed >= m_timer_next_checkpoint_at)
+    {
+        amrex::Print() << "[Self-signal timer] WARPX_CHECKPOINT_EVERY_SECONDS"
+                       << " reached at wall=" << elapsed
+                       << "s — sending signal " << m_timer_checkpoint_signal
+                       << "\n";
+        m_timer_next_checkpoint_at = elapsed
+            + static_cast<double>(m_timer_checkpoint_every_seconds);
+        std::raise(m_timer_checkpoint_signal);
+    }
+#endif
 }
 
 } // namespace ablastr::utils
