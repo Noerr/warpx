@@ -60,6 +60,28 @@ public:
     //! Complete the asynchronous broadcast of signal flags
     static void WaitSignals ();
 
+    //! Initialize timer-based self-signaling from environment variables.
+    //!
+    //! Reads the following env vars (rank 0 only):
+    //!   WARPX_BREAK_AFTER_SECONDS=<int>      — once after N wall seconds, self-signal break
+    //!   WARPX_CHECKPOINT_EVERY_SECONDS=<int> — every N wall seconds, self-signal checkpoint
+    //!
+    //! The signal number for each action is looked up from signal_conf_requests[],
+    //! so the user's existing warpx.break_signals / warpx.checkpoint_signals input
+    //! mappings are honored. If a timer is set but no signal is configured for
+    //! the corresponding action, a warning is printed and that timer is disabled.
+    //!
+    //! Must be called AFTER signal_conf_requests has been populated (i.e. after
+    //! WarpX::ReadParameters has parsed break_signals / checkpoint_signals).
+    static void InitTimers ();
+
+    //! Check elapsed wall-clock time against configured timers; self-signal via
+    //! std::raise(sig) when a timer elapses. Cheap no-op when both timers are
+    //! disabled. Rank 0 only; other ranks return immediately. The existing
+    //! per-step CheckSignals() then broadcasts the resulting action flag to all
+    //! ranks, so no separate MPI coordination is needed for the timer.
+    static void CheckTimers ();
+
     //! Check whether a given action has been requested, and reset the associated flag
     static bool TestAndResetActionRequestFlag (int action_to_test);
 
@@ -72,6 +94,25 @@ private:
 
     //! On process 0, whether a given signal has been received since the last check
     static std::atomic<bool> signal_received_flags[NUM_SIGNALS];
+
+    //
+    // Timer-based self-signaling state (rank 0 only). Configured by InitTimers
+    // from environment variables; consulted by CheckTimers each step.
+    //
+    //! Wall time (amrex::second()) at InitTimers
+    static double m_timer_wall_start;
+    //! Configured WARPX_BREAK_AFTER_SECONDS, or -1 if disabled
+    static int m_timer_break_after_seconds;
+    //! Configured WARPX_CHECKPOINT_EVERY_SECONDS, or -1 if disabled
+    static int m_timer_checkpoint_every_seconds;
+    //! Cached signal number to fire for break (-1 if none configured)
+    static int m_timer_break_signal;
+    //! Cached signal number to fire for checkpoint (-1 if none configured)
+    static int m_timer_checkpoint_signal;
+    //! Whether the break timer has already fired (one-shot)
+    static bool m_timer_break_fired;
+    //! Next wall-time threshold at which a checkpoint should fire (relative to start)
+    static double m_timer_next_checkpoint_at;
 
 #if defined(AMREX_USE_MPI)
     //! MPI requests for the asynchronous broadcasts of the signal-requested actions
