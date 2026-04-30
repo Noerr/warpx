@@ -693,6 +693,11 @@ WarpX::ReadParameters ()
                                          "Signal handling requested in input, but is not supported on this platform");
 #endif
 
+        // Initialize timer-based self-signaling (env-var-driven). Must be
+        // called after signal_conf_requests has been populated above so that
+        // InitTimers can look up the configured signal number for each action.
+        SignalHandling::InitTimers();
+
         // set random seed
         std::string random_seed = "default";
         pp_warpx.query("random_seed", random_seed);
