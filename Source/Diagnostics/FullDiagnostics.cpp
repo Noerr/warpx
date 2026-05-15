@@ -386,6 +386,9 @@ FullDiagnostics::InitializeFieldFunctorsRZopenPMD (int lev)
     int i = 0;
     // Species index to loop over species that dump temperature per species
     int i_T_species = 0;
+    // Counter over m_J_per_species_index entries (one entry per jx_/jy_/jz_<species>
+    // occurrence in fields_to_plot).
+    int i_J_species = 0;
     const int ncomp = ncomp_multimodefab;
     // This function is called multiple times, for different values of `lev`
     // but the `varnames` need only be updated once.
@@ -434,11 +437,26 @@ FullDiagnostics::InitializeFieldFunctorsRZopenPMD (int lev)
                 }
             } else if ( m_varnames_fields[comp] == "j"+field_names[idir] ){
                 m_all_field_functors[lev][comp] = std::make_unique<JFunctor>(idir, lev, m_crse_ratio,
-                                                            false, deposit_current, ncomp);
+                                                            false, deposit_current,
+                                                            /*species_index=*/-1, ncomp);
                 deposit_current = false;
                 if (update_varnames) {
                     AddRZModesToOutputNames(std::string("j"+field_names[idir]), ncomp);
                 }
+            } else if ( m_varnames_fields[comp].rfind("j"+field_names[idir]+"_", 0) == 0
+                        && m_varnames_fields[comp] != "j"+field_names[idir]+"_displacement" ){
+                // Per-species current density component. The JFunctor allocates a
+                // fresh per-species J at diagnostic time via DepositCurrent on
+                // local MultiFabs.
+                const int sp_idx = m_J_per_species_index[i_J_species];
+                m_all_field_functors[lev][comp] = std::make_unique<JFunctor>(idir, lev, m_crse_ratio,
+                                                            false, /*deposit_current=*/false,
+                                                            sp_idx, ncomp);
+                if (update_varnames) {
+                    AddRZModesToOutputNames(std::string("j"+field_names[idir]+"_")
+                                            + m_all_species_names[sp_idx], ncomp);
+                }
+                ++i_J_species;
             } else if ( m_varnames_fields[comp] == "j"+field_names[idir]+"_displacement" ){
                 m_all_field_functors[lev][comp] = std::make_unique<JdispFunctor>(idir, lev, m_crse_ratio,
                                                             false, ncomp);
@@ -838,6 +856,10 @@ FullDiagnostics::InitializeFieldFunctors (int lev)
     // Species index to loop over species that dump temperature per species
     int i_T_species = 0;
 
+    // Counter over m_J_per_species_index entries (one entry per jx_/jy_/jz_<species>
+    // occurrence in fields_to_plot).
+    int i_J_species = 0;
+
     const auto nvar = static_cast<int>(m_varnames_fields.size());
     const auto nspec = static_cast<int>(m_pfield_species.size());
     const auto ntot = static_cast<int>(nvar + m_pfield_varnames.size() * nspec);
@@ -865,8 +887,18 @@ FullDiagnostics::InitializeFieldFunctors (int lev)
             } else if ( m_varnames[comp] == "B"+field_names[idir] ){
                 m_all_field_functors[lev][comp] = std::make_unique<CellCenterFunctor>(warpx.m_fields.get(FieldType::Bfield_aux, Direction{idir}, lev), lev, m_crse_ratio);
             } else if ( m_varnames[comp] == "j"+field_names[idir] ){
-                m_all_field_functors[lev][comp] = std::make_unique<JFunctor>(idir, lev, m_crse_ratio, true, deposit_current);
+                m_all_field_functors[lev][comp] = std::make_unique<JFunctor>(idir, lev, m_crse_ratio, true, deposit_current,
+                                                                              /*species_index=*/-1);
                 deposit_current = false;
+            } else if ( m_varnames[comp].rfind("j"+field_names[idir]+"_", 0) == 0
+                        && m_varnames[comp] != "j"+field_names[idir]+"_displacement" ){
+                // Per-species current density component. The JFunctor allocates a
+                // fresh per-species J at diagnostic time via DepositCurrent on
+                // local MultiFabs.
+                const int sp_idx = m_J_per_species_index[i_J_species];
+                m_all_field_functors[lev][comp] = std::make_unique<JFunctor>(idir, lev, m_crse_ratio, true,
+                                                                              /*deposit_current=*/false, sp_idx);
+                ++i_J_species;
             } else if ( m_varnames[comp] == "j"+field_names[idir]+"_displacement" ) {
                     m_all_field_functors[lev][comp] = std::make_unique<JdispFunctor>(idir, lev, m_crse_ratio, true);
             } else if ( m_varnames[comp] == "A"+field_names[idir] ){
