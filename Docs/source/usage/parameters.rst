@@ -4401,6 +4401,10 @@ In-situ capabilities can be used by turning on Sensei or Ascent (provided they a
     Possible vector field components in RSPHERE geometry: ``Er`` ``Et`` ``Ep`` ``Br`` ``Bt`` ``Bp`` ``jr`` ``jt`` ``jp``.
     Any MultiFab added to the internal registry can also be included in the list.
     The default :pp:param:`<diag_name>.fields_to_plot` is to write all possible field components for the geometry.
+    Per-species current density components are also available as ``jx_<species_name>``, ``jy_<species_name>``, ``jz_<species_name>`` (or the geometry-appropriate direction names).
+    In the PICMI Python interface, the convenience name ``J_<species_name>`` in ``data_list`` expands to all three per-direction components, mirroring the way ``J`` expands to ``jx, jy, jz``.
+    Per-species current density is computed by on-demand re-deposition at diagnostic time (one current deposition per requested species per diagnostic period), so the sum of all per-species ``j*_<species>`` will not be byte-equal to the total ``j*`` when current filtering is enabled (``warpx.use_filter = 1``) — the per-species path applies only ghost-cell exchange, not the bilinear filter chain.
+    The default ``<diag_name>.fields_to_plot`` is to write all possible field components for the geometry.
     When the special value ``none`` is specified, no fields are written out.
     Note that the fields are averaged on the cell centers before they are written to file.
     Otherwise, we reconstruct a 2D Cartesian slice of the fields for output at :math:`\theta=0`.

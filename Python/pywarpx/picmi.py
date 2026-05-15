@@ -4322,6 +4322,16 @@ class FieldDiagnostic(picmistandard.PICMI_FieldDiagnostic, WarpXDiagnosticBase):
                 elif dataname.startswith("Q_"):
                     # Adds Q_species heat flux diagnostic (3 components)
                     fields_to_plot.add(dataname)
+                elif (
+                    dataname.startswith("J_")
+                    and dataname != "J_displacement"
+                ):
+                    # Adds J_species diagnostic by expanding to the three
+                    # per-direction lowercase component names. Mirrors the
+                    # plain 'J' -> jx/jy/jz expansion above.
+                    species = dataname[2:]
+                    for field_name in J_fields_list:
+                        fields_to_plot.add(f"{field_name.lower()}_{species}")
                 elif any([dataname.startswith(tstr) for tstr in T_fields_list]):
                     fields_to_plot.add(dataname)
                 elif dataname == "dive":

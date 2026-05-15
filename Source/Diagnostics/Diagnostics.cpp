@@ -385,6 +385,34 @@ Diagnostics::BaseReadParameters ()
                 "Input error: string " + var + " in " + m_diag_name
                 + ".fields_to_plot does not match any species");
         }
+
+        // Check if m_varnames contains a string of the form j<dir>_<species_name>,
+        // i.e. per-species current density component. The valid <dir> prefixes are
+        // x/y/z in cartesian, r/t/z in RZ, and r/t/p in spherical/cylindrical
+        // variants - the parser only needs to recognize "j<one-char>_" to dispatch.
+        // Exclude j<dir>_displacement tokens, which are dispatched separately.
+        if (var.size() >= 4 && var[0] == 'j' && var[2] == '_'
+            && var.find("_displacement") == std::string::npos) {
+            const char d = var[1];
+            const bool is_j_per_species =
+                (d == 'x' || d == 'y' || d == 'z' || d == 'r' || d == 't' || d == 'p');
+            if (is_j_per_species) {
+                // Extract species name from j<dir>_<species_name>
+                const std::string species = var.substr(3);
+                bool species_name_is_wrong = true;
+                for (int i = 0, n = int(m_all_species_names.size()); i < n; i++) {
+                    if (species == m_all_species_names[i]) {
+                        m_J_per_species_index.push_back(i);
+                        species_name_is_wrong = false;
+                    }
+                }
+                WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
+                    !species_name_is_wrong,
+                    "Input error: string " + var + " in " + m_diag_name
+                    + ".fields_to_plot does not match any species"
+                );
+            }
+        }
     }
 
     const bool checkpoint_compatibility = (
