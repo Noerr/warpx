@@ -22,10 +22,12 @@ using warpx::fields::FieldType;
 JFunctor::JFunctor (const int dir, int lev,
                    amrex::IntVect crse_ratio,
                    bool convertRZmodes2cartesian,
-                   bool deposit_current, int ncomp)
+                   bool deposit_current,
+                   int species_index, int ncomp)
     : ComputeDiagFunctor(ncomp, crse_ratio), m_dir(dir), m_lev(lev),
       m_convertRZmodes2cartesian(convertRZmodes2cartesian),
-      m_deposit_current(deposit_current)
+      m_deposit_current(deposit_current),
+      m_species_index(species_index)
 { }
 
 void
@@ -34,6 +36,51 @@ JFunctor::operator() (amrex::MultiFab& mf_dst, int dcomp, const int /*i_buffer*/
     using ablastr::fields::Direction;
 
     auto& warpx = WarpX::GetInstance();
+
+    // Per-species path: redeposit just the requested species into fresh local
+    // MultiFabs, then interpolate the requested direction into mf_dst. We must
+    // NOT reuse warpx.m_fields current_fp slots here (that would overwrite the
+    // live total current that physics needs).
+    if (m_species_index >= 0) {
+        amrex::MultiFab* live_jx = warpx.m_fields.get(FieldType::current_fp, Direction{0}, m_lev);
+        amrex::MultiFab* live_jy = warpx.m_fields.get(FieldType::current_fp, Direction{1}, m_lev);
+        amrex::MultiFab* live_jz = warpx.m_fields.get(FieldType::current_fp, Direction{2}, m_lev);
+
+        amrex::MultiFab tmp_jx(live_jx->boxArray(), live_jx->DistributionMap(),
+                               live_jx->nComp(), live_jx->nGrowVect());
+        amrex::MultiFab tmp_jy(live_jy->boxArray(), live_jy->DistributionMap(),
+                               live_jy->nComp(), live_jy->nGrowVect());
+        amrex::MultiFab tmp_jz(live_jz->boxArray(), live_jz->DistributionMap(),
+                               live_jz->nComp(), live_jz->nGrowVect());
+        tmp_jx.setVal(0.0);
+        tmp_jy.setVal(0.0);
+        tmp_jz.setVal(0.0);
+
+        ablastr::fields::MultiLevelVectorField jspec_temp {
+            ablastr::fields::VectorField{ &tmp_jx, &tmp_jy, &tmp_jz }
+        };
+
+        auto& pc = warpx.GetPartContainer().GetParticleContainer(m_species_index);
+        pc.DepositCurrent(jspec_temp, warpx.getdt(m_lev), 0.0);
+
+        // Exchange ghost data so the cell-centered interpolation sees consistent
+        // values. Note: the bilinear filter that is applied to the total current
+        // during physics is NOT applied here, so the sum of all per-species J
+        // will not be byte-equal to the total J in filtered runs.
+        for (int idim = 0; idim < 3; ++idim) {
+            jspec_temp[0][idim]->FillBoundary(warpx.Geom(m_lev).periodicity());
+        }
+
+        amrex::MultiFab* m_mf_src = jspec_temp[0][m_dir];
+        WARPX_ALWAYS_ASSERT_WITH_MESSAGE(m_mf_src != nullptr, "m_mf_src can't be a nullptr.");
+        AMREX_ASSUME(m_mf_src != nullptr);
+
+        InterpolateMFForDiag(
+            mf_dst, *m_mf_src, dcomp,
+            warpx.DistributionMap(m_lev), m_convertRZmodes2cartesian);
+        return;
+    }
+
     /** pointer to source multifab (can be multi-component) */
     amrex::MultiFab* m_mf_src = warpx.m_fields.get(FieldType::current_fp,Direction{m_dir},m_lev);
 
