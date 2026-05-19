@@ -330,11 +330,18 @@ namespace {
             // Determine N_ppc from the calling injection style.
             int num_particles_per_cell = 0;
             if (style == "nuniformpercell") {
-                std::vector<int> ppc_each_dim(3, 1);
+                // num_particles_per_cell_each_dim has AMREX_SPACEDIM entries
+                // (2 in 2D Cartesian/RZ, 3 in 3D). The velocity-lattice cube
+                // is independent of position-space dim; we just need the
+                // total per-cell particle count = product over position dims.
+                std::vector<int> ppc_each_dim(AMREX_SPACEDIM, 1);
                 utils::parser::getArrWithParser(pp_species, source_name,
                                                 "num_particles_per_cell_each_dim",
-                                                ppc_each_dim, 0, 3);
-                num_particles_per_cell = ppc_each_dim[0] * ppc_each_dim[1] * ppc_each_dim[2];
+                                                ppc_each_dim, 0, AMREX_SPACEDIM);
+                num_particles_per_cell = 1;
+                for (int d = 0; d < AMREX_SPACEDIM; ++d) {
+                    num_particles_per_cell *= ppc_each_dim[d];
+                }
             } else { // nrandompercell
                 utils::parser::getWithParser(pp_species, source_name,
                                              "num_particles_per_cell",
