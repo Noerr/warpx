@@ -1079,23 +1079,6 @@ Particle initialization
     * ``NRandomPerCell``: injection with a fixed number of randomly-distributed particles per cell.
       This requires the additional parameter ``<species_name>.num_particles_per_cell``.
 
-    * ``NColocatedPerCell``: injection with a fixed number of macroparticles per cell, all
-      colocated at the cell geometric center. This requires the additional parameter
-      ``<species_name>.num_particles_per_cell``. Intended to pair with
-      ``momentum_distribution_type = gaussian_parse_momentum_function_quiet``: with all
-      N_ppc particles in a cell sharing the same physical position, the antithetic
-      velocity-lattice property of the quiet velocity injector means the deposited
-      current density on the grid equals :math:`\rho \cdot u_{\rm drift}` exactly per
-      cell (no position-scatter floor on J).
-
-      Caveat: concentrating macroparticles at a single sub-cell point is the maximally
-      aliased per-cell distribution and can excite finite-grid instabilities for tight
-      :math:`v_{\rm th} \cdot dt / dx` regimes. Thermal motion in the physics step
-      redistributes particles off the cell-center singularity within a few cell-crossing
-      times, so this is safest viewed as an initial condition that the physics blurs
-      away on its own. For order-1 (linear) shape factors and standard PIC stability
-      regimes, this is benign on the IC.
-
     * ``SingleParticle``: Inject a single macroparticle.
       This requires the additional parameters:
 
@@ -1230,6 +1213,39 @@ Particle initialization
     number of particles per theta is at least two times the number of azimuthal modes requested.
     (It is recommended to do a convergence scan of the number of particles per theta)
     For RSPHERE, the three axis are radius, theta, and phi, and for RCYLINDER, the two axis are radius and theta.
+
+* ``<species_name>.velocity_samples_per_position`` (`integer`) optional (default `1`)
+    Group macroparticles within a cell: each group of M consecutive particles shares
+    one physical position (the position injector is invoked only once per group), and
+    the momentum injector receives a per-group velocity-sample index 0..M-1. Total
+    particles per cell = (positions per cell) :math:`\times` M; for NRandomPerCell the
+    ``num_particles_per_cell`` value must be divisible by M, for NUniformPerCell the
+    total becomes :math:`\prod_i \mathtt{num\_particles\_per\_cell\_each\_dim}[i] \cdot M`.
+
+    The default value 1 reproduces historic per-particle one-position behaviour
+    exactly (no caching, identical RNG sequence).
+
+    Designed to pair with ``momentum_distribution_type = gaussian_parse_momentum_function_quiet``:
+    with all M particles at the same spatial point sampling the quiet velocity
+    quantile lattice, the antithetic-lattice property carries through to the
+    deposited current density on the grid so that per-cell
+    :math:`J = \rho \cdot u_{\rm drift}` exactly (no position-scatter floor on J).
+    When paired with the quiet momentum injector, M must be a perfect cube
+    (1, 8, 27, 64, 125, 216, 343, 512, 729, 1000, 1331, 1728, 2197, 2744, 3375, 4096);
+    the velocity-lattice cube is :math:`M^{1/3}` per axis.
+
+    Caveat: setting ``velocity_samples_per_position > 1`` with a random-velocity
+    injector (the default Maxwellian variants) concentrates noise at fewer physical
+    points and is strictly *worse* than the default. The feature only makes physical
+    sense when paired with the quiet velocity injector.
+
+    Caveat: in the extreme case (M = total particles per cell, a single physical point
+    per cell at the cell geometric center via ``num_particles_per_cell_each_dim = [1, 1, 1]``),
+    the per-cell distribution becomes a single :math:`\delta`-function in space, which is
+    maximally aliased onto the grid. For order-1 (linear) shape factors and standard
+    PIC stability regimes this is benign as an initial condition (thermal motion
+    redistributes within a few cell-crossing times); higher-order shape factors
+    (``algo.particle_shape = 2`` or ``3``) further bandlimit the per-cell deposit.
 
 * ``<species_name>.random_theta`` (`bool`) optional (default `1`)
     When using RZ or RCYLINDER geometry, whether to randomize the azimuthal position of particles.
@@ -1436,10 +1452,10 @@ Particle initialization
       this requires ``n_macroparticles_per_cell`` (or the product of ``num_particles_per_cell_each_dim``)
       to be a perfect cube in [1, 4096] (i.e. 1, 8, 27, 64, 125, 216, 343, 512, 729, 1000, 1331, 1728,
       2197, 2744, 3375, 4096); the code aborts at setup with a clear error otherwise. Only valid when
-      paired with ``injection_style = NUniformPerCell``, ``NRandomPerCell``, or ``NColocatedPerCell``.
-      The ``NColocatedPerCell`` pairing gives the cleanest J initial condition: per-cell
-      deposited current density equals :math:`\rho \cdot u_{\rm drift}` exactly with no
-      position-scatter floor (see ``NColocatedPerCell`` documentation above).
+      paired with ``injection_style = NUniformPerCell`` or ``NRandomPerCell``. When the
+      additional parameter ``<species_name>.velocity_samples_per_position`` is set
+      (default 1), the velocity-lattice cube is built from M_vel rather than the total
+      particles per cell (see the ``velocity_samples_per_position`` documentation below).
 
 * ``<species_name>.theta_distribution_type`` (`string`) optional (default ``constant``)
     Only read if ``<species_name>.momentum_distribution_type`` is ``maxwell_boltzmann`` or ``maxwell_juttner``.

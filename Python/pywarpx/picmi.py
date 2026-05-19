@@ -594,6 +594,12 @@ class DensityDistributionBase(object):
                 "num_particles_per_cell_each_dim",
                 layout.n_macroparticle_per_cell,
             )
+            if getattr(layout, "velocity_samples_per_position", 1) != 1:
+                species.add_new_group_attr(
+                    source_name,
+                    "velocity_samples_per_position",
+                    layout.velocity_samples_per_position,
+                )
         elif isinstance(layout, PseudoRandomLayout):
             assert layout.n_macroparticles_per_cell is not None, Exception(
                 "WarpX only supports n_macroparticles_per_cell for the PseudoRandomLayout with this distribution"
@@ -602,11 +608,12 @@ class DensityDistributionBase(object):
             species.add_new_group_attr(
                 source_name, "num_particles_per_cell", layout.n_macroparticles_per_cell
             )
-        elif isinstance(layout, CellCenterColocatedLayout):
-            species.add_new_group_attr(source_name, "injection_style", "ncolocatedpercell")
-            species.add_new_group_attr(
-                source_name, "num_particles_per_cell", layout.n_macroparticle_per_cell
-            )
+            if getattr(layout, "velocity_samples_per_position", 1) != 1:
+                species.add_new_group_attr(
+                    source_name,
+                    "velocity_samples_per_position",
+                    layout.velocity_samples_per_position,
+                )
         else:
             raise Exception(
                 "WarpX does not support the specified layout for this distribution"
@@ -964,50 +971,56 @@ class ParticleDistributionPlanarInjector(
 
 
 class GriddedLayout(picmistandard.PICMI_GriddedLayout):
-    pass
-
-
-class PseudoRandomLayout(picmistandard.PICMI_PseudoRandomLayout):
-    def init(self, kw):
-        if self.seed is not None:
-            print(
-                "Warning: WarpX does not support specifying the random number seed in PseudoRandomLayout"
-            )
-
-
-class CellCenterColocatedLayout(picmistandard.base._ClassWithInit):
-    """All ``n_macroparticle_per_cell`` particles within a cell share the same
-    physical position (the cell geometric center). Designed to pair with
-    ``warpx_velocity_quiet_start=True`` on ``AnalyticDistribution`` so that the
-    deposited current density on the grid equals ``rho * u_drift`` exactly per
-    cell (no position-scatter floor on J). When combined with the quiet velocity
-    injector, ``n_macroparticle_per_cell`` must be a perfect cube (8, 27, 64,
-    125, 216, 343, 512, 729, 1000, 1331, 1728, 2197, 2744, 3375, 4096) because
-    the velocity quantile lattice is 3D regardless of position-space dimension.
-
-    Note: concentrating all macroparticles per cell at a single sub-cell point
-    is the maximally aliased per-cell distribution and can excite finite-grid
-    instabilities for tight ``v_th * dt / dx`` regimes. Thermal motion in the
-    physics step redistributes particles off the cell-center singularity within
-    a few cell-crossing times, so this is safest viewed as an initial condition
-    that the physics blurs away on its own.
+    """WarpX-specific extension of PICMI GriddedLayout.
 
     Parameters
     ----------
 
-    n_macroparticle_per_cell: integer
-        Total number of macroparticles per cell (all colocated at the cell
-        center). Must be a perfect cube when used with quiet velocity start.
+    velocity_samples_per_position: integer, default 1
+        Number of macroparticles per physical position within a cell. When
+        greater than 1, the position injector is called once per group of
+        ``velocity_samples_per_position`` consecutive particles and the result
+        is reused for the next M-1 particles. Intended to pair with
+        ``warpx_velocity_quiet_start=True`` on AnalyticDistribution: with all
+        ``velocity_samples_per_position`` particles at the same spatial
+        position, the antithetic velocity-lattice property of the quiet
+        injector means the deposited current density on the grid equals
+        ``rho * u_drift`` exactly per spatial point (no position-scatter floor
+        on J). When paired with the quiet velocity injector,
+        ``velocity_samples_per_position`` must be a perfect cube (1, 8, 27,
+        64, 125, 216, 343, 512, 729, 1000, 1331, 1728, 2197, 2744, 3375, 4096).
 
-    grid: grid instance, optional
-        Carried for PICMI symmetry with other layouts; not consumed by WarpX
-        (the cell-center placement is grid-implicit).
+        For random-velocity injectors (the default Maxwellian variants),
+        setting ``velocity_samples_per_position > 1`` concentrates noise at
+        fewer physical points and is strictly worse than the default; the
+        kwarg only makes physical sense paired with the quiet velocity start.
     """
 
-    def __init__(self, n_macroparticle_per_cell, grid=None, **kw):
-        self.n_macroparticle_per_cell = n_macroparticle_per_cell
-        self.grid = grid
-        self.handle_init(kw)
+    def init(self, kw):
+        self.velocity_samples_per_position = kw.pop("velocity_samples_per_position", 1)
+
+
+class PseudoRandomLayout(picmistandard.PICMI_PseudoRandomLayout):
+    """WarpX-specific extension of PICMI PseudoRandomLayout.
+
+    Parameters
+    ----------
+
+    velocity_samples_per_position: integer, default 1
+        Same role as on GriddedLayout: number of macroparticles colocated at
+        each random physical position. ``n_macroparticles_per_cell`` must be
+        divisible by this value (each "group" gets one random position and
+        ``velocity_samples_per_position`` particles share it). See
+        GriddedLayout for the rationale and cube constraint when used with
+        ``warpx_velocity_quiet_start=True``.
+    """
+
+    def init(self, kw):
+        self.velocity_samples_per_position = kw.pop("velocity_samples_per_position", 1)
+        if self.seed is not None:
+            print(
+                "Warning: WarpX does not support specifying the random number seed in PseudoRandomLayout"
+            )
 
 
 class BinomialSmoother(picmistandard.PICMI_BinomialSmoother):

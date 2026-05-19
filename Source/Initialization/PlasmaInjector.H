@@ -67,6 +67,15 @@ public:
 
     amrex::Vector<int> num_particles_per_cell_each_dim;
 
+    // Number of macroparticles per physical position within a cell. When > 1,
+    // groups of M_vel particles share a position (the position injector is
+    // called only once per group) and the momentum injector receives the
+    // per-group velocity-sample index (0..M_vel-1). Default 1 reproduces
+    // historic per-particle one-position behaviour exactly. Intended to pair
+    // with momentum_distribution_type = gaussian_parse_momentum_function_quiet,
+    // for which M_vel must equal a perfect cube of velocity-lattice points.
+    int velocity_samples_per_position = 1;
+
     // gamma * beta
     [[nodiscard]] amrex::XDim3 getMomentum (
         amrex::Real x, amrex::Real y, amrex::Real z) const noexcept;
@@ -216,7 +225,6 @@ protected:
     void setupNRandomPerCell (amrex::ParmParse const& pp_species);
     void setupNFluxPerCell (amrex::ParmParse const& pp_species);
     void setupNuniformPerCell (amrex::ParmParse const& pp_species);
-    void setupNColocatedPerCell (amrex::ParmParse const& pp_species);
     void setupExternalFile (amrex::ParmParse const& pp_species);
 
     void parseFlux (amrex::ParmParse const& pp_species);
