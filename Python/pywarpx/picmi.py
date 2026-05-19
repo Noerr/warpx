@@ -976,7 +976,7 @@ class GriddedLayout(picmistandard.PICMI_GriddedLayout):
     Parameters
     ----------
 
-    velocity_samples_per_position: integer, default 1
+    warpx_velocity_samples_per_position: integer, default 1
         Number of macroparticles per physical position within a cell. When
         greater than 1, the position injector is called once per group of
         ``velocity_samples_per_position`` consecutive particles and the result
@@ -997,7 +997,7 @@ class GriddedLayout(picmistandard.PICMI_GriddedLayout):
     """
 
     def init(self, kw):
-        self.velocity_samples_per_position = kw.pop("velocity_samples_per_position", 1)
+        self.velocity_samples_per_position = kw.pop("warpx_velocity_samples_per_position", 1)
 
 
 class PseudoRandomLayout(picmistandard.PICMI_PseudoRandomLayout):
@@ -1006,7 +1006,7 @@ class PseudoRandomLayout(picmistandard.PICMI_PseudoRandomLayout):
     Parameters
     ----------
 
-    velocity_samples_per_position: integer, default 1
+    warpx_velocity_samples_per_position: integer, default 1
         Same role as on GriddedLayout: number of macroparticles colocated at
         each random physical position. ``n_macroparticles_per_cell`` must be
         divisible by this value (each "group" gets one random position and
@@ -1016,7 +1016,7 @@ class PseudoRandomLayout(picmistandard.PICMI_PseudoRandomLayout):
     """
 
     def init(self, kw):
-        self.velocity_samples_per_position = kw.pop("velocity_samples_per_position", 1)
+        self.velocity_samples_per_position = kw.pop("warpx_velocity_samples_per_position", 1)
         if self.seed is not None:
             print(
                 "Warning: WarpX does not support specifying the random number seed in PseudoRandomLayout"
