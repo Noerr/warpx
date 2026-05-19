@@ -623,10 +623,15 @@ amrex::XDim3 PlasmaInjector::getMomentum (amrex::Real x,
                                           amrex::Real y,
                                           amrex::Real z) const noexcept
 {
+    // This public host-side wrapper does not have a per-cell particle index
+    // available. Non-quiet injectors ignore the i_part argument; the
+    // gaussian_parser_quiet variant interprets i_part=0 as the lattice corner
+    // (jx=jy=jz=0) sample. That is not the bulk mean -- callers wanting drift
+    // only should use getBulkMomentum() instead.
 #ifdef AMREX_USE_GPU
-    return h_inj_mom->getMomentum(x, y, z, amrex::RandomEngine{nullptr}); // gamma*beta
+    return h_inj_mom->getMomentum(0, x, y, z, amrex::RandomEngine{nullptr}); // gamma*beta
 #else
-    return h_inj_mom->getMomentum(x, y, z, amrex::RandomEngine{}); // gamma*beta
+    return h_inj_mom->getMomentum(0, x, y, z, amrex::RandomEngine{}); // gamma*beta
 #endif
 }
 

@@ -1087,7 +1087,7 @@ PhysicalParticleContainer::AddPlasma (PlasmaInjector& plasma_injector, int lev, 
                         continue;
                     }
 
-                    u = inj_mom->getMomentum(pos.x, pos.y, z0, engine);
+                    u = inj_mom->getMomentum(i_part, pos.x, pos.y, z0, engine);
                     dens = inj_rho->getDensity(pos.x, pos.y, z0);
 
                     // Remove particle if density below threshold
@@ -1131,7 +1131,7 @@ PhysicalParticleContainer::AddPlasma (PlasmaInjector& plasma_injector, int lev, 
                     dens = amrex::min(dens, density_max);
 
                     // get the full momentum, including thermal motion
-                    u = inj_mom->getMomentum(pos.x, pos.y, 0._rt, engine);
+                    u = inj_mom->getMomentum(i_part, pos.x, pos.y, 0._rt, engine);
                     const amrex::Real gamma_lab = std::sqrt( 1._rt+(u.x*u.x+u.y*u.y+u.z*u.z) );
                     const amrex::Real betaz_lab = u.z/(gamma_lab);
 
@@ -1519,7 +1519,7 @@ PhysicalParticleContainer::AddPlasmaFlux (PlasmaInjector const& plasma_injector,
 
                 // inj_mom would typically be InjectorMomentumGaussianFlux
                 XDim3 u;
-                u = inj_mom->getMomentum(pos.x, pos.y, pos.z, engine);
+                u = inj_mom->getMomentum(i_part, pos.x, pos.y, pos.z, engine);
                 auto pu = PDim3(u);
 
                 pu.x *= PhysConst::c;
