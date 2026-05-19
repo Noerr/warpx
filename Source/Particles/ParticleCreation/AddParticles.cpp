@@ -842,6 +842,7 @@ PhysicalParticleContainer::AddPlasma (PlasmaInjector& plasma_injector, int lev, 
     }
 
     const int num_ppc = plasma_injector.num_particles_per_cell;
+    const int M_vel = plasma_injector.velocity_samples_per_position;
 #if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE)
     const amrex::Real rmax = std::min(plasma_injector.xmax, part_realbox.hi(0));
     const amrex::Real rmin = std::max(plasma_injector.xmin, part_realbox.lo(0));
@@ -1060,15 +1061,27 @@ PhysicalParticleContainer::AddPlasma (PlasmaInjector& plasma_injector, int lev, 
 #endif
 
             const amrex::Real scale_fac = compute_scale_fac_volume(dx, pcounts[index]);
+            // Particles within a cell are grouped: each group of M_vel
+            // consecutive i_part indices shares one physical position
+            // (the position injector is invoked only when m_vel_idx == 0)
+            // and the momentum injector receives the per-group velocity-
+            // sample index m_vel_idx. M_vel == 1 reproduces historical
+            // per-particle one-position behaviour exactly.
+            XDim3 r_cached;
             for (int i_part = 0; i_part < pcounts[index]; ++i_part)
             {
                 long ip = poffset[index] + i_part;
                 pa_idcpu[ip] = amrex::SetParticleIDandCPU(pid+ip, cpuid);
-                const XDim3 r = (fine_overlap_box.ok() && fine_overlap_box.contains(iv)) ?
-                  // In the refined injection region: use refinement ratio `rrfac`
-                  inj_pos->getPositionUnitBox(i_part, rrfac, engine) :
-                  // Otherwise: use 1 as the refinement ratio
-                  inj_pos->getPositionUnitBox(i_part, amrex::IntVect::TheUnitVector(), engine);
+                const int m_vel_idx = (M_vel > 1) ? (i_part % M_vel) : 0;
+                const int i_pos = (M_vel > 1) ? (i_part / M_vel) : i_part;
+                if (m_vel_idx == 0) {
+                    r_cached = (fine_overlap_box.ok() && fine_overlap_box.contains(iv)) ?
+                      // In the refined injection region: use refinement ratio `rrfac`
+                      inj_pos->getPositionUnitBox(i_pos, rrfac, engine) :
+                      // Otherwise: use 1 as the refinement ratio
+                      inj_pos->getPositionUnitBox(i_pos, amrex::IntVect::TheUnitVector(), engine);
+                }
+                const XDim3 r = r_cached;
                 auto pos = getCellCoords(overlap_corner, dx, r, iv);
 
 #if defined(WARPX_DIM_3D)
@@ -1171,7 +1184,7 @@ PhysicalParticleContainer::AddPlasma (PlasmaInjector& plasma_injector, int lev, 
                         continue;
                     }
 
-                    u = inj_mom->getMomentum(i_part, pos.x, pos.y, z0, engine);
+                    u = inj_mom->getMomentum(m_vel_idx, pos.x, pos.y, z0, engine);
                     dens = inj_rho->getDensity(pos.x, pos.y, z0);
 
                     // Remove particle if density below threshold
@@ -1215,7 +1228,7 @@ PhysicalParticleContainer::AddPlasma (PlasmaInjector& plasma_injector, int lev, 
                     dens = amrex::min(dens, density_max);
 
                     // get the full momentum, including thermal motion
-                    u = inj_mom->getMomentum(i_part, pos.x, pos.y, 0._rt, engine);
+                    u = inj_mom->getMomentum(m_vel_idx, pos.x, pos.y, 0._rt, engine);
                     const amrex::Real gamma_lab = std::sqrt( 1._rt+(u.x*u.x+u.y*u.y+u.z*u.z) );
                     const amrex::Real betaz_lab = u.z/(gamma_lab);
 

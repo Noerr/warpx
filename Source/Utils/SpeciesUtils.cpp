@@ -323,43 +323,31 @@ namespace {
             // as the non-quiet variant). N_ppc must be a perfect cube; the
             // per-axis quantile lattice has N_half = round(N_ppc^(1/3)) points.
             WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
-                style == "nuniformpercell" || style == "nrandompercell"
-                || style == "ncolocatedpercell",
+                style == "nuniformpercell" || style == "nrandompercell",
                 "gaussian_parse_momentum_function_quiet requires "
-                "injection_style = NUniformPerCell, NRandomPerCell, or "
-                "NColocatedPerCell");
+                "injection_style = NUniformPerCell or NRandomPerCell");
 
-            // Determine N_ppc from the calling injection style.
-            int num_particles_per_cell = 0;
-            if (style == "nuniformpercell") {
-                // num_particles_per_cell_each_dim has AMREX_SPACEDIM entries
-                // (2 in 2D Cartesian/RZ, 3 in 3D). The velocity-lattice cube
-                // is independent of position-space dim; we just need the
-                // total per-cell particle count = product over position dims.
-                std::vector<int> ppc_each_dim(AMREX_SPACEDIM, 1);
-                utils::parser::getArrWithParser(pp_species, source_name,
-                                                "num_particles_per_cell_each_dim",
-                                                ppc_each_dim, 0, AMREX_SPACEDIM);
-                num_particles_per_cell = 1;
-                for (int d = 0; d < AMREX_SPACEDIM; ++d) {
-                    num_particles_per_cell *= ppc_each_dim[d];
-                }
-            } else { // nrandompercell or ncolocatedpercell -- both use scalar
-                utils::parser::getWithParser(pp_species, source_name,
-                                             "num_particles_per_cell",
-                                             num_particles_per_cell);
-            }
+            // The quiet velocity injector samples M_vel particles per physical
+            // position from a 3D inverse-Gaussian-CDF quantile lattice; M_vel
+            // must be a perfect cube. The user controls M_vel via the optional
+            // input `velocity_samples_per_position` (default 1). Total
+            // particles per cell = K_pos * M_vel where K_pos is the spatial
+            // particle count from the injection_style.
+            int M_vel = 1;
+            utils::parser::queryWithParser(pp_species, source_name,
+                                           "velocity_samples_per_position", M_vel);
+            WARPX_ALWAYS_ASSERT_WITH_MESSAGE(M_vel >= 1,
+                "velocity_samples_per_position must be >= 1");
 
-            const int N_half = static_cast<int>(std::round(
-                std::cbrt(double(num_particles_per_cell))));
+            const int N_half = static_cast<int>(std::round(std::cbrt(double(M_vel))));
             WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
                 N_half >= 1 && N_half <= InjectorMomentumGaussianParserQuiet::K_MAX
-                && N_half * N_half * N_half == num_particles_per_cell,
-                std::string("gaussian_parse_momentum_function_quiet requires N_ppc ")
-                + "to be a perfect cube in [1, "
+                && N_half * N_half * N_half == M_vel,
+                std::string("gaussian_parse_momentum_function_quiet requires ")
+                + "velocity_samples_per_position to be a perfect cube in [1, "
                 + std::to_string(InjectorMomentumGaussianParserQuiet::K_MAX*InjectorMomentumGaussianParserQuiet::K_MAX*InjectorMomentumGaussianParserQuiet::K_MAX)
-                + "]. Got N_ppc=" + std::to_string(num_particles_per_cell)
-                + ". Nearest valid: 1 8 27 64 125 216 343 512 729 1000 1331 1728 "
+                + "]. Got velocity_samples_per_position=" + std::to_string(M_vel)
+                + ". Valid cubes: 1 8 27 64 125 216 343 512 729 1000 1331 1728 "
                 + "2197 2744 3375 4096."
             );
 

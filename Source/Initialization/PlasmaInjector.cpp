@@ -146,8 +146,6 @@ PlasmaInjector::PlasmaInjector (int ispecies, const std::string& name,
         setupNFluxPerCell(pp_species);
     } else if (injection_style == "nuniformpercell") {
         setupNuniformPerCell(pp_species);
-    } else if (injection_style == "ncolocatedpercell") {
-        setupNColocatedPerCell(pp_species);
     } else if (injection_style == "external_file") {
         setupExternalFile(pp_species);
     } else if (injection_style != "none") {
@@ -303,6 +301,18 @@ void PlasmaInjector::setupGaussianBeam (amrex::ParmParse const& pp_species)
 void PlasmaInjector::setupNRandomPerCell (amrex::ParmParse const& pp_species)
 {
     utils::parser::getWithParser(pp_species, source_name, "num_particles_per_cell", num_particles_per_cell);
+    // Optional grouping: M_vel particles per physical position (default 1).
+    // Must divide num_particles_per_cell evenly.
+    utils::parser::queryWithParser(pp_species, source_name,
+                                   "velocity_samples_per_position",
+                                   velocity_samples_per_position);
+    WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
+        velocity_samples_per_position >= 1
+        && num_particles_per_cell % velocity_samples_per_position == 0,
+        std::string("velocity_samples_per_position must be >= 1 and a divisor of "
+                    "num_particles_per_cell. Got velocity_samples_per_position=")
+        + std::to_string(velocity_samples_per_position)
+        + ", num_particles_per_cell=" + std::to_string(num_particles_per_cell));
 #if WARPX_DIM_RZ
     if (WarpX::n_rz_azimuthal_modes > 1) {
     WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
@@ -326,34 +336,6 @@ void PlasmaInjector::setupNRandomPerCell (amrex::ParmParse const& pp_species)
 
     SpeciesUtils::parseDensity(species_name, source_name, h_inj_rho, density_parser, m_geom);
     SpeciesUtils::parseMomentum(species_name, source_name, "nrandompercell", h_inj_mom,
-                                ux_parser, uy_parser, uz_parser,
-                                ux_th_parser, uy_th_parser, uz_th_parser,
-                                h_mom_temp, h_mom_vel);
-}
-
-void PlasmaInjector::setupNColocatedPerCell (amrex::ParmParse const& pp_species)
-{
-    // All N_ppc particles per cell are placed at the cell geometric center.
-    // Intended to pair with the quiet-velocity injector
-    // (momentum_distribution_type = gaussian_parse_momentum_function_quiet).
-    // Because all particles in a cell share the same physical position, the
-    // antithetic-lattice property of the quiet velocity injector carries
-    // through to the deposited current density: per-cell J = rho * u_drift
-    // exactly. See Docs/source/usage/parameters.rst for the aliasing caveat.
-    utils::parser::getWithParser(pp_species, source_name, "num_particles_per_cell", num_particles_per_cell);
-    h_inj_pos = std::make_unique<InjectorPosition>(
-        (InjectorPositionCellCenter*)nullptr,
-        xmin, xmax, ymin, ymax, zmin, zmax);
-#ifdef AMREX_USE_GPU
-    d_inj_pos = static_cast<InjectorPosition*>
-        (amrex::The_Arena()->alloc(sizeof(InjectorPosition)));
-    amrex::Gpu::htod_memcpy_async(d_inj_pos, h_inj_pos.get(), sizeof(InjectorPosition));
-#else
-    d_inj_pos = h_inj_pos.get();
-#endif
-
-    SpeciesUtils::parseDensity(species_name, source_name, h_inj_rho, density_parser, m_geom);
-    SpeciesUtils::parseMomentum(species_name, source_name, "ncolocatedpercell", h_inj_mom,
                                 ux_parser, uy_parser, uz_parser,
                                 ux_th_parser, uy_th_parser, uz_th_parser,
                                 h_mom_temp, h_mom_vel);
@@ -468,6 +450,12 @@ void PlasmaInjector::setupNuniformPerCell (amrex::ParmParse const& pp_species)
 #else
     constexpr int num_required_ppc_each_dim = 3;
 #endif
+    // Optional grouping: M_vel particles per physical position (default 1).
+    utils::parser::queryWithParser(pp_species, source_name,
+                                   "velocity_samples_per_position",
+                                   velocity_samples_per_position);
+    WARPX_ALWAYS_ASSERT_WITH_MESSAGE(velocity_samples_per_position >= 1,
+        "velocity_samples_per_position must be >= 1");
     utils::parser::getArrWithParser(pp_species, source_name, "num_particles_per_cell_each_dim", num_particles_per_cell_each_dim);
     WARPX_ALWAYS_ASSERT_WITH_MESSAGE(static_cast<int>(num_particles_per_cell_each_dim.size()) == num_required_ppc_each_dim,
                                      "num_particles_per_cell_each_dim must have " + std::to_string(num_required_ppc_each_dim) + " elements specified");
@@ -502,7 +490,8 @@ void PlasmaInjector::setupNuniformPerCell (amrex::ParmParse const& pp_species)
 #endif
     num_particles_per_cell = num_particles_per_cell_each_dim[0] *
                              num_particles_per_cell_each_dim[1] *
-                             num_particles_per_cell_each_dim[2];
+                             num_particles_per_cell_each_dim[2] *
+                             velocity_samples_per_position;
     SpeciesUtils::parseDensity(species_name, source_name, h_inj_rho, density_parser, m_geom);
     SpeciesUtils::parseMomentum(species_name, source_name, "nuniformpercell", h_inj_mom,
                                 ux_parser, uy_parser, uz_parser,
