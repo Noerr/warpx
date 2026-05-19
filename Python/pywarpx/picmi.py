@@ -602,6 +602,11 @@ class DensityDistributionBase(object):
             species.add_new_group_attr(
                 source_name, "num_particles_per_cell", layout.n_macroparticles_per_cell
             )
+        elif isinstance(layout, CellCenterColocatedLayout):
+            species.add_new_group_attr(source_name, "injection_style", "ncolocatedpercell")
+            species.add_new_group_attr(
+                source_name, "num_particles_per_cell", layout.n_macroparticle_per_cell
+            )
         else:
             raise Exception(
                 "WarpX does not support the specified layout for this distribution"
@@ -968,6 +973,41 @@ class PseudoRandomLayout(picmistandard.PICMI_PseudoRandomLayout):
             print(
                 "Warning: WarpX does not support specifying the random number seed in PseudoRandomLayout"
             )
+
+
+class CellCenterColocatedLayout(picmistandard.base._ClassWithInit):
+    """All ``n_macroparticle_per_cell`` particles within a cell share the same
+    physical position (the cell geometric center). Designed to pair with
+    ``warpx_velocity_quiet_start=True`` on ``AnalyticDistribution`` so that the
+    deposited current density on the grid equals ``rho * u_drift`` exactly per
+    cell (no position-scatter floor on J). When combined with the quiet velocity
+    injector, ``n_macroparticle_per_cell`` must be a perfect cube (8, 27, 64,
+    125, 216, 343, 512, 729, 1000, 1331, 1728, 2197, 2744, 3375, 4096) because
+    the velocity quantile lattice is 3D regardless of position-space dimension.
+
+    Note: concentrating all macroparticles per cell at a single sub-cell point
+    is the maximally aliased per-cell distribution and can excite finite-grid
+    instabilities for tight ``v_th * dt / dx`` regimes. Thermal motion in the
+    physics step redistributes particles off the cell-center singularity within
+    a few cell-crossing times, so this is safest viewed as an initial condition
+    that the physics blurs away on its own.
+
+    Parameters
+    ----------
+
+    n_macroparticle_per_cell: integer
+        Total number of macroparticles per cell (all colocated at the cell
+        center). Must be a perfect cube when used with quiet velocity start.
+
+    grid: grid instance, optional
+        Carried for PICMI symmetry with other layouts; not consumed by WarpX
+        (the cell-center placement is grid-implicit).
+    """
+
+    def __init__(self, n_macroparticle_per_cell, grid=None, **kw):
+        self.n_macroparticle_per_cell = n_macroparticle_per_cell
+        self.grid = grid
+        self.handle_init(kw)
 
 
 class BinomialSmoother(picmistandard.PICMI_BinomialSmoother):

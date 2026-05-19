@@ -119,11 +119,35 @@ private:
     amrex::Dim3 ppc;
 };
 
+// struct whose getPositionUnitBox places EVERY particle at the cell center,
+// regardless of i_part. Intended for use with the quiet-velocity injector
+// (gaussian_parse_momentum_function_quiet): with N_ppc colocated particles
+// all sharing the same position, the antithetic velocity-lattice property
+// of the quiet injector means the deposited current density J on the grid
+// equals rho * u_drift exactly per cell (no position-scatter floor on J).
+// All N_ppc particles in the cell share the same shape-function deposition
+// pattern, so this is the maximally aliased per-cell particle distribution;
+// it relies on thermal motion in the physics step to redistribute particles
+// off the cell-center singularity within a few cell-crossing times.
+struct InjectorPositionCellCenter
+{
+    [[nodiscard]]
+    AMREX_GPU_HOST_DEVICE
+    amrex::XDim3
+    getPositionUnitBox (int /*i_part*/, amrex::IntVect /*ref_fac*/,
+                        amrex::RandomEngine const&) const noexcept
+    {
+        using namespace amrex::literals;
+        return amrex::XDim3{0.5_rt, 0.5_rt, 0.5_rt};
+    }
+};
+
 // Base struct for position injector.
 // InjectorPosition contains a union (called Object) that holds any one
 // instance of:
-// - InjectorPositionRandom : to generate random distribution;
-// - InjectorPositionRegular: to generate regular distribution.
+// - InjectorPositionRandom    : to generate random distribution;
+// - InjectorPositionRegular   : to generate regular sub-cell lattice;
+// - InjectorPositionCellCenter: to colocate all particles at cell center.
 // The choice is made at runtime, depending in the constructor called.
 // This mimics virtual functions.
 struct InjectorPosition
@@ -166,6 +190,18 @@ struct InjectorPosition
           zmin(a_zmin), zmax(a_zmax)
     { }
 
+    // This constructor stores a InjectorPositionCellCenter in union object.
+    InjectorPosition (InjectorPositionCellCenter* t,
+                      amrex::Real a_xmin, amrex::Real a_xmax,
+                      amrex::Real a_ymin, amrex::Real a_ymax,
+                      amrex::Real a_zmin, amrex::Real a_zmax)
+        : type(Type::cellcenter),
+          object(t),
+          xmin(a_xmin), xmax(a_xmax),
+          ymin(a_ymin), ymax(a_ymax),
+          zmin(a_zmin), zmax(a_zmax)
+    { }
+
     ~InjectorPosition () = default;
 
     // Explicitly prevent the compiler from generating copy constructors
@@ -192,6 +228,10 @@ struct InjectorPosition
         case Type::randomplane:
         {
             return object.randomplane.getPositionUnitBox(i_part, ref_fac, engine);
+        }
+        case Type::cellcenter:
+        {
+            return object.cellcenter.getPositionUnitBox(i_part, ref_fac, engine);
         }
         default:
         {
@@ -242,20 +282,22 @@ struct InjectorPosition
     }
 
 private:
-    enum struct Type { random, randomplane, regular };
+    enum struct Type { random, randomplane, regular, cellcenter };
     Type type;
 
     // An instance of union Object constructs and stores any one of
-    // the objects declared (random or regular).
+    // the objects declared (random, regular, or cellcenter).
     union Object {
         Object (InjectorPositionRandom*) noexcept : random() {}
         Object (InjectorPositionRandomPlane*, int const& a_dir) noexcept
             : randomplane(a_dir) {}
         Object (InjectorPositionRegular*, amrex::Dim3 const& a_ppc) noexcept
             : regular(a_ppc) {}
+        Object (InjectorPositionCellCenter*) noexcept : cellcenter() {}
         InjectorPositionRandom random;
         InjectorPositionRandomPlane randomplane;
         InjectorPositionRegular regular;
+        InjectorPositionCellCenter cellcenter;
     };
     Object object;
 

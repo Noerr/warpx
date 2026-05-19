@@ -1079,6 +1079,23 @@ Particle initialization
     * ``NRandomPerCell``: injection with a fixed number of randomly-distributed particles per cell.
       This requires the additional parameter ``<species_name>.num_particles_per_cell``.
 
+    * ``NColocatedPerCell``: injection with a fixed number of macroparticles per cell, all
+      colocated at the cell geometric center. This requires the additional parameter
+      ``<species_name>.num_particles_per_cell``. Intended to pair with
+      ``momentum_distribution_type = gaussian_parse_momentum_function_quiet``: with all
+      N_ppc particles in a cell sharing the same physical position, the antithetic
+      velocity-lattice property of the quiet velocity injector means the deposited
+      current density on the grid equals :math:`\rho \cdot u_{\rm drift}` exactly per
+      cell (no position-scatter floor on J).
+
+      Caveat: concentrating macroparticles at a single sub-cell point is the maximally
+      aliased per-cell distribution and can excite finite-grid instabilities for tight
+      :math:`v_{\rm th} \cdot dt / dx` regimes. Thermal motion in the physics step
+      redistributes particles off the cell-center singularity within a few cell-crossing
+      times, so this is safest viewed as an initial condition that the physics blurs
+      away on its own. For order-1 (linear) shape factors and standard PIC stability
+      regimes, this is benign on the IC.
+
     * ``SingleParticle``: Inject a single macroparticle.
       This requires the additional parameters:
 
@@ -1419,7 +1436,10 @@ Particle initialization
       this requires ``n_macroparticles_per_cell`` (or the product of ``num_particles_per_cell_each_dim``)
       to be a perfect cube in [1, 4096] (i.e. 1, 8, 27, 64, 125, 216, 343, 512, 729, 1000, 1331, 1728,
       2197, 2744, 3375, 4096); the code aborts at setup with a clear error otherwise. Only valid when
-      paired with ``injection_style = NUniformPerCell`` or ``NRandomPerCell``.
+      paired with ``injection_style = NUniformPerCell``, ``NRandomPerCell``, or ``NColocatedPerCell``.
+      The ``NColocatedPerCell`` pairing gives the cleanest J initial condition: per-cell
+      deposited current density equals :math:`\rho \cdot u_{\rm drift}` exactly with no
+      position-scatter floor (see ``NColocatedPerCell`` documentation above).
 
 * ``<species_name>.theta_distribution_type`` (`string`) optional (default ``constant``)
     Only read if ``<species_name>.momentum_distribution_type`` is ``maxwell_boltzmann`` or ``maxwell_juttner``.

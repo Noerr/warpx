@@ -214,6 +214,7 @@ protected:
     void setupNRandomPerCell (amrex::ParmParse const& pp_species);
     void setupNFluxPerCell (amrex::ParmParse const& pp_species);
     void setupNuniformPerCell (amrex::ParmParse const& pp_species);
+    void setupNColocatedPerCell (amrex::ParmParse const& pp_species);
     void setupExternalFile (amrex::ParmParse const& pp_species);
 
     void parseFlux (amrex::ParmParse const& pp_species);

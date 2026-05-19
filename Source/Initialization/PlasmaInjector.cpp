@@ -146,6 +146,8 @@ PlasmaInjector::PlasmaInjector (int ispecies, const std::string& name,
         setupNFluxPerCell(pp_species);
     } else if (injection_style == "nuniformpercell") {
         setupNuniformPerCell(pp_species);
+    } else if (injection_style == "ncolocatedpercell") {
+        setupNColocatedPerCell(pp_species);
     } else if (injection_style == "external_file") {
         setupExternalFile(pp_species);
     } else if (injection_style != "none") {
@@ -324,6 +326,34 @@ void PlasmaInjector::setupNRandomPerCell (amrex::ParmParse const& pp_species)
 
     SpeciesUtils::parseDensity(species_name, source_name, h_inj_rho, density_parser, m_geom);
     SpeciesUtils::parseMomentum(species_name, source_name, "nrandompercell", h_inj_mom,
+                                ux_parser, uy_parser, uz_parser,
+                                ux_th_parser, uy_th_parser, uz_th_parser,
+                                h_mom_temp, h_mom_vel);
+}
+
+void PlasmaInjector::setupNColocatedPerCell (amrex::ParmParse const& pp_species)
+{
+    // All N_ppc particles per cell are placed at the cell geometric center.
+    // Intended to pair with the quiet-velocity injector
+    // (momentum_distribution_type = gaussian_parse_momentum_function_quiet).
+    // Because all particles in a cell share the same physical position, the
+    // antithetic-lattice property of the quiet velocity injector carries
+    // through to the deposited current density: per-cell J = rho * u_drift
+    // exactly. See Docs/source/usage/parameters.rst for the aliasing caveat.
+    utils::parser::getWithParser(pp_species, source_name, "num_particles_per_cell", num_particles_per_cell);
+    h_inj_pos = std::make_unique<InjectorPosition>(
+        (InjectorPositionCellCenter*)nullptr,
+        xmin, xmax, ymin, ymax, zmin, zmax);
+#ifdef AMREX_USE_GPU
+    d_inj_pos = static_cast<InjectorPosition*>
+        (amrex::The_Arena()->alloc(sizeof(InjectorPosition)));
+    amrex::Gpu::htod_memcpy_async(d_inj_pos, h_inj_pos.get(), sizeof(InjectorPosition));
+#else
+    d_inj_pos = h_inj_pos.get();
+#endif
+
+    SpeciesUtils::parseDensity(species_name, source_name, h_inj_rho, density_parser, m_geom);
+    SpeciesUtils::parseMomentum(species_name, source_name, "ncolocatedpercell", h_inj_mom,
                                 ux_parser, uy_parser, uz_parser,
                                 ux_th_parser, uy_th_parser, uz_th_parser,
                                 h_mom_temp, h_mom_vel);
