@@ -323,9 +323,11 @@ namespace {
             // as the non-quiet variant). N_ppc must be a perfect cube; the
             // per-axis quantile lattice has N_half = round(N_ppc^(1/3)) points.
             WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
-                style == "nuniformpercell" || style == "nrandompercell",
+                style == "nuniformpercell" || style == "nrandompercell"
+                || style == "ncolocatedpercell",
                 "gaussian_parse_momentum_function_quiet requires "
-                "injection_style = NUniformPerCell or NRandomPerCell");
+                "injection_style = NUniformPerCell, NRandomPerCell, or "
+                "NColocatedPerCell");
 
             // Determine N_ppc from the calling injection style.
             int num_particles_per_cell = 0;
@@ -342,7 +344,7 @@ namespace {
                 for (int d = 0; d < AMREX_SPACEDIM; ++d) {
                     num_particles_per_cell *= ppc_each_dim[d];
                 }
-            } else { // nrandompercell
+            } else { // nrandompercell or ncolocatedpercell -- both use scalar
                 utils::parser::getWithParser(pp_species, source_name,
                                              "num_particles_per_cell",
                                              num_particles_per_cell);
