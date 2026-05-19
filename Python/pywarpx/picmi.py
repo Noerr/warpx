@@ -621,7 +621,16 @@ class DensityDistributionBase(object):
         if hasattr(self, "momentum_spread_expressions") and np.any(
             np.not_equal(self.momentum_spread_expressions, None)
         ):
-            species.momentum_distribution_type = "gaussian_parse_momentum_function"
+            if getattr(self, "velocity_quiet_start", False):
+                # Deterministic antithetic Gaussian quiet-velocity start.
+                # Requires N_ppc to be a perfect cube (8, 27, 64, ..., 4096)
+                # and an nuniformpercell or nrandompercell layout. The C++
+                # injector validates at setup time.
+                species.momentum_distribution_type = (
+                    "gaussian_parse_momentum_function_quiet"
+                )
+            else:
+                species.momentum_distribution_type = "gaussian_parse_momentum_function"
             self.setup_parse_momentum_functions(
                 species,
                 source_name,
@@ -852,6 +861,25 @@ class AnalyticDistribution(
         Parameters can be used in the expression with the values given as keyword arguments.
         For any axis not supplied (set to None), zero will be used.
 
+    warpx_velocity_quiet_start: bool, default False
+        If True, draw particle velocities from a deterministic antithetic lattice
+        on the inverse-Gaussian-CDF quantiles instead of independent random samples.
+        Produces a per-cell first moment of velocity equal to the prescribed drift
+        to floating-point round-off, eliminating the shot-noise on the deposited
+        current density that an independent-sample Maxwellian generates.
+
+        The velocity lattice is always 3D regardless of position-space
+        dimensionality, so this requires ``n_macroparticles_per_cell`` to be a
+        perfect cube (8, 27, 64, 125, 216, 343, 512, 729, 1000, 1331, 1728, 2197,
+        2744, 3375, 4096). Only valid with ``GriddedLayout`` (nuniformpercell) or
+        ``PseudoRandomLayout`` (nrandompercell). Aborts otherwise. Default off;
+        backward compatible.
+
+        Requires ``warpx_momentum_spread_expressions`` to be set; the per-axis
+        thermal-spread parser expressions scale the deterministic quantile
+        lattice. The same drift parser expressions used by the random variant
+        apply unchanged.
+
     """
 
     def init(self, kw):
@@ -860,6 +888,7 @@ class AnalyticDistribution(
         self.momentum_spread_expressions = kw.pop(
             "warpx_momentum_spread_expressions", [None, None, None]
         )
+        self.velocity_quiet_start = kw.pop("warpx_velocity_quiet_start", False)
 
     def distribution_initialize_inputs(
         self, species_number, layout, species, density_scale, source_name

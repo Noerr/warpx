@@ -1408,6 +1408,19 @@ Particle initialization
       * ``<species_name>.momentum_function_uy_th(x,y,z)``: standard deviation of :math:`u_{y}`
       * ``<species_name>.momentum_function_uz_th(x,y,z)``: standard deviation of :math:`u_{z}`
 
+    * ``gaussian_parse_momentum_function_quiet``: deterministic antithetic Gaussian quiet-velocity start.
+      Takes the same six ``momentum_function_u*_{m,th}(x,y,z)`` parser arguments as ``gaussian_parse_momentum_function``,
+      but draws particle velocities from a 3D tensor-product lattice on the inverse-Gaussian-CDF quantiles
+      instead of independent random samples. The per-cell first moment of velocity equals the prescribed
+      drift to floating-point round-off (the quantile lattice is symmetric about 0 analytically),
+      eliminating the shot-noise on the deposited current density :math:`J` that an independent-sample
+      Maxwellian generates. This is the velocity-space analog of the existing ``nuniformpercell`` quiet
+      position start. The velocity lattice is always 3D regardless of position-space dimensionality, so
+      this requires ``n_macroparticles_per_cell`` (or the product of ``num_particles_per_cell_each_dim``)
+      to be a perfect cube in [1, 4096] (i.e. 1, 8, 27, 64, 125, 216, 343, 512, 729, 1000, 1331, 1728,
+      2197, 2744, 3375, 4096); the code aborts at setup with a clear error otherwise. Only valid when
+      paired with ``injection_style = NUniformPerCell`` or ``NRandomPerCell``.
+
 * ``<species_name>.theta_distribution_type`` (`string`) optional (default ``constant``)
     Only read if ``<species_name>.momentum_distribution_type`` is ``maxwell_boltzmann`` or ``maxwell_juttner``.
     See documentation for these distributions (above) for constraints on values of theta. Temperatures less than zero are not allowed.
