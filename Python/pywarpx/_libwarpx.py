@@ -82,10 +82,12 @@ class LibWarpX:
 
         if _dims == "RZ":
             self.geometry_dim = "rz"
+        elif _dims == "RCYLINDER":
+            self.geometry_dim = "rcylinder"
         elif _dims == "1" or _dims == "2" or _dims == "3":
             self.geometry_dim = "%dd" % int(_dims)
         else:
-            raise Exception("Undefined geometry %d" % _dims)
+            raise Exception("Undefined geometry %s" % _dims)
 
         try:
             if self.geometry_dim == "1d":
@@ -112,6 +114,14 @@ class LibWarpX:
 
                 self.libwarpx_so = cxx_rz
                 self.dim = 2
+            elif self.geometry_dim == "rcylinder":
+                import amrex.space1d as amr
+
+                self.amr = amr
+                from . import warpx_pybind_rcylinder as cxx_rcyl
+
+                self.libwarpx_so = cxx_rcyl
+                self.dim = 1
             elif self.geometry_dim == "3d":
                 import amrex.space3d as amr
 
