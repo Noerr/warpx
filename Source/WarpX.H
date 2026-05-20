@@ -1105,6 +1105,11 @@ private:
         const ablastr::fields::MultiLevelVectorField& J_cp,
         const ablastr::fields::MultiLevelVectorField& J_buffer,
         int lev);
+public:
+    // Sum ghost-cell contributions of a current MultiFab triplet back into the
+    // owning interior cells. Exposed so per-species diagnostic functors (e.g.
+    // JFunctor for j*_<species>) can match the partition-boundary handling
+    // that the live current_fp receives via SyncCurrent every physics step.
     void SumBoundaryJ (
         const ablastr::fields::MultiLevelVectorField& current,
         int lev,
@@ -1114,6 +1119,7 @@ private:
         const ablastr::fields::MultiLevelVectorField& current,
         int lev,
         const amrex::Periodicity& period);
+private:
 
     void RestrictRhoFromFineToCoarsePatch (int lev );
     void ApplyFilterandSumBoundaryRho (
