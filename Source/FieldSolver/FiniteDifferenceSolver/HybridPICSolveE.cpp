@@ -584,11 +584,12 @@ void FiniteDifferenceSolver::HybridPICSolveECylindrical (
     // Create a temporary multifab to hold the nodal E-field values
     // Note the multifab has 3 values for Ex, Ey and Ez which we can do here
     // since all three components will be calculated on the same grid.
+    // For multi-mode RZ each spatial direction carries (2*nmodes - 1) components.
     // Also note that enE_nodal_mf does not need to have any guard cells since
     // these values will be interpolated to the Yee mesh which is contained
     // by the nodal mesh.
     auto const& ba = convert(rhofield.boxArray(), IntVect::TheNodeVector());
-    MultiFab enE_nodal_mf(ba, rhofield.DistributionMap(), 3, IntVect::TheZeroVector());
+    MultiFab enE_nodal_mf(ba, rhofield.DistributionMap(), 3 * (2*m_nmodes - 1), IntVect::TheZeroVector());
 
     // Loop through the grids, and over the tiles within each grid for the
     // initial, nodal calculation of E

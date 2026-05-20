@@ -166,12 +166,6 @@ void HybridPICModel::AllocateLevelMFs (
             Bx_nodal_flag, By_nodal_flag, Bz_nodal_flag
         );
     }
-
-#ifdef WARPX_DIM_RZ
-    WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
-        (ncomps == 1),
-        "Ohm's law solver only support m = 0 azimuthal mode at present.");
-#endif
 }
 
 void HybridPICModel::InitData (const ablastr::fields::MultiFabRegister& fields)
