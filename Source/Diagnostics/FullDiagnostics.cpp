@@ -724,6 +724,14 @@ FullDiagnostics::AddRZModesToOutputNames (const std::string& field, int ncomp){
         m_varnames.push_back( field + "_" + std::to_string(ic) + "_real" );
         m_varnames.push_back( field + "_" + std::to_string(ic) + "_imag" );
     }
+#elif defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE)
+    // RCYLINDER / RSPHERE have no azimuthal-mode decomposition (m=0 only),
+    // so push a single bare field name. Without this, the openPMD path in
+    // InitializeFieldFunctorsRZopenPMD adds a functor for each requested
+    // field but never adds the matching varname, and the assertion
+    // ncomp_from_src == m_varnames.size() fails at the end.
+    amrex::ignore_unused(ncomp);
+    m_varnames.push_back(field);
 #else
     amrex::ignore_unused(field, ncomp);
 #endif
