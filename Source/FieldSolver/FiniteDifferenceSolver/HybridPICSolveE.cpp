@@ -21,12 +21,110 @@
 #endif
 #include "HybridPICModel/HybridPICModel.H"
 #include "Utils/TextMsg.H"
+#include "Utils/WarpXConst.H"
 #include "WarpX.H"
 
 #include <ablastr/coarsen/sample.H>
 
+#include <cmath>
+
 using namespace amrex;
 using warpx::fields::FieldType;
+
+#if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER)
+namespace {
+
+// Compile-time upper bound on n_rz_azimuthal_modes for the pseudo-spectral
+// kernel below. Determines the size of stack-allocated theta-grid buffers
+// inside the per-cell ParallelFor lambdas. Increase if you need more modes.
+constexpr int MAX_PSEUDO_SPECTRAL_NMODES = 8;
+constexpr int MAX_PSEUDO_SPECTRAL_NTHETA = 2 * MAX_PSEUDO_SPECTRAL_NMODES - 1;
+
+// Inverse azimuthal Fourier transform from modal storage to theta-grid values.
+// Convention matches WarpX RZ deposition/gather:
+//   A(theta) = A_0 + sum_{m>=1} [Re(A_m) cos(m*theta) + Im(A_m) sin(m*theta)]
+// (factor-of-2 absorbed into the stored amplitudes for m >= 1).
+//
+// `A_modes` has (2*nmodes - 1) entries: [A_0, Re(A_1), Im(A_1), Re(A_2), ...].
+// `A_theta` is filled with `n_theta` real-space values at theta_k = 2*pi*k/n_theta.
+AMREX_GPU_DEVICE AMREX_FORCE_INLINE
+void inverse_az_ft (int nmodes, int n_theta,
+                    amrex::Real const* AMREX_RESTRICT A_modes,
+                    amrex::Real* AMREX_RESTRICT A_theta)
+{
+    for (int k = 0; k < n_theta; ++k) {
+        const amrex::Real theta_k = (2._rt * MathConst::pi * k) / n_theta;
+        amrex::Real val = A_modes[0];
+        for (int m = 1; m < nmodes; ++m) {
+            const amrex::Real c = std::cos(m * theta_k);
+            const amrex::Real s = std::sin(m * theta_k);
+            val += A_modes[2*m - 1] * c + A_modes[2*m] * s;
+        }
+        A_theta[k] = val;
+    }
+}
+
+// Forward azimuthal Fourier transform from theta-grid values to modal storage.
+//   A_0    = (1/n_theta) sum_k A(theta_k)
+//   A_m_re = (2/n_theta) sum_k A(theta_k) cos(m*theta_k)   for m >= 1
+//   A_m_im = (2/n_theta) sum_k A(theta_k) sin(m*theta_k)   for m >= 1
+AMREX_GPU_DEVICE AMREX_FORCE_INLINE
+void forward_az_ft (int nmodes, int n_theta,
+                    amrex::Real const* AMREX_RESTRICT A_theta,
+                    amrex::Real* AMREX_RESTRICT A_modes)
+{
+    amrex::Real a0 = 0._rt;
+    for (int k = 0; k < n_theta; ++k) { a0 += A_theta[k]; }
+    A_modes[0] = a0 / n_theta;
+    for (int m = 1; m < nmodes; ++m) {
+        amrex::Real ar = 0._rt, ai = 0._rt;
+        for (int k = 0; k < n_theta; ++k) {
+            const amrex::Real theta_k = (2._rt * MathConst::pi * k) / n_theta;
+            ar += A_theta[k] * std::cos(m * theta_k);
+            ai += A_theta[k] * std::sin(m * theta_k);
+        }
+        A_modes[2*m - 1] = (2._rt * ar) / n_theta;
+        A_modes[2*m    ] = (2._rt * ai) / n_theta;
+    }
+}
+
+// Enforce on-axis modal boundary conditions for a scalar field (rho, P_e).
+// Smoothness in (x, y) requires modes m>=1 to vanish as r^m near the axis,
+// so on the axis itself they are zero.
+AMREX_GPU_DEVICE AMREX_FORCE_INLINE
+void apply_axis_bc_scalar (int nmodes, amrex::Real* AMREX_RESTRICT A_modes)
+{
+    for (int m = 1; m < nmodes; ++m) {
+        A_modes[2*m - 1] = 0._rt;
+        A_modes[2*m    ] = 0._rt;
+    }
+}
+
+// Enforce on-axis modal BCs for the (r, theta) components of a vector field.
+// V_r,0(0) = V_theta,0(0) = 0; V_z behaves as a scalar (handled separately).
+// For m == 1, regularity demands Re(V_r)= -Im(V_theta), Im(V_r)= +Re(V_theta);
+// the *finite* m=1 amplitude must be read from the cell adjacent to the axis
+// (linear-in-r extrapolation), but for a first cut we zero m>=1 here and
+// rely on the surrounding kernels (Faraday, Ampere) to recover the m=1
+// cross-coupling from neighboring cells. This is consistent with how the
+// existing m=0 kernel treats on-axis (J, B, E) tangential components.
+AMREX_GPU_DEVICE AMREX_FORCE_INLINE
+void apply_axis_bc_vector_rt (int nmodes,
+                              amrex::Real* AMREX_RESTRICT Vr_modes,
+                              amrex::Real* AMREX_RESTRICT Vt_modes)
+{
+    Vr_modes[0] = 0._rt;
+    Vt_modes[0] = 0._rt;
+    for (int m = 1; m < nmodes; ++m) {
+        Vr_modes[2*m - 1] = 0._rt;
+        Vr_modes[2*m    ] = 0._rt;
+        Vt_modes[2*m - 1] = 0._rt;
+        Vt_modes[2*m    ] = 0._rt;
+    }
+}
+
+} // anonymous namespace
+#endif // defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER)
 
 void FiniteDifferenceSolver::CalculateCurrentAmpere (
     ablastr::fields::VectorField & Jfield,
@@ -968,13 +1066,474 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
     int lev, HybridPICModel const* hybrid_model,
     const bool solve_for_Faraday )
 {
-    // Stage 2.1: pseudo-spectral kernel not yet implemented. Delegate to the
-    // m=0-only kernel so the runtime dispatch is exercised and behavior is
-    // unchanged when `hybrid_pic_model.use_pseudo_spectral_E = 1` at N=1.
-    // The actual pseudo-spectral algorithm lands in a follow-up commit.
-    HybridPICSolveECylindrical<T_Algo>(
-        Efield, Jfield, Jifield, Bfield, rhofield, Pefield,
-        eb_update_E, lev, hybrid_model, solve_for_Faraday );
+    // Pseudo-spectral azimuthal-mode Ohm's-law E-solve.
+    //
+    // Structure mirrors HybridPICSolveECylindrical:
+    //   Pass 1 (nodal): compute (J - J_i) x B per azimuthal mode and store
+    //                   in a 3*ncomps-component nodal scratch MultiFab.
+    //   Pass 2 (Yee):   for each component r/theta/z and each mode,
+    //                   E = (enE - grad P_e) / (e rho), plus eta J (resistivity
+    //                   on the Faraday update path).
+    //
+    // The nonlinear pieces ((J - J_i) x B, the 1/rho factor, eta(rho, |J|))
+    // are evaluated by inverse-FT'ing each cell's modal inputs to an
+    // azimuthal grid of n_theta = 2*nmodes - 1 points, doing the pointwise
+    // arithmetic in real (r, z, theta) space, and forward-FT'ing back to
+    // modes. At nmodes = 1 both FTs degenerate to the identity and the
+    // kernel reduces to the same scalar arithmetic as the m=0-only routine.
+
+    const int nmodes = m_nmodes;
+    const int ncomps = 2 * nmodes - 1;
+    const int n_theta = 2 * nmodes - 1;
+
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+        nmodes <= MAX_PSEUDO_SPECTRAL_NMODES,
+        "n_rz_azimuthal_modes exceeds MAX_PSEUDO_SPECTRAL_NMODES; "
+        "increase the compile-time bound in HybridPICSolveE.cpp.");
+
+    // First-cut feature gating: lift in follow-up commits once each path is
+    // generalized to multi-mode separately. Both pieces introduce additional
+    // nonlinearities (Laplacian-of-J / external-field couplings).
+    WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
+        !hybrid_model->m_include_hyper_resistivity_term,
+        "Pseudo-spectral hybrid solver: hyper-resistivity is not yet supported.");
+    WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
+        !hybrid_model->m_add_external_fields,
+        "Pseudo-spectral hybrid solver: external E/B fields are not yet supported.");
+
+    // for the profiler
+    amrex::LayoutData<amrex::Real>* cost = WarpX::getCosts(lev);
+
+    using namespace ablastr::coarsen::sample;
+
+    // get hybrid model parameters
+    const auto eta = hybrid_model->m_eta;
+    const auto rho_floor = hybrid_model->m_n_floor * PhysConst::q_e;
+    const auto resistivity_has_J_dependence = hybrid_model->m_resistivity_has_J_dependence;
+    const bool holmstrom_vacuum_region = hybrid_model->m_holmstrom_vacuum_region;
+
+    // Index type required for interpolating fields from their respective
+    // staggering to the Er, Etheta, Ez locations
+    amrex::GpuArray<int, 3> const& Er_stag     = hybrid_model->Ex_IndexType;
+    amrex::GpuArray<int, 3> const& Etheta_stag = hybrid_model->Ey_IndexType;
+    amrex::GpuArray<int, 3> const& Ez_stag     = hybrid_model->Ez_IndexType;
+    amrex::GpuArray<int, 3> const& Jr_stag     = hybrid_model->Jx_IndexType;
+    amrex::GpuArray<int, 3> const& Jtheta_stag = hybrid_model->Jy_IndexType;
+    amrex::GpuArray<int, 3> const& Jz_stag     = hybrid_model->Jz_IndexType;
+    amrex::GpuArray<int, 3> const& Br_stag     = hybrid_model->Bx_IndexType;
+    amrex::GpuArray<int, 3> const& Btheta_stag = hybrid_model->By_IndexType;
+    amrex::GpuArray<int, 3> const& Bz_stag     = hybrid_model->Bz_IndexType;
+
+    amrex::GpuArray<int, 3> const& nodal   = {1, 1, 1};
+    amrex::GpuArray<int, 3> const& coarsen = {1, 1, 1};
+
+    // 3*ncomps components on the nodal scratch: components
+    //   [0 .. ncomps-1]            -> r-direction modal pieces
+    //   [ncomps .. 2*ncomps-1]     -> theta-direction modal pieces
+    //   [2*ncomps .. 3*ncomps-1]   -> z-direction modal pieces
+    auto const& ba = convert(rhofield.boxArray(), IntVect::TheNodeVector());
+    MultiFab enE_nodal_mf(ba, rhofield.DistributionMap(), 3 * ncomps,
+                          IntVect::TheZeroVector());
+
+    // =====================================================================
+    // Pass 1 : compute modal (J - J_i) x B on the nodal grid
+    // =====================================================================
+#ifdef AMREX_USE_OMP
+#pragma omp parallel if (amrex::Gpu::notInLaunchRegion())
+#endif
+    for ( MFIter mfi(enE_nodal_mf, TilingIfNotGPU()); mfi.isValid(); ++mfi ) {
+        if (cost && WarpX::load_balance_costs_update_algo == LoadBalanceCostsUpdateAlgo::Timers)
+        {
+            amrex::Gpu::synchronize();
+        }
+        Real wt = static_cast<Real>(amrex::second());
+
+        Array4<Real> const& enE_nodal     = enE_nodal_mf.array(mfi);
+        Array4<Real const> const& Jr      = Jfield[0]->const_array(mfi);
+        Array4<Real const> const& Jtheta  = Jfield[1]->const_array(mfi);
+        Array4<Real const> const& Jz      = Jfield[2]->const_array(mfi);
+        Array4<Real const> const& Jir     = Jifield[0]->const_array(mfi);
+        Array4<Real const> const& Jit     = Jifield[1]->const_array(mfi);
+        Array4<Real const> const& Jiz     = Jifield[2]->const_array(mfi);
+        Array4<Real const> const& Br      = Bfield[0]->const_array(mfi);
+        Array4<Real const> const& Btheta  = Bfield[1]->const_array(mfi);
+        Array4<Real const> const& Bz      = Bfield[2]->const_array(mfi);
+
+        amrex::ParallelFor(mfi.tilebox(),
+        [=] AMREX_GPU_DEVICE (int i, int j, int /*k*/) {
+
+            // Modal samples at this nodal cell, after stagger interpolation.
+            Real Br_m [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+            Real Bt_m [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+            Real Bz_m [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+            Real Jr_m [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+            Real Jt_m [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+            Real Jz_m [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+            Real Jir_m[MAX_PSEUDO_SPECTRAL_NMODES * 2];
+            Real Jit_m[MAX_PSEUDO_SPECTRAL_NMODES * 2];
+            Real Jiz_m[MAX_PSEUDO_SPECTRAL_NMODES * 2];
+
+            for (int c = 0; c < ncomps; ++c) {
+                Br_m [c] = Interp(Br,     Br_stag,     nodal, coarsen, i, j, 0, c);
+                Bt_m [c] = Interp(Btheta, Btheta_stag, nodal, coarsen, i, j, 0, c);
+                Bz_m [c] = Interp(Bz,     Bz_stag,     nodal, coarsen, i, j, 0, c);
+                Jr_m [c] = Interp(Jr,     Jr_stag,     nodal, coarsen, i, j, 0, c);
+                Jt_m [c] = Interp(Jtheta, Jtheta_stag, nodal, coarsen, i, j, 0, c);
+                Jz_m [c] = Interp(Jz,     Jz_stag,     nodal, coarsen, i, j, 0, c);
+                Jir_m[c] = Interp(Jir,    Jr_stag,     nodal, coarsen, i, j, 0, c);
+                Jit_m[c] = Interp(Jit,    Jtheta_stag, nodal, coarsen, i, j, 0, c);
+                Jiz_m[c] = Interp(Jiz,    Jz_stag,     nodal, coarsen, i, j, 0, c);
+            }
+
+            // On-axis modal BCs (regularity in (x, y) Cartesian coords).
+            // Nodal i == 0 corresponds to r == 0 exactly.
+            if (i == 0) {
+                apply_axis_bc_vector_rt(nmodes, Br_m,  Bt_m);
+                apply_axis_bc_vector_rt(nmodes, Jr_m,  Jt_m);
+                apply_axis_bc_vector_rt(nmodes, Jir_m, Jit_m);
+                // V_z behaves as a scalar: only m >= 1 modes are forced to zero.
+                apply_axis_bc_scalar(nmodes, Bz_m);
+                apply_axis_bc_scalar(nmodes, Jz_m);
+                apply_axis_bc_scalar(nmodes, Jiz_m);
+            }
+
+            // Inverse FT each modal array to theta-grid samples.
+            Real Br_th [MAX_PSEUDO_SPECTRAL_NTHETA];
+            Real Bt_th [MAX_PSEUDO_SPECTRAL_NTHETA];
+            Real Bz_th [MAX_PSEUDO_SPECTRAL_NTHETA];
+            Real Jr_th [MAX_PSEUDO_SPECTRAL_NTHETA];
+            Real Jt_th [MAX_PSEUDO_SPECTRAL_NTHETA];
+            Real Jz_th [MAX_PSEUDO_SPECTRAL_NTHETA];
+            Real Jir_th[MAX_PSEUDO_SPECTRAL_NTHETA];
+            Real Jit_th[MAX_PSEUDO_SPECTRAL_NTHETA];
+            Real Jiz_th[MAX_PSEUDO_SPECTRAL_NTHETA];
+
+            inverse_az_ft(nmodes, n_theta, Br_m,  Br_th);
+            inverse_az_ft(nmodes, n_theta, Bt_m,  Bt_th);
+            inverse_az_ft(nmodes, n_theta, Bz_m,  Bz_th);
+            inverse_az_ft(nmodes, n_theta, Jr_m,  Jr_th);
+            inverse_az_ft(nmodes, n_theta, Jt_m,  Jt_th);
+            inverse_az_ft(nmodes, n_theta, Jz_m,  Jz_th);
+            inverse_az_ft(nmodes, n_theta, Jir_m, Jir_th);
+            inverse_az_ft(nmodes, n_theta, Jit_m, Jit_th);
+            inverse_az_ft(nmodes, n_theta, Jiz_m, Jiz_th);
+
+            // Pointwise (J - J_i) x B at each theta_k.
+            Real enE_r_th[MAX_PSEUDO_SPECTRAL_NTHETA];
+            Real enE_t_th[MAX_PSEUDO_SPECTRAL_NTHETA];
+            Real enE_z_th[MAX_PSEUDO_SPECTRAL_NTHETA];
+            for (int k = 0; k < n_theta; ++k) {
+                const Real dJr = Jr_th[k] - Jir_th[k];
+                const Real dJt = Jt_th[k] - Jit_th[k];
+                const Real dJz = Jz_th[k] - Jiz_th[k];
+                enE_r_th[k] = dJt * Bz_th[k] - dJz * Bt_th[k];
+                enE_t_th[k] = dJz * Br_th[k] - dJr * Bz_th[k];
+                enE_z_th[k] = dJr * Bt_th[k] - dJt * Br_th[k];
+            }
+
+            // Forward FT back to modes and store.
+            Real enE_r_m[MAX_PSEUDO_SPECTRAL_NMODES * 2];
+            Real enE_t_m[MAX_PSEUDO_SPECTRAL_NMODES * 2];
+            Real enE_z_m[MAX_PSEUDO_SPECTRAL_NMODES * 2];
+            forward_az_ft(nmodes, n_theta, enE_r_th, enE_r_m);
+            forward_az_ft(nmodes, n_theta, enE_t_th, enE_t_m);
+            forward_az_ft(nmodes, n_theta, enE_z_th, enE_z_m);
+
+            for (int c = 0; c < ncomps; ++c) {
+                enE_nodal(i, j, 0, 0*ncomps + c) = enE_r_m[c];
+                enE_nodal(i, j, 0, 1*ncomps + c) = enE_t_m[c];
+                enE_nodal(i, j, 0, 2*ncomps + c) = enE_z_m[c];
+            }
+        });
+
+        if (cost && WarpX::load_balance_costs_update_algo == LoadBalanceCostsUpdateAlgo::Timers)
+        {
+            amrex::Gpu::synchronize();
+            wt = static_cast<Real>(amrex::second()) - wt;
+            amrex::HostDevice::Atomic::Add( &(*cost)[mfi.index()], wt);
+        }
+    }
+
+    // =====================================================================
+    // Pass 2 : compute modal E on the Yee staggering
+    // =====================================================================
+#ifdef AMREX_USE_OMP
+#pragma omp parallel if (amrex::Gpu::notInLaunchRegion())
+#endif
+    for ( MFIter mfi(*Efield[0], TilingIfNotGPU()); mfi.isValid(); ++mfi ) {
+        if (cost && WarpX::load_balance_costs_update_algo == LoadBalanceCostsUpdateAlgo::Timers)
+        {
+            amrex::Gpu::synchronize();
+        }
+        Real wt = static_cast<Real>(amrex::second());
+
+        Array4<Real> const& Er             = Efield[0]->array(mfi);
+        Array4<Real> const& Etheta         = Efield[1]->array(mfi);
+        Array4<Real> const& Ez             = Efield[2]->array(mfi);
+        Array4<Real const> const& Jr       = Jfield[0]->const_array(mfi);
+        Array4<Real const> const& Jtheta   = Jfield[1]->const_array(mfi);
+        Array4<Real const> const& Jz       = Jfield[2]->const_array(mfi);
+        Array4<Real const> const& enE      = enE_nodal_mf.const_array(mfi);
+        Array4<Real const> const& rho      = rhofield.const_array(mfi);
+        Array4<Real const> const& Pe       = Pefield.const_array(mfi);
+
+        amrex::Array4<int> update_Er_arr, update_Etheta_arr, update_Ez_arr;
+        if (EB::enabled()) {
+            update_Er_arr     = eb_update_E[0]->array(mfi);
+            update_Etheta_arr = eb_update_E[1]->array(mfi);
+            update_Ez_arr     = eb_update_E[2]->array(mfi);
+        }
+
+        Real const * const AMREX_RESTRICT coefs_r = m_stencil_coefs_r.dataPtr();
+        int const n_coefs_r = static_cast<int>(m_stencil_coefs_r.size());
+        Real const * const AMREX_RESTRICT coefs_z = m_stencil_coefs_z.dataPtr();
+        int const n_coefs_z = static_cast<int>(m_stencil_coefs_z.size());
+
+        Real const dr = m_dr;
+        Real const rmin = m_rmin;
+
+        Box const& ter = mfi.tilebox(Efield[0]->ixType().toIntVect());
+        Box const& tet = mfi.tilebox(Efield[1]->ixType().toIntVect());
+        Box const& tez = mfi.tilebox(Efield[2]->ixType().toIntVect());
+
+        amrex::ParallelFor(ter, tet, tez,
+
+            // --------------------------- E_r ---------------------------
+            [=] AMREX_GPU_DEVICE (int i, int j, int /*k*/) {
+
+                if (update_Er_arr && update_Er_arr(i, j, 0) == 0) { return; }
+
+                // Modal inputs interpolated to the E_r stagger.
+                Real enE_r_m[MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real rho_m  [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real gPr_m  [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real Jr_m   [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real Jt_m   [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real Jz_m   [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+
+                for (int c = 0; c < ncomps; ++c) {
+                    enE_r_m[c] = Interp(enE, nodal, Er_stag, coarsen, i, j, 0, 0*ncomps + c);
+                    rho_m  [c] = Interp(rho, nodal, Er_stag, coarsen, i, j, 0, c);
+                    // grad P_e radial component: d/dr of nodal P_e mode-by-mode.
+                    gPr_m  [c] = T_Algo::UpwardDr(Pe, coefs_r, n_coefs_r, i, j, 0, c);
+                    Jr_m   [c] = Jr(i, j, 0, c);
+                    Jt_m   [c] = Interp(Jtheta, Jtheta_stag, Er_stag, coarsen, i, j, 0, c);
+                    Jz_m   [c] = Interp(Jz,     Jz_stag,     Er_stag, coarsen, i, j, 0, c);
+                }
+
+                // Inverse FT to theta-grid.
+                Real enE_r_th[MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real rho_th  [MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real gPr_th  [MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real Jr_th   [MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real Jt_th   [MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real Jz_th   [MAX_PSEUDO_SPECTRAL_NTHETA];
+                inverse_az_ft(nmodes, n_theta, enE_r_m, enE_r_th);
+                inverse_az_ft(nmodes, n_theta, rho_m,   rho_th);
+                inverse_az_ft(nmodes, n_theta, gPr_m,   gPr_th);
+                inverse_az_ft(nmodes, n_theta, Jr_m,    Jr_th);
+                inverse_az_ft(nmodes, n_theta, Jt_m,    Jt_th);
+                inverse_az_ft(nmodes, n_theta, Jz_m,    Jz_th);
+
+                Real Er_th[MAX_PSEUDO_SPECTRAL_NTHETA];
+                for (int k = 0; k < n_theta; ++k) {
+                    if (rho_th[k] < rho_floor && holmstrom_vacuum_region) {
+                        Er_th[k] = 0._rt;
+                        continue;
+                    }
+                    const Real rho_lim = amrex::max(rho_th[k], rho_floor);
+                    const Real grad_Pe_k = solve_for_Faraday ? 0._rt : gPr_th[k];
+                    Er_th[k] = (enE_r_th[k] - grad_Pe_k) / rho_lim;
+
+                    if (solve_for_Faraday) {
+                        Real jmag = 0._rt;
+                        if (resistivity_has_J_dependence) {
+                            jmag = std::sqrt(Jr_th[k]*Jr_th[k]
+                                           + Jt_th[k]*Jt_th[k]
+                                           + Jz_th[k]*Jz_th[k]);
+                        }
+                        Er_th[k] += eta(rho_th[k], jmag) * Jr_th[k];
+                    }
+                }
+
+                Real Er_m[MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                forward_az_ft(nmodes, n_theta, Er_th, Er_m);
+                for (int c = 0; c < ncomps; ++c) {
+                    Er(i, j, 0, c) = Er_m[c];
+                }
+            },
+
+            // -------------------------- E_theta ------------------------
+            [=] AMREX_GPU_DEVICE (int i, int j, int /*k*/) {
+
+                if (update_Etheta_arr && update_Etheta_arr(i, j, 0) == 0) { return; }
+
+                // r at the E_theta stagger (nodal in r): i=0 is on axis.
+                const Real r = rmin + i * dr;
+
+                if (r < 0.5_rt * dr) {
+                    // On axis: V_theta,0 = 0, and for m >= 2 V_theta,m = 0.
+                    // The m=1 cross-coupling with V_r is enforced elsewhere
+                    // (Ampere/Faraday) via linear-in-r extrapolation, so we
+                    // zero all modes here to match the existing m=0 behavior.
+                    for (int c = 0; c < ncomps; ++c) { Etheta(i, j, 0, c) = 0._rt; }
+                    return;
+                }
+
+                Real enE_t_m[MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real rho_m  [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real gPt_m  [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real Jr_m   [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real Jt_m   [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real Jz_m   [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+
+                // P_e at E_theta stagger (needed for the (-i m / r) factor).
+                Real Pe_m   [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+
+                for (int c = 0; c < ncomps; ++c) {
+                    enE_t_m[c] = Interp(enE, nodal, Etheta_stag, coarsen, i, j, 0, 1*ncomps + c);
+                    rho_m  [c] = Interp(rho, nodal, Etheta_stag, coarsen, i, j, 0, c);
+                    Pe_m   [c] = Interp(Pe,  nodal, Etheta_stag, coarsen, i, j, 0, c);
+                    Jr_m   [c] = Interp(Jr,     Jr_stag,     Etheta_stag, coarsen, i, j, 0, c);
+                    Jt_m   [c] = Jtheta(i, j, 0, c);
+                    Jz_m   [c] = Interp(Jz,     Jz_stag,     Etheta_stag, coarsen, i, j, 0, c);
+                }
+
+                // grad P_e theta-component: in modes it is (-i m P_m) / r.
+                // The result of (-i*m) acting on (Re + i Im) is (m*Im - i*m*Re),
+                // so stored Re <- m*Im_input, Im <- -m*Re_input, divided by r.
+                gPt_m[0] = 0._rt; // d/dtheta of mode 0 is zero
+                for (int m = 1; m < nmodes; ++m) {
+                    const Real Pe_re = Pe_m[2*m - 1];
+                    const Real Pe_im = Pe_m[2*m    ];
+                    gPt_m[2*m - 1] =  (m * Pe_im) / r;
+                    gPt_m[2*m    ] = -(m * Pe_re) / r;
+                }
+
+                Real enE_t_th[MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real rho_th  [MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real gPt_th  [MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real Jr_th   [MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real Jt_th   [MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real Jz_th   [MAX_PSEUDO_SPECTRAL_NTHETA];
+                inverse_az_ft(nmodes, n_theta, enE_t_m, enE_t_th);
+                inverse_az_ft(nmodes, n_theta, rho_m,   rho_th);
+                inverse_az_ft(nmodes, n_theta, gPt_m,   gPt_th);
+                inverse_az_ft(nmodes, n_theta, Jr_m,    Jr_th);
+                inverse_az_ft(nmodes, n_theta, Jt_m,    Jt_th);
+                inverse_az_ft(nmodes, n_theta, Jz_m,    Jz_th);
+
+                Real Et_th[MAX_PSEUDO_SPECTRAL_NTHETA];
+                for (int k = 0; k < n_theta; ++k) {
+                    if (rho_th[k] < rho_floor && holmstrom_vacuum_region) {
+                        Et_th[k] = 0._rt;
+                        continue;
+                    }
+                    const Real rho_lim = amrex::max(rho_th[k], rho_floor);
+                    const Real grad_Pe_k = solve_for_Faraday ? 0._rt : gPt_th[k];
+                    Et_th[k] = (enE_t_th[k] - grad_Pe_k) / rho_lim;
+
+                    if (solve_for_Faraday) {
+                        Real jmag = 0._rt;
+                        if (resistivity_has_J_dependence) {
+                            jmag = std::sqrt(Jr_th[k]*Jr_th[k]
+                                           + Jt_th[k]*Jt_th[k]
+                                           + Jz_th[k]*Jz_th[k]);
+                        }
+                        Et_th[k] += eta(rho_th[k], jmag) * Jt_th[k];
+                    }
+                }
+
+                Real Et_m[MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                forward_az_ft(nmodes, n_theta, Et_th, Et_m);
+                for (int c = 0; c < ncomps; ++c) {
+                    Etheta(i, j, 0, c) = Et_m[c];
+                }
+            },
+
+            // --------------------------- E_z ---------------------------
+            [=] AMREX_GPU_DEVICE (int i, int j, int /*k*/) {
+
+                if (update_Ez_arr && update_Ez_arr(i, j, 0) == 0) { return; }
+
+                Real enE_z_m[MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real rho_m  [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real gPz_m  [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real Jr_m   [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real Jt_m   [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real Jz_m   [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+
+                for (int c = 0; c < ncomps; ++c) {
+                    enE_z_m[c] = Interp(enE, nodal, Ez_stag, coarsen, i, j, 0, 2*ncomps + c);
+                    rho_m  [c] = Interp(rho, nodal, Ez_stag, coarsen, i, j, 0, c);
+                    gPz_m  [c] = T_Algo::UpwardDz(Pe, coefs_z, n_coefs_z, i, j, 0, c);
+                    Jr_m   [c] = Interp(Jr,     Jr_stag,     Ez_stag, coarsen, i, j, 0, c);
+                    Jt_m   [c] = Interp(Jtheta, Jtheta_stag, Ez_stag, coarsen, i, j, 0, c);
+                    Jz_m   [c] = Jz(i, j, 0, c);
+                }
+
+                // Ez stagger is nodal in r, so i=0 is on the axis. V_z behaves
+                // as a scalar: m=0 free, m>=1 zero on axis.
+                const Real r = rmin + i * dr;
+                if (r < 0.5_rt * dr) {
+                    apply_axis_bc_scalar(nmodes, enE_z_m);
+                    apply_axis_bc_scalar(nmodes, gPz_m);
+                    apply_axis_bc_scalar(nmodes, Jz_m);
+                    apply_axis_bc_scalar(nmodes, rho_m);
+                    // Note: at i=0, rho_m[0] (m=0) is still non-zero; the axis
+                    // BC only zeros m >= 1 contributions. The pointwise math
+                    // proceeds normally for m=0.
+                }
+
+                Real enE_z_th[MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real rho_th  [MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real gPz_th  [MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real Jr_th   [MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real Jt_th   [MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real Jz_th   [MAX_PSEUDO_SPECTRAL_NTHETA];
+                inverse_az_ft(nmodes, n_theta, enE_z_m, enE_z_th);
+                inverse_az_ft(nmodes, n_theta, rho_m,   rho_th);
+                inverse_az_ft(nmodes, n_theta, gPz_m,   gPz_th);
+                inverse_az_ft(nmodes, n_theta, Jr_m,    Jr_th);
+                inverse_az_ft(nmodes, n_theta, Jt_m,    Jt_th);
+                inverse_az_ft(nmodes, n_theta, Jz_m,    Jz_th);
+
+                Real Ez_th[MAX_PSEUDO_SPECTRAL_NTHETA];
+                for (int k = 0; k < n_theta; ++k) {
+                    if (rho_th[k] < rho_floor && holmstrom_vacuum_region) {
+                        Ez_th[k] = 0._rt;
+                        continue;
+                    }
+                    const Real rho_lim = amrex::max(rho_th[k], rho_floor);
+                    const Real grad_Pe_k = solve_for_Faraday ? 0._rt : gPz_th[k];
+                    Ez_th[k] = (enE_z_th[k] - grad_Pe_k) / rho_lim;
+
+                    if (solve_for_Faraday) {
+                        Real jmag = 0._rt;
+                        if (resistivity_has_J_dependence) {
+                            jmag = std::sqrt(Jr_th[k]*Jr_th[k]
+                                           + Jt_th[k]*Jt_th[k]
+                                           + Jz_th[k]*Jz_th[k]);
+                        }
+                        Ez_th[k] += eta(rho_th[k], jmag) * Jz_th[k];
+                    }
+                }
+
+                Real Ez_m[MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                forward_az_ft(nmodes, n_theta, Ez_th, Ez_m);
+                for (int c = 0; c < ncomps; ++c) {
+                    Ez(i, j, 0, c) = Ez_m[c];
+                }
+            }
+        );
+
+        if (cost && WarpX::load_balance_costs_update_algo == LoadBalanceCostsUpdateAlgo::Timers)
+        {
+            amrex::Gpu::synchronize();
+            wt = static_cast<Real>(amrex::second()) - wt;
+            amrex::HostDevice::Atomic::Add( &(*cost)[mfi.index()], wt);
+        }
+    }
 }
 
 #elif defined(WARPX_DIM_RSPHERE)
