@@ -314,6 +314,29 @@ class FiniteDifferenceSolver
             int lev, HybridPICModel const* hybrid_model,
             bool solve_for_Faraday );
 
+        /**
+         * \brief Pseudo-spectral azimuthal-mode Ohm's-law E-solve in RZ.
+         *
+         * Same inputs/outputs as `HybridPICSolveECylindrical`, but the
+         * nonlinear pieces of generalized Ohm's law (`J x B / (e rho)`,
+         * `grad P_e / (e rho)`, `eta(rho, J) J`, `eta_H(rho, B) Laplacian J`)
+         * are evaluated by inverse-FT'ing each input from azimuthal modes
+         * to an azimuthal grid of N_theta = 2*nmodes - 1 points, computing
+         * the RHS pointwise in real (r, z, theta) space, and forward-FT'ing
+         * back to modes. Activated by `hybrid_pic_model.use_pseudo_spectral_E`.
+         */
+        template<typename T_Algo>
+        void HybridPICSolveECylindricalMultiMode (
+            ablastr::fields::VectorField const& Efield,
+            ablastr::fields::VectorField const& Jfield,
+            ablastr::fields::VectorField const& Jifield,
+            ablastr::fields::VectorField const& Bfield,
+            amrex::MultiFab const& rhofield,
+            amrex::MultiFab const& Pefield,
+            std::array< std::unique_ptr<amrex::iMultiFab>,3> const& eb_update_E,
+            int lev, HybridPICModel const* hybrid_model,
+            bool solve_for_Faraday );
+
         template<typename T_Algo>
         void CalculateCurrentAmpereCylindrical (
             ablastr::fields::VectorField& Jfield,

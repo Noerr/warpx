@@ -177,6 +177,13 @@ public:
 
     bool m_holmstrom_vacuum_region = false;
 
+    /** Use the pseudo-spectral azimuthal-mode kernel for the Ohm's-law E-solve
+     *  in RZ. When false (default), the original m=0-only kernel is used.
+     *  When true, the kernel handles all `n_rz_azimuthal_modes` via
+     *  per-cell inverse/forward azimuthal Fourier transforms around the
+     *  nonlinear pieces of Ohm's law. No effect outside of RZ. */
+    bool m_use_pseudo_spectral_E = false;
+
     /** Electron temperature in eV */
     amrex::Real m_elec_temp;
     /** Reference electron density */

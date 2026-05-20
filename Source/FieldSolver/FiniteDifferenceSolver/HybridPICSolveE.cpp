@@ -482,10 +482,17 @@ void FiniteDifferenceSolver::HybridPICSolveE (
     if (m_fdtd_algo == ElectromagneticSolverAlgo::HybridPIC) {
 #if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER)
 
-        HybridPICSolveECylindrical <CylindricalYeeAlgorithm> (
-            Efield, Jfield, Jifield, Bfield, rhofield, Pefield,
-            eb_update_E, lev, hybrid_model, solve_for_Faraday
-        );
+        if (hybrid_model->m_use_pseudo_spectral_E) {
+            HybridPICSolveECylindricalMultiMode <CylindricalYeeAlgorithm> (
+                Efield, Jfield, Jifield, Bfield, rhofield, Pefield,
+                eb_update_E, lev, hybrid_model, solve_for_Faraday
+            );
+        } else {
+            HybridPICSolveECylindrical <CylindricalYeeAlgorithm> (
+                Efield, Jfield, Jifield, Bfield, rhofield, Pefield,
+                eb_update_E, lev, hybrid_model, solve_for_Faraday
+            );
+        }
 
 #elif defined(WARPX_DIM_RSPHERE)
 
@@ -947,6 +954,27 @@ void FiniteDifferenceSolver::HybridPICSolveECylindrical (
             amrex::HostDevice::Atomic::Add( &(*cost)[mfi.index()], wt);
         }
     }
+}
+
+template<typename T_Algo>
+void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
+    ablastr::fields::VectorField const& Efield,
+    ablastr::fields::VectorField const& Jfield,
+    ablastr::fields::VectorField const& Jifield,
+    ablastr::fields::VectorField const& Bfield,
+    amrex::MultiFab const& rhofield,
+    amrex::MultiFab const& Pefield,
+    std::array< std::unique_ptr<amrex::iMultiFab>,3 > const& eb_update_E,
+    int lev, HybridPICModel const* hybrid_model,
+    const bool solve_for_Faraday )
+{
+    // Stage 2.1: pseudo-spectral kernel not yet implemented. Delegate to the
+    // m=0-only kernel so the runtime dispatch is exercised and behavior is
+    // unchanged when `hybrid_pic_model.use_pseudo_spectral_E = 1` at N=1.
+    // The actual pseudo-spectral algorithm lands in a follow-up commit.
+    HybridPICSolveECylindrical<T_Algo>(
+        Efield, Jfield, Jifield, Bfield, rhofield, Pefield,
+        eb_update_E, lev, hybrid_model, solve_for_Faraday );
 }
 
 #elif defined(WARPX_DIM_RSPHERE)
