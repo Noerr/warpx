@@ -19,6 +19,7 @@
 #   include "FiniteDifferenceAlgorithms/CartesianYeeAlgorithm.H"
 #   include "FiniteDifferenceAlgorithms/CartesianNodalAlgorithm.H"
 #endif
+#include "HybridPICModel/HybridPICAzimuthalFT.H"
 #include "HybridPICModel/HybridPICModel.H"
 #include "Utils/TextMsg.H"
 #include "Utils/WarpXConst.H"
@@ -30,101 +31,6 @@
 
 using namespace amrex;
 using warpx::fields::FieldType;
-
-#if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER)
-namespace {
-
-// Compile-time upper bound on n_rz_azimuthal_modes for the pseudo-spectral
-// kernel below. Determines the size of stack-allocated theta-grid buffers
-// inside the per-cell ParallelFor lambdas. Increase if you need more modes.
-constexpr int MAX_PSEUDO_SPECTRAL_NMODES = 8;
-constexpr int MAX_PSEUDO_SPECTRAL_NTHETA = 2 * MAX_PSEUDO_SPECTRAL_NMODES - 1;
-
-// Inverse azimuthal Fourier transform from modal storage to theta-grid values.
-// Convention matches WarpX RZ deposition/gather:
-//   A(theta) = A_0 + sum_{m>=1} [Re(A_m) cos(m*theta) + Im(A_m) sin(m*theta)]
-// (factor-of-2 absorbed into the stored amplitudes for m >= 1).
-//
-// `A_modes` has (2*nmodes - 1) entries: [A_0, Re(A_1), Im(A_1), Re(A_2), ...].
-// `A_theta` is filled with `n_theta` real-space values at theta_k = 2*pi*k/n_theta.
-AMREX_GPU_DEVICE AMREX_FORCE_INLINE
-void inverse_az_ft (int nmodes, int n_theta,
-                    amrex::Real const* AMREX_RESTRICT A_modes,
-                    amrex::Real* AMREX_RESTRICT A_theta)
-{
-    for (int k = 0; k < n_theta; ++k) {
-        const amrex::Real theta_k = (2._rt * MathConst::pi * k) / n_theta;
-        amrex::Real val = A_modes[0];
-        for (int m = 1; m < nmodes; ++m) {
-            const amrex::Real c = std::cos(m * theta_k);
-            const amrex::Real s = std::sin(m * theta_k);
-            val += A_modes[2*m - 1] * c + A_modes[2*m] * s;
-        }
-        A_theta[k] = val;
-    }
-}
-
-// Forward azimuthal Fourier transform from theta-grid values to modal storage.
-//   A_0    = (1/n_theta) sum_k A(theta_k)
-//   A_m_re = (2/n_theta) sum_k A(theta_k) cos(m*theta_k)   for m >= 1
-//   A_m_im = (2/n_theta) sum_k A(theta_k) sin(m*theta_k)   for m >= 1
-AMREX_GPU_DEVICE AMREX_FORCE_INLINE
-void forward_az_ft (int nmodes, int n_theta,
-                    amrex::Real const* AMREX_RESTRICT A_theta,
-                    amrex::Real* AMREX_RESTRICT A_modes)
-{
-    amrex::Real a0 = 0._rt;
-    for (int k = 0; k < n_theta; ++k) { a0 += A_theta[k]; }
-    A_modes[0] = a0 / n_theta;
-    for (int m = 1; m < nmodes; ++m) {
-        amrex::Real ar = 0._rt, ai = 0._rt;
-        for (int k = 0; k < n_theta; ++k) {
-            const amrex::Real theta_k = (2._rt * MathConst::pi * k) / n_theta;
-            ar += A_theta[k] * std::cos(m * theta_k);
-            ai += A_theta[k] * std::sin(m * theta_k);
-        }
-        A_modes[2*m - 1] = (2._rt * ar) / n_theta;
-        A_modes[2*m    ] = (2._rt * ai) / n_theta;
-    }
-}
-
-// Enforce on-axis modal boundary conditions for a scalar field (rho, P_e).
-// Smoothness in (x, y) requires modes m>=1 to vanish as r^m near the axis,
-// so on the axis itself they are zero.
-AMREX_GPU_DEVICE AMREX_FORCE_INLINE
-void apply_axis_bc_scalar (int nmodes, amrex::Real* AMREX_RESTRICT A_modes)
-{
-    for (int m = 1; m < nmodes; ++m) {
-        A_modes[2*m - 1] = 0._rt;
-        A_modes[2*m    ] = 0._rt;
-    }
-}
-
-// Enforce on-axis modal BCs for the (r, theta) components of a vector field.
-// V_r,0(0) = V_theta,0(0) = 0; V_z behaves as a scalar (handled separately).
-// For m == 1, regularity demands Re(V_r)= -Im(V_theta), Im(V_r)= +Re(V_theta);
-// the *finite* m=1 amplitude must be read from the cell adjacent to the axis
-// (linear-in-r extrapolation), but for a first cut we zero m>=1 here and
-// rely on the surrounding kernels (Faraday, Ampere) to recover the m=1
-// cross-coupling from neighboring cells. This is consistent with how the
-// existing m=0 kernel treats on-axis (J, B, E) tangential components.
-AMREX_GPU_DEVICE AMREX_FORCE_INLINE
-void apply_axis_bc_vector_rt (int nmodes,
-                              amrex::Real* AMREX_RESTRICT Vr_modes,
-                              amrex::Real* AMREX_RESTRICT Vt_modes)
-{
-    Vr_modes[0] = 0._rt;
-    Vt_modes[0] = 0._rt;
-    for (int m = 1; m < nmodes; ++m) {
-        Vr_modes[2*m - 1] = 0._rt;
-        Vr_modes[2*m    ] = 0._rt;
-        Vt_modes[2*m - 1] = 0._rt;
-        Vt_modes[2*m    ] = 0._rt;
-    }
-}
-
-} // anonymous namespace
-#endif // defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER)
 
 void FiniteDifferenceSolver::CalculateCurrentAmpere (
     ablastr::fields::VectorField & Jfield,

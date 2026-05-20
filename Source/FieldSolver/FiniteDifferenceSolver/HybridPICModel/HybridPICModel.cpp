@@ -9,6 +9,7 @@
  */
 
 #include "HybridPICModel.H"
+#include "HybridPICAzimuthalFT.H"
 
 #include <ablastr/utils/Communication.H>
 #include <ablastr/warn_manager/WarnManager.H>
@@ -437,6 +438,20 @@ void HybridPICModel::FillElectronPressureMF (
     const auto elec_temp = m_elec_temp;
     const auto gamma = m_gamma;
 
+#if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER)
+    const int nmodes = WarpX::n_rz_azimuthal_modes;
+    const int ncomps = 2 * nmodes - 1;
+    const int n_theta = 2 * nmodes - 1;
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+        nmodes <= MAX_PSEUDO_SPECTRAL_NMODES,
+        "n_rz_azimuthal_modes exceeds MAX_PSEUDO_SPECTRAL_NMODES; "
+        "increase the bound in HybridPICAzimuthalFT.H.");
+#else
+    constexpr int nmodes = 1;
+    constexpr int ncomps = 1;
+    constexpr int n_theta = 1;
+#endif
+
     // Loop through the grids, and over the tiles within each grid
 #ifdef AMREX_USE_OMP
 #pragma omp parallel if (amrex::Gpu::notInLaunchRegion())
@@ -451,9 +466,40 @@ void HybridPICModel::FillElectronPressureMF (
         const Box& tilebox  = mfi.tilebox();
 
         ParallelFor(tilebox, [=] AMREX_GPU_DEVICE (int i, int j, int k) {
-            Pe(i, j, k) = ElectronPressure::get_pressure(
-                n0_ref, elec_temp, gamma, rho(i, j, k)
-            );
+            // For multi-mode RZ, Pe = n0 * T0 * (rho/(q_e n0))^gamma is
+            // nonlinear in rho whenever gamma != 1, so each mode of Pe is
+            // a convolution over modes of rho. Evaluate via a pseudo-spectral
+            // round-trip: inverse-FT rho_m to an azimuthal grid, apply the
+            // pointwise EOS, forward-FT back to modal Pe. At gamma == 1 the
+            // EOS is linear and the round-trip recovers Pe_m = T_e/q_e * rho_m
+            // up to roundoff; at nmodes == 1 the FT pair is the identity and
+            // the body reduces to the original scalar Pe(rho) call.
+            amrex::Real rho_m[MAX_PSEUDO_SPECTRAL_NMODES * 2];
+            amrex::Real Pe_m [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+            amrex::Real rho_th[MAX_PSEUDO_SPECTRAL_NTHETA];
+            amrex::Real Pe_th [MAX_PSEUDO_SPECTRAL_NTHETA];
+
+            for (int c = 0; c < ncomps; ++c) {
+                rho_m[c] = rho(i, j, k, c);
+            }
+
+#if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER)
+            // On-axis modal BC: in nodal staggering (which is how rho/Pe are
+            // laid out), i == 0 corresponds to r == 0. Zero modes m >= 1 so
+            // the EOS sees a uniform-in-theta rho on axis.
+            if (i == 0) { apply_axis_bc_scalar(nmodes, rho_m); }
+#endif
+
+            inverse_az_ft(nmodes, n_theta, rho_m, rho_th);
+            for (int t = 0; t < n_theta; ++t) {
+                Pe_th[t] = ElectronPressure::get_pressure(
+                    n0_ref, elec_temp, gamma, rho_th[t]);
+            }
+            forward_az_ft(nmodes, n_theta, Pe_th, Pe_m);
+
+            for (int c = 0; c < ncomps; ++c) {
+                Pe(i, j, k, c) = Pe_m[c];
+            }
         });
     }
 }
