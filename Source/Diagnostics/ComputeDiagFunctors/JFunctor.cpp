@@ -63,12 +63,29 @@ JFunctor::operator() (amrex::MultiFab& mf_dst, int dcomp, const int /*i_buffer*/
         auto& pc = warpx.GetPartContainer().GetParticleContainer(m_species_index);
         pc.DepositCurrent(jspec_temp, warpx.getdt(m_lev), 0.0);
 
-        // Exchange ghost data so the cell-centered interpolation sees consistent
-        // values. Note: the bilinear filter that is applied to the total current
-        // during physics is NOT applied here, so the sum of all per-species J
-        // will not be byte-equal to the total J in filtered runs.
+        // Sum ghost-cell deposition contributions back into the owning neighbor's
+        // interior cells. REQUIRED: without this, every cell along an MPI
+        // partition seam shows a systematic deficit (because particles near the
+        // boundary deposited weight into ghost cells that never got summed into
+        // the neighbor rank). The total current_fp gets this on every physics
+        // step via WarpX::SyncCurrent.
+        //
+        // Note: we deliberately do NOT apply WarpX::ApplyFilterMF here. The
+        // bilinear filter is a numerical regularization for the field solve;
+        // per-species J is a diagnostic of the kinetic first moment <q*v>(x)
+        // and is more informative without the smoothing kernel folded in.
+        // Consequence: in runs with warpx.use_filter = 1, the sum of per-species
+        // J*_<species> will differ from the total J* by the filter residual.
+        // This is by design.
+        //
+        // All of this runs only on diagnostic compute cycles (when this functor
+        // is invoked from Diagnostics::FilterComputePackFlush), so no per-
+        // physics-step overhead is incurred.
+        const amrex::Periodicity& period = warpx.Geom(m_lev).periodicity();
+        warpx.SumBoundaryJ(jspec_temp, m_lev, period);
+
         for (int idim = 0; idim < 3; ++idim) {
-            jspec_temp[0][idim]->FillBoundary(warpx.Geom(m_lev).periodicity());
+            jspec_temp[0][idim]->FillBoundary(period);
         }
 
         amrex::MultiFab* m_mf_src = jspec_temp[0][m_dir];
