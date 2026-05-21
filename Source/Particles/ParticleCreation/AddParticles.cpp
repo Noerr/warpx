@@ -868,6 +868,18 @@ PhysicalParticleContainer::AddPlasma (PlasmaInjector& plasma_injector, int lev, 
     const amrex::Real density_min = plasma_injector.density_min;
     const amrex::Real density_max = plasma_injector.density_max;
 
+    // Optional per-cell NPPC: when set, pcount per cell comes from a parser
+    // function evaluated at the cell center, instead of the uniform num_ppc.
+    // The position injector falls back to random sub-cell positions when this
+    // is active, since the regular NUniformPerCell grid only has num_ppc
+    // logical positions.  Particle weights are unchanged in expectation:
+    // compute_scale_fac_volume already divides by the per-cell pcount.
+    const bool has_ppc_function = plasma_injector.hasPpcFunction();
+    amrex::ParserExecutor<3> ppc_parserexec{};
+    if (has_ppc_function) {
+        ppc_parserexec = plasma_injector.getPpcParserExec();
+    }
+
 #if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER)
     const int nmodes = WarpX::n_rz_azimuthal_modes;
 #endif
@@ -961,7 +973,17 @@ PhysicalParticleContainer::AddPlasma (PlasmaInjector& plasma_injector, int lev, 
                 auto index = overlap_box.index(iv);
                 const amrex::Long r = (fine_overlap_box.ok() && fine_overlap_box.contains(iv))?
                     (AMREX_D_TERM(rrfac[0],*rrfac[1],*rrfac[2])) : (1);
-                pcounts[index] = num_ppc*r;
+                // Either uniform num_ppc, or per-cell pcount from the user
+                // parser num_particles_per_cell_function(x,y,z), evaluated at
+                // the cell center.  Refinement factor r still multiplies.
+                amrex::Long const cell_ppc = has_ppc_function
+                    ? static_cast<amrex::Long>(amrex::Math::round(
+                        amrex::max(0._rt, ppc_parserexec(
+                            (lo.x + hi.x) * 0.5_rt,
+                            (lo.y + hi.y) * 0.5_rt,
+                            (lo.z + hi.z) * 0.5_rt))))
+                    : static_cast<amrex::Long>(num_ppc);
+                pcounts[index] = cell_ppc*r;
                 // update pcount by checking if cell-corners or cell-center
                 // has non-zero density
                 const auto xlim = amrex::GpuArray<Real, 3>{lo.x,(lo.x+hi.x)/2._rt,hi.x};
@@ -980,7 +1002,7 @@ PhysicalParticleContainer::AddPlasma (PlasmaInjector& plasma_injector, int lev, 
                     }
                     return 0;
                 };
-                pcounts[index] = checker() ? num_ppc*r : 0;
+                pcounts[index] = checker() ? cell_ppc*r : 0;
             }
             amrex::ignore_unused(j,k);
         });
@@ -1075,11 +1097,23 @@ PhysicalParticleContainer::AddPlasma (PlasmaInjector& plasma_injector, int lev, 
                 const int m_vel_idx = (M_vel > 1) ? (i_part % M_vel) : 0;
                 const int i_pos = (M_vel > 1) ? (i_part / M_vel) : i_part;
                 if (m_vel_idx == 0) {
-                    r_cached = (fine_overlap_box.ok() && fine_overlap_box.contains(iv)) ?
-                      // In the refined injection region: use refinement ratio `rrfac`
-                      inj_pos->getPositionUnitBox(i_pos, rrfac, engine) :
-                      // Otherwise: use 1 as the refinement ratio
-                      inj_pos->getPositionUnitBox(i_pos, amrex::IntVect::TheUnitVector(), engine);
+                    if (has_ppc_function) {
+                        // Variable per-cell NPPC: the regular position grid
+                        // (NUniformPerCell with fixed num_ppc) cannot supply
+                        // unique sub-positions when cell_ppc varies and can
+                        // exceed num_ppc, so we use random sub-cell positions.
+                        // The position injector's quiet-start is lost in this
+                        // mode in exchange for arbitrary per-cell counts.
+                        r_cached = XDim3{amrex::Random(engine),
+                                         amrex::Random(engine),
+                                         amrex::Random(engine)};
+                    } else {
+                        r_cached = (fine_overlap_box.ok() && fine_overlap_box.contains(iv)) ?
+                          // In the refined injection region: use refinement ratio `rrfac`
+                          inj_pos->getPositionUnitBox(i_pos, rrfac, engine) :
+                          // Otherwise: use 1 as the refinement ratio
+                          inj_pos->getPositionUnitBox(i_pos, amrex::IntVect::TheUnitVector(), engine);
+                    }
                 }
                 const XDim3 r = r_cached;
                 auto pos = getCellCoords(overlap_corner, dx, r, iv);

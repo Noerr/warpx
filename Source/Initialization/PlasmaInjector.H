@@ -171,6 +171,20 @@ public:
 
     [[nodiscard]] bool distributedInjectorDensity () const { return inj_rho_distributed; }
 
+    /** \brief Returns true if a per-cell NPPC parser
+     * `num_particles_per_cell_function(x,y,z)` was provided for this species,
+     * meaning the per-cell macroparticle count varies smoothly through the
+     * domain rather than being uniform.  Used by PhysicalParticleContainer to
+     * select the per-cell pcount during initial injection.
+     */
+    [[nodiscard]] bool hasPpcFunction () const { return static_cast<bool>(ppc_parser); }
+
+    /** Compile the per-cell NPPC parser to a GPU-callable executor.  The
+     * caller is responsible for capturing the returned executor by value
+     * into a device kernel; it is invalid to call this if !hasPpcFunction.
+     */
+    [[nodiscard]] amrex::ParserExecutor<3> getPpcParserExec () const;
+
 protected:
 
     bool mass_from_source = false;
@@ -198,6 +212,13 @@ protected:
     bool inj_rho_distributed = false;
     bool inj_rho_prepared = false;
     std::unique_ptr<amrex::Parser> density_parser;
+
+    // Optional per-cell macros-per-cell parser:
+    // num_particles_per_cell_function(x,y,z) gives the desired pcount as a
+    // function of position (evaluated at each cell center during initial
+    // injection).  Allows radially-clustered macros for cylindrical decks
+    // without the seam noise of a multi-species region split.
+    std::unique_ptr<amrex::Parser> ppc_parser;
 
     std::unique_ptr<InjectorFlux,InjectorFluxDeleter> h_inj_flux;
     InjectorFlux* d_inj_flux = nullptr;

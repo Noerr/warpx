@@ -497,6 +497,33 @@ void PlasmaInjector::setupNuniformPerCell (amrex::ParmParse const& pp_species)
                                 ux_parser, uy_parser, uz_parser,
                                 ux_th_parser, uy_th_parser, uz_th_parser,
                                 h_mom_temp, h_mom_vel);
+
+    // Optional per-cell NPPC parser.  When provided, the per-cell macroparticle
+    // count is set by evaluating this function at each cell center, overriding
+    // the otherwise-uniform num_particles_per_cell.  Particle weights still
+    // scale to give the correct deposited density (compute_scale_fac_volume
+    // already divides by the per-cell pcount).
+    {
+        const std::string ppc_key = "num_particles_per_cell_function(x,y,z)";
+        const std::string ppc_key_grp = source_name + "." + ppc_key;
+        const bool has_without_group = pp_species.contains(ppc_key.c_str());
+        const bool has_with_group =
+            !source_name.empty() && pp_species.contains(ppc_key_grp.c_str());
+        if (has_without_group || has_with_group) {
+            std::string ppc_function_str;
+            utils::parser::Store_parserString(
+                pp_species, source_name, ppc_key, ppc_function_str);
+            ppc_parser = std::make_unique<amrex::Parser>(
+                utils::parser::makeParser(ppc_function_str, {"x", "y", "z"}));
+        }
+    }
+}
+
+amrex::ParserExecutor<3>
+PlasmaInjector::getPpcParserExec () const
+{
+    AMREX_ALWAYS_ASSERT(ppc_parser);
+    return ppc_parser->compile<3>();
 }
 
 void PlasmaInjector::setupExternalFile (amrex::ParmParse const& pp_species)
