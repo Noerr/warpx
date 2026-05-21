@@ -441,7 +441,7 @@ void HybridPICModel::FillElectronPressureMF (
 #if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER)
     const int nmodes = WarpX::n_rz_azimuthal_modes;
     const int ncomps = 2 * nmodes - 1;
-    const int n_theta = 2 * nmodes - 1;
+    const int n_theta = 3 * nmodes;   // Orszag 2/3 dealiasing (see HybridPICAzimuthalFT.H)
     AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
         nmodes <= MAX_PSEUDO_SPECTRAL_NMODES,
         "n_rz_azimuthal_modes exceeds MAX_PSEUDO_SPECTRAL_NMODES; "

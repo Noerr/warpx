@@ -990,22 +990,33 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
 
     const int nmodes = m_nmodes;
     const int ncomps = 2 * nmodes - 1;
-    const int n_theta = 2 * nmodes - 1;
+    // Orszag 2/3 rule: with 3N theta-grid points, the de-aliased band is the
+    // lower 2/3 (= 2N modes), which comfortably covers our N stored modes.
+    // Bilinear products and any non-polynomial nonlinearity (1/rho, rho^gamma,
+    // eta(rho, J)) folded back into the kept modes are well-dealiased.
+    const int n_theta = 3 * nmodes;
 
     AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
         nmodes <= MAX_PSEUDO_SPECTRAL_NMODES,
         "n_rz_azimuthal_modes exceeds MAX_PSEUDO_SPECTRAL_NMODES; "
         "increase the compile-time bound in HybridPICSolveE.cpp.");
 
-    // First-cut feature gating: lift in follow-up commits once each path is
-    // generalized to multi-mode separately. Both pieces introduce additional
-    // nonlinearities (Laplacian-of-J / external-field couplings).
-    WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
-        !hybrid_model->m_include_hyper_resistivity_term,
-        "Pseudo-spectral hybrid solver: hyper-resistivity is not yet supported.");
+    // External vector-potential / E-B fields not yet plumbed through the
+    // multi-mode pseudo-spectral path; assert off for now.
     WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
         !hybrid_model->m_add_external_fields,
         "Pseudo-spectral hybrid solver: external E/B fields are not yet supported.");
+
+    // B-dependent hyper-resistivity in the multi-mode kernel would require
+    // interpolating B at every Yee stagger and adding it to the per-cell
+    // pseudo-spectral round-trip. We only support rho-dependent (or constant)
+    // eta_h here. eta_h itself can be any expression; this gate only blocks
+    // expressions that reference |B|.
+    WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
+        !(hybrid_model->m_include_hyper_resistivity_term &&
+          hybrid_model->m_hyper_resistivity_has_B_dependence),
+        "Pseudo-spectral hybrid solver: B-dependent plasma_hyper_resistivity "
+        "is not yet supported (only rho-dependent or constant).");
 
     // for the profiler
     amrex::LayoutData<amrex::Real>* cost = WarpX::getCosts(lev);
@@ -1014,8 +1025,10 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
 
     // get hybrid model parameters
     const auto eta = hybrid_model->m_eta;
+    const auto eta_h = hybrid_model->m_eta_h;
     const auto rho_floor = hybrid_model->m_n_floor * PhysConst::q_e;
     const auto resistivity_has_J_dependence = hybrid_model->m_resistivity_has_J_dependence;
+    const bool include_hyper_resistivity_term = hybrid_model->m_include_hyper_resistivity_term;
     const bool holmstrom_vacuum_region = hybrid_model->m_holmstrom_vacuum_region;
 
     // Index type required for interpolating fields from their respective
@@ -1210,12 +1223,17 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
                 if (update_Er_arr && update_Er_arr(i, j, 0) == 0) { return; }
 
                 // Modal inputs interpolated to the E_r stagger.
-                Real enE_r_m[MAX_PSEUDO_SPECTRAL_NMODES * 2];
-                Real rho_m  [MAX_PSEUDO_SPECTRAL_NMODES * 2];
-                Real gPr_m  [MAX_PSEUDO_SPECTRAL_NMODES * 2];
-                Real Jr_m   [MAX_PSEUDO_SPECTRAL_NMODES * 2];
-                Real Jt_m   [MAX_PSEUDO_SPECTRAL_NMODES * 2];
-                Real Jz_m   [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real enE_r_m   [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real rho_m     [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real gPr_m     [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real Jr_m      [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real Jt_m      [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real Jz_m      [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real lapJr_m   [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+
+                // r at the E_r stagger (cell-centered in r): always off-axis for i >= 0.
+                const Real r_Er = rmin + (i + 0.5_rt) * dr;
+                const Real one_over_r2 = 1._rt / (r_Er * r_Er);
 
                 for (int c = 0; c < ncomps; ++c) {
                     enE_r_m[c] = Interp(enE, nodal, Er_stag, coarsen, i, j, 0, 0*ncomps + c);
@@ -1225,21 +1243,40 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
                     Jr_m   [c] = Jr(i, j, 0, c);
                     Jt_m   [c] = Interp(Jtheta, Jtheta_stag, Er_stag, coarsen, i, j, 0, c);
                     Jz_m   [c] = Interp(Jz,     Jz_stag,     Er_stag, coarsen, i, j, 0, c);
+                    lapJr_m[c] = 0._rt;
+                }
+
+                if (include_hyper_resistivity_term) {
+                    // nabla^2 J_r mode-by-mode (linear in J modes).
+                    // Vector r-component cylindrical Laplacian for mode m:
+                    //   (d/dr)(1/r d(r J)/dr) + d^2 J / dz^2 - (m^2 + 1) J / r^2
+                    // The (1/r)(d/dr)(r d/dr) part is handled by Dr_rDr_over_r.
+                    for (int c = 0; c < ncomps; ++c) {
+                        const int mm = (c == 0) ? 0 : ((c + 1) / 2);
+                        lapJr_m[c] =
+                            T_Algo::Dr_rDr_over_r(Jr, r_Er, dr, coefs_r, n_coefs_r, i, j, 0, c)
+                          + T_Algo::Dzz         (Jr,           coefs_z, n_coefs_z, i, j, 0, c)
+                          - (static_cast<Real>(mm * mm) + 1._rt) * one_over_r2 * Jr(i, j, 0, c);
+                    }
                 }
 
                 // Inverse FT to theta-grid.
-                Real enE_r_th[MAX_PSEUDO_SPECTRAL_NTHETA];
-                Real rho_th  [MAX_PSEUDO_SPECTRAL_NTHETA];
-                Real gPr_th  [MAX_PSEUDO_SPECTRAL_NTHETA];
-                Real Jr_th   [MAX_PSEUDO_SPECTRAL_NTHETA];
-                Real Jt_th   [MAX_PSEUDO_SPECTRAL_NTHETA];
-                Real Jz_th   [MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real enE_r_th [MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real rho_th   [MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real gPr_th   [MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real Jr_th    [MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real Jt_th    [MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real Jz_th    [MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real lapJr_th [MAX_PSEUDO_SPECTRAL_NTHETA];
                 inverse_az_ft(nmodes, n_theta, enE_r_m, enE_r_th);
                 inverse_az_ft(nmodes, n_theta, rho_m,   rho_th);
                 inverse_az_ft(nmodes, n_theta, gPr_m,   gPr_th);
                 inverse_az_ft(nmodes, n_theta, Jr_m,    Jr_th);
                 inverse_az_ft(nmodes, n_theta, Jt_m,    Jt_th);
                 inverse_az_ft(nmodes, n_theta, Jz_m,    Jz_th);
+                if (include_hyper_resistivity_term) {
+                    inverse_az_ft(nmodes, n_theta, lapJr_m, lapJr_th);
+                }
 
                 Real Er_th[MAX_PSEUDO_SPECTRAL_NTHETA];
                 for (int k = 0; k < n_theta; ++k) {
@@ -1259,6 +1296,12 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
                                            + Jz_th[k]*Jz_th[k]);
                         }
                         Er_th[k] += eta(rho_th[k], jmag) * Jr_th[k];
+
+                        if (include_hyper_resistivity_term) {
+                            // B-dependence is asserted off at the top of the
+                            // function; we pass bmag = 0.
+                            Er_th[k] -= eta_h(rho_th[k], 0._rt) * lapJr_th[k];
+                        }
                     }
                 }
 
@@ -1286,15 +1329,18 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
                     return;
                 }
 
-                Real enE_t_m[MAX_PSEUDO_SPECTRAL_NMODES * 2];
-                Real rho_m  [MAX_PSEUDO_SPECTRAL_NMODES * 2];
-                Real gPt_m  [MAX_PSEUDO_SPECTRAL_NMODES * 2];
-                Real Jr_m   [MAX_PSEUDO_SPECTRAL_NMODES * 2];
-                Real Jt_m   [MAX_PSEUDO_SPECTRAL_NMODES * 2];
-                Real Jz_m   [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real enE_t_m  [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real rho_m    [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real gPt_m    [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real Jr_m     [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real Jt_m     [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real Jz_m     [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real lapJt_m  [MAX_PSEUDO_SPECTRAL_NMODES * 2];
 
                 // P_e at E_theta stagger (needed for the (-i m / r) factor).
                 Real Pe_m   [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+
+                const Real one_over_r2 = 1._rt / (r * r);
 
                 for (int c = 0; c < ncomps; ++c) {
                     enE_t_m[c] = Interp(enE, nodal, Etheta_stag, coarsen, i, j, 0, 1*ncomps + c);
@@ -1303,6 +1349,7 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
                     Jr_m   [c] = Interp(Jr,     Jr_stag,     Etheta_stag, coarsen, i, j, 0, c);
                     Jt_m   [c] = Jtheta(i, j, 0, c);
                     Jz_m   [c] = Interp(Jz,     Jz_stag,     Etheta_stag, coarsen, i, j, 0, c);
+                    lapJt_m[c] = 0._rt;
                 }
 
                 // grad P_e theta-component: in modes it is (-i m P_m) / r.
@@ -1316,18 +1363,34 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
                     gPt_m[2*m    ] = -(m * Pe_re) / r;
                 }
 
-                Real enE_t_th[MAX_PSEUDO_SPECTRAL_NTHETA];
-                Real rho_th  [MAX_PSEUDO_SPECTRAL_NTHETA];
-                Real gPt_th  [MAX_PSEUDO_SPECTRAL_NTHETA];
-                Real Jr_th   [MAX_PSEUDO_SPECTRAL_NTHETA];
-                Real Jt_th   [MAX_PSEUDO_SPECTRAL_NTHETA];
-                Real Jz_th   [MAX_PSEUDO_SPECTRAL_NTHETA];
+                if (include_hyper_resistivity_term) {
+                    // Vector theta-component Laplacian, mode m:
+                    //   scalar_lap(J_theta) - J_theta/r^2 - (m^2)/r^2 J_theta
+                    for (int c = 0; c < ncomps; ++c) {
+                        const int mm = (c == 0) ? 0 : ((c + 1) / 2);
+                        lapJt_m[c] =
+                            T_Algo::Dr_rDr_over_r(Jtheta, r, dr, coefs_r, n_coefs_r, i, j, 0, c)
+                          + T_Algo::Dzz         (Jtheta,        coefs_z, n_coefs_z, i, j, 0, c)
+                          - (static_cast<Real>(mm * mm) + 1._rt) * one_over_r2 * Jtheta(i, j, 0, c);
+                    }
+                }
+
+                Real enE_t_th [MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real rho_th   [MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real gPt_th   [MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real Jr_th    [MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real Jt_th    [MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real Jz_th    [MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real lapJt_th [MAX_PSEUDO_SPECTRAL_NTHETA];
                 inverse_az_ft(nmodes, n_theta, enE_t_m, enE_t_th);
                 inverse_az_ft(nmodes, n_theta, rho_m,   rho_th);
                 inverse_az_ft(nmodes, n_theta, gPt_m,   gPt_th);
                 inverse_az_ft(nmodes, n_theta, Jr_m,    Jr_th);
                 inverse_az_ft(nmodes, n_theta, Jt_m,    Jt_th);
                 inverse_az_ft(nmodes, n_theta, Jz_m,    Jz_th);
+                if (include_hyper_resistivity_term) {
+                    inverse_az_ft(nmodes, n_theta, lapJt_m, lapJt_th);
+                }
 
                 Real Et_th[MAX_PSEUDO_SPECTRAL_NTHETA];
                 for (int k = 0; k < n_theta; ++k) {
@@ -1347,6 +1410,10 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
                                            + Jz_th[k]*Jz_th[k]);
                         }
                         Et_th[k] += eta(rho_th[k], jmag) * Jt_th[k];
+
+                        if (include_hyper_resistivity_term) {
+                            Et_th[k] -= eta_h(rho_th[k], 0._rt) * lapJt_th[k];
+                        }
                     }
                 }
 
@@ -1362,12 +1429,13 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
 
                 if (update_Ez_arr && update_Ez_arr(i, j, 0) == 0) { return; }
 
-                Real enE_z_m[MAX_PSEUDO_SPECTRAL_NMODES * 2];
-                Real rho_m  [MAX_PSEUDO_SPECTRAL_NMODES * 2];
-                Real gPz_m  [MAX_PSEUDO_SPECTRAL_NMODES * 2];
-                Real Jr_m   [MAX_PSEUDO_SPECTRAL_NMODES * 2];
-                Real Jt_m   [MAX_PSEUDO_SPECTRAL_NMODES * 2];
-                Real Jz_m   [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real enE_z_m  [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real rho_m    [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real gPz_m    [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real Jr_m     [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real Jt_m     [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real Jz_m     [MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real lapJz_m  [MAX_PSEUDO_SPECTRAL_NMODES * 2];
 
                 for (int c = 0; c < ncomps; ++c) {
                     enE_z_m[c] = Interp(enE, nodal, Ez_stag, coarsen, i, j, 0, 2*ncomps + c);
@@ -1376,12 +1444,14 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
                     Jr_m   [c] = Interp(Jr,     Jr_stag,     Ez_stag, coarsen, i, j, 0, c);
                     Jt_m   [c] = Interp(Jtheta, Jtheta_stag, Ez_stag, coarsen, i, j, 0, c);
                     Jz_m   [c] = Jz(i, j, 0, c);
+                    lapJz_m[c] = 0._rt;
                 }
 
                 // Ez stagger is nodal in r, so i=0 is on the axis. V_z behaves
                 // as a scalar: m=0 free, m>=1 zero on axis.
                 const Real r = rmin + i * dr;
-                if (r < 0.5_rt * dr) {
+                const bool on_axis = (r < 0.5_rt * dr);
+                if (on_axis) {
                     apply_axis_bc_scalar(nmodes, enE_z_m);
                     apply_axis_bc_scalar(nmodes, gPz_m);
                     apply_axis_bc_scalar(nmodes, Jz_m);
@@ -1391,18 +1461,45 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
                     // proceeds normally for m=0.
                 }
 
-                Real enE_z_th[MAX_PSEUDO_SPECTRAL_NTHETA];
-                Real rho_th  [MAX_PSEUDO_SPECTRAL_NTHETA];
-                Real gPz_th  [MAX_PSEUDO_SPECTRAL_NTHETA];
-                Real Jr_th   [MAX_PSEUDO_SPECTRAL_NTHETA];
-                Real Jt_th   [MAX_PSEUDO_SPECTRAL_NTHETA];
-                Real Jz_th   [MAX_PSEUDO_SPECTRAL_NTHETA];
+                if (include_hyper_resistivity_term) {
+                    // Scalar z-component Laplacian, mode m:
+                    //   d^2 J_z/dr^2 + (1/r) dJ_z/dr - (m^2/r^2) J_z + d^2 J_z/dz^2
+                    // On axis (i==0) Jz_m>=1 is already zero (above); for m=0
+                    // use the regularized Drr form to avoid the 1/r singularity
+                    // (matching the existing m=0 hybrid kernel handling).
+                    for (int c = 0; c < ncomps; ++c) {
+                        const int mm = (c == 0) ? 0 : ((c + 1) / 2);
+                        Real lap = T_Algo::Dzz(Jz, coefs_z, n_coefs_z, i, j, 0, c);
+                        if (on_axis) {
+                            // m=0: regularized radial Laplacian; m>=1: already zero
+                            if (mm == 0) {
+                                lap += T_Algo::Drr(Jz, coefs_r, n_coefs_r, i, j, 0, c);
+                            }
+                        } else {
+                            const Real one_over_r2 = 1._rt / (r * r);
+                            lap += T_Algo::Dr_rDr_over_r(Jz, r, dr, coefs_r, n_coefs_r, i, j, 0, c)
+                                 - static_cast<Real>(mm * mm) * one_over_r2 * Jz(i, j, 0, c);
+                        }
+                        lapJz_m[c] = lap;
+                    }
+                }
+
+                Real enE_z_th [MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real rho_th   [MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real gPz_th   [MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real Jr_th    [MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real Jt_th    [MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real Jz_th    [MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real lapJz_th [MAX_PSEUDO_SPECTRAL_NTHETA];
                 inverse_az_ft(nmodes, n_theta, enE_z_m, enE_z_th);
                 inverse_az_ft(nmodes, n_theta, rho_m,   rho_th);
                 inverse_az_ft(nmodes, n_theta, gPz_m,   gPz_th);
                 inverse_az_ft(nmodes, n_theta, Jr_m,    Jr_th);
                 inverse_az_ft(nmodes, n_theta, Jt_m,    Jt_th);
                 inverse_az_ft(nmodes, n_theta, Jz_m,    Jz_th);
+                if (include_hyper_resistivity_term) {
+                    inverse_az_ft(nmodes, n_theta, lapJz_m, lapJz_th);
+                }
 
                 Real Ez_th[MAX_PSEUDO_SPECTRAL_NTHETA];
                 for (int k = 0; k < n_theta; ++k) {
@@ -1422,6 +1519,10 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
                                            + Jz_th[k]*Jz_th[k]);
                         }
                         Ez_th[k] += eta(rho_th[k], jmag) * Jz_th[k];
+
+                        if (include_hyper_resistivity_term) {
+                            Ez_th[k] -= eta_h(rho_th[k], 0._rt) * lapJz_th[k];
+                        }
                     }
                 }
 

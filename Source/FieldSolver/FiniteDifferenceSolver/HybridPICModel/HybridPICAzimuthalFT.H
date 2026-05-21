@@ -38,9 +38,16 @@
 
 /** Compile-time upper bound on `n_rz_azimuthal_modes` for stack-allocated
  *  theta-grid buffers inside per-cell ParallelFor lambdas. Increase if a
- *  larger truncation is required. */
+ *  larger truncation is required.
+ *
+ *  NTHETA = 3 * NMODES: enforces the Orszag 2/3 de-aliasing rule. The
+ *  pseudo-spectral round-trip evaluates the nonlinear Ohm's-law RHS on a
+ *  theta-grid that is 3x larger than the stored mode count, so the
+ *  trustworthy band (lower 2/3 of grid modes) covers all N stored modes.
+ *  Modes beyond N are implicitly discarded by the forward-FT write-back
+ *  loop, which only stores indices [0, 2*N - 1]. */
 constexpr int MAX_PSEUDO_SPECTRAL_NMODES = 8;
-constexpr int MAX_PSEUDO_SPECTRAL_NTHETA = 2 * MAX_PSEUDO_SPECTRAL_NMODES - 1;
+constexpr int MAX_PSEUDO_SPECTRAL_NTHETA = 3 * MAX_PSEUDO_SPECTRAL_NMODES;
 
 /** Inverse azimuthal FT: modal storage -> n_theta real-space samples. */
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
