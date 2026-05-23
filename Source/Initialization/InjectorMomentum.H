@@ -467,13 +467,26 @@ struct InjectorMomentumGaussianParser
 // struct whose getMomentum returns a deterministic, antithetically-paired
 // Gaussian velocity sample on a 3D tensor-product lattice of inverse-Gaussian-CDF
 // quantiles. Drift and per-axis thermal spread come from parser expressions
-// (mirroring InjectorMomentumGaussianParser). The lattice multi-index is decoded
-// from the per-cell particle index i_part using lexicographic ordering. The
-// per-cell first moment of velocity equals the prescribed drift exactly (the
-// quantile lattice is symmetric about 0 analytically). N_half_per_dim is set at
-// construction; m_quantile_table holds the precomputed Phi^{-1}(p_j) values.
-// Maximum per-axis lattice size is K_MAX; total particles-per-cell must equal
-// N_half_per_dim^3 with N_half_per_dim <= K_MAX.
+// Stratified-random Gaussian quiet start with strict pair antithetic. For each
+// per-cell particle index i_part decoded into bin coords (jx,jy,jz) ∈ [0,N)^3,
+// the per-axis velocity is q = Φ⁻¹((j + u)/N) where u ∈ [0,1) is a deterministic
+// hash of (position, canonical_pair_index, axis_id). Pair partners i_part and
+// M_vel-1-i_part share the same canonical hash (so the same u), but for the
+// upper-half partner the u is flipped to 1-u; combined with the bin flip
+// j → N-1-j that gives q_upper = -q_lower exactly (strict antithetic per axis).
+//
+// Why this is correct (and the midpoint version was not):
+//   - Variance per axis = (1/N) Σ_j ∫_{j/N}^{(j+1)/N} Φ⁻¹(p)² · N dp = ∫₀¹ Φ⁻¹(p)² dp = 1.
+//     i.e. ⟨v_x²⟩ = ux_th² exactly, no bias factor.
+//   - The midpoint version returned q_j = Φ⁻¹((2j-1)/(2N)) deterministically; its
+//     empirical variance was (1/N) Σ_j q_j² < 1, with bias ≈ 0.455 at N=2.
+//   - Tails are full: the j=N-1 bin extends to p→1, so q can reach arbitrarily
+//     large values, unlike the midpoint version capped at Φ⁻¹((2N-1)/(2N)).
+//   - Per-cell first moment is exactly zero by pair construction; no shot-noise
+//     contribution to bulk drift.
+//
+// N_half_per_dim is set at construction; m_quantile_table is no longer used by
+// getMomentum but kept for ABI compatibility with the construction path.
 struct InjectorMomentumGaussianParserQuiet
 {
     static constexpr int K_MAX = 16;
@@ -495,6 +508,100 @@ struct InjectorMomentumGaussianParserQuiet
         }
     }
 
+    // Acklam's rational approximation to Phi^{-1}(p), device-callable.
+    // Absolute error ~6e-9 on p in (0,1); endpoints are clipped to avoid -inf/+inf.
+    [[nodiscard]]
+    AMREX_GPU_HOST_DEVICE
+    static amrex::Real inv_norm_cdf (amrex::Real p) noexcept
+    {
+        const amrex::Real eps = amrex::Real(1.0e-15);
+        if (p < eps)            { p = eps; }
+        if (p > amrex::Real(1.0) - eps) { p = amrex::Real(1.0) - eps; }
+        const amrex::Real a0 = amrex::Real(-3.969683028665376e+01);
+        const amrex::Real a1 = amrex::Real( 2.209460984245205e+02);
+        const amrex::Real a2 = amrex::Real(-2.759285104469687e+02);
+        const amrex::Real a3 = amrex::Real( 1.383577518672690e+02);
+        const amrex::Real a4 = amrex::Real(-3.066479806614716e+01);
+        const amrex::Real a5 = amrex::Real( 2.506628277459239e+00);
+        const amrex::Real b1 = amrex::Real(-5.447609879822406e+01);
+        const amrex::Real b2 = amrex::Real( 1.615858368580409e+02);
+        const amrex::Real b3 = amrex::Real(-1.556989798598866e+02);
+        const amrex::Real b4 = amrex::Real( 6.680131188771972e+01);
+        const amrex::Real b5 = amrex::Real(-1.328068155288572e+01);
+        const amrex::Real c0 = amrex::Real(-7.784894002430293e-03);
+        const amrex::Real c1 = amrex::Real(-3.223964580411365e-01);
+        const amrex::Real c2 = amrex::Real(-2.400758277161838e+00);
+        const amrex::Real c3 = amrex::Real(-2.549732539343734e+00);
+        const amrex::Real c4 = amrex::Real( 4.374664141464968e+00);
+        const amrex::Real c5 = amrex::Real( 2.938163982698783e+00);
+        const amrex::Real d1 = amrex::Real( 7.784695709041462e-03);
+        const amrex::Real d2 = amrex::Real( 3.224671290700398e-01);
+        const amrex::Real d3 = amrex::Real( 2.445134137142996e+00);
+        const amrex::Real d4 = amrex::Real( 3.754408661907416e+00);
+        const amrex::Real p_low  = amrex::Real(0.02425);
+        const amrex::Real p_high = amrex::Real(1.0) - p_low;
+        amrex::Real q, r;
+        if (p < p_low) {
+            q = std::sqrt(amrex::Real(-2.0) * std::log(p));
+            return (((((c0*q+c1)*q+c2)*q+c3)*q+c4)*q+c5) /
+                   ((((d1*q+d2)*q+d3)*q+d4)*q + amrex::Real(1.0));
+        } else if (p <= p_high) {
+            q = p - amrex::Real(0.5);
+            r = q*q;
+            return (((((a0*r+a1)*r+a2)*r+a3)*r+a4)*r+a5) * q /
+                   (((((b1*r+b2)*r+b3)*r+b4)*r+b5)*r + amrex::Real(1.0));
+        } else {
+            q = std::sqrt(amrex::Real(-2.0) * std::log(amrex::Real(1.0) - p));
+            return -(((((c0*q+c1)*q+c2)*q+c3)*q+c4)*q+c5) /
+                    ((((d1*q+d2)*q+d3)*q+d4)*q + amrex::Real(1.0));
+        }
+    }
+
+    // Deterministic uniform-[0,1) hash of (position, canonical_idx, axis_id).
+    // Shared randomness across pair partners: both members of pair
+    // (i_part, M-1-i_part) compute the same canonical_idx and share position
+    // (same i_pos group in the emission loop), so they get the same u.
+    // SplitMix64-style mixer on the bit pattern of the coordinates.
+    [[nodiscard]]
+    AMREX_GPU_HOST_DEVICE
+    static amrex::Real position_hash (amrex::Real x, amrex::Real y, amrex::Real z,
+                                      int canonical_idx, int axis_id) noexcept
+    {
+        amrex::ULong bx, by, bz;
+        if constexpr (sizeof(amrex::Real) == 8) {
+            double dx = static_cast<double>(x);
+            double dy = static_cast<double>(y);
+            double dz = static_cast<double>(z);
+            amrex::ULong tx, ty, tz;
+            __builtin_memcpy(&tx, &dx, 8);
+            __builtin_memcpy(&ty, &dy, 8);
+            __builtin_memcpy(&tz, &dz, 8);
+            bx = tx; by = ty; bz = tz;
+        } else {
+            float fx = static_cast<float>(x);
+            float fy = static_cast<float>(y);
+            float fz = static_cast<float>(z);
+            std::uint32_t tx, ty, tz;
+            __builtin_memcpy(&tx, &fx, 4);
+            __builtin_memcpy(&ty, &fy, 4);
+            __builtin_memcpy(&tz, &fz, 4);
+            bx = static_cast<amrex::ULong>(tx);
+            by = static_cast<amrex::ULong>(ty);
+            bz = static_cast<amrex::ULong>(tz);
+        }
+        amrex::ULong h = bx
+            ^ ((by << 17) | (by >> 47))
+            ^ ((bz << 31) | (bz >> 33));
+        h ^= static_cast<amrex::ULong>(canonical_idx) * amrex::ULong(0x9E3779B97F4A7C15ULL);
+        h ^= static_cast<amrex::ULong>(axis_id)       * amrex::ULong(0xBF58476D1CE4E5B9ULL);
+        h ^= h >> 30; h *= amrex::ULong(0xBF58476D1CE4E5B9ULL);
+        h ^= h >> 27; h *= amrex::ULong(0x94D049BB133111EBULL);
+        h ^= h >> 31;
+        // 53-bit mantissa → [0, 1)
+        return static_cast<amrex::Real>(h >> 11)
+             * amrex::Real(1.0 / static_cast<double>(amrex::ULong(1) << 53));
+    }
+
     [[nodiscard]]
     AMREX_GPU_HOST_DEVICE
     amrex::XDim3
@@ -503,18 +610,40 @@ struct InjectorMomentumGaussianParserQuiet
                  amrex::RandomEngine const& /*engine*/) const noexcept
     {
         const int N = m_n_half_per_dim;
+        const int M = N*N*N;
         const int jx =  i_part / (N*N);
         const int jy = (i_part / N) % N;
         const int jz =  i_part % N;
+
+        // Pair canonical idx and upper/lower flag. Pair partner of i_part is
+        // M-1-i_part, which has bins (N-1-jx, N-1-jy, N-1-jz). Both members
+        // hash from the same canonical idx (the smaller of the two).
+        const int i_canonical = (i_part <= M - 1 - i_part) ? i_part : (M - 1 - i_part);
+        const bool is_upper   = (i_part >  M - 1 - i_part);
+
+        amrex::Real ux_u = position_hash(x, y, z, i_canonical, 0);
+        amrex::Real uy_u = position_hash(x, y, z, i_canonical, 1);
+        amrex::Real uz_u = position_hash(x, y, z, i_canonical, 2);
+        if (is_upper) {
+            ux_u = amrex::Real(1.0) - ux_u;
+            uy_u = amrex::Real(1.0) - uy_u;
+            uz_u = amrex::Real(1.0) - uz_u;
+        }
+
+        const amrex::Real inv_N = amrex::Real(1.0) / static_cast<amrex::Real>(N);
+        const amrex::Real q_x = inv_norm_cdf((static_cast<amrex::Real>(jx) + ux_u) * inv_N);
+        const amrex::Real q_y = inv_norm_cdf((static_cast<amrex::Real>(jy) + uy_u) * inv_N);
+        const amrex::Real q_z = inv_norm_cdf((static_cast<amrex::Real>(jz) + uz_u) * inv_N);
+
         amrex::Real const ux_m  = m_ux_m_parser(x,y,z);
         amrex::Real const uy_m  = m_uy_m_parser(x,y,z);
         amrex::Real const uz_m  = m_uz_m_parser(x,y,z);
         amrex::Real const ux_th = m_ux_th_parser(x,y,z);
         amrex::Real const uy_th = m_uy_th_parser(x,y,z);
         amrex::Real const uz_th = m_uz_th_parser(x,y,z);
-        return amrex::XDim3{ux_m + ux_th * m_quantile_table[jx],
-                            uy_m + uy_th * m_quantile_table[jy],
-                            uz_m + uz_th * m_quantile_table[jz]};
+        return amrex::XDim3{ux_m + ux_th * q_x,
+                            uy_m + uy_th * q_y,
+                            uz_m + uz_th * q_z};
     }
 
     [[nodiscard]]
