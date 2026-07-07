@@ -44,9 +44,28 @@ FieldEnergy::FieldEnergy (const std::string& rd_name)
     pp_amr.query("max_level", nLevel);
     nLevel += 1;
 
-    constexpr int noutputs = 3; // total energy, E-field energy and B-field energy
+    // Output layout per level: 9 numbers
+    //   [0] total energy
+    //   [1] E-field energy
+    //   [2] B-field energy
+    //   [3..5] per-component E energy: Ex (or Er), Ey (or Etheta), Ez
+    //   [6..8] per-component B energy: Bx (or Br), By (or Btheta), Bz
+    // In RZ the per-component values sum over all stored azimuthal modes,
+    // matching the multi-mode FieldEnergy summation already used for the
+    // total. This lets diagnostics target a single component for
+    // perturbation tracking (e.g. B_z energy as a kink growth measure on
+    // an axisymmetric equilibrium where the equilibrium B_z = 0).
+    constexpr int noutputs = 9;
     // resize data array
     m_data.resize(noutputs*nLevel, 0.0_rt);
+
+#if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER)
+    const std::array<std::string, 3> dirname{{"r", "theta", "z"}};
+#elif defined(WARPX_DIM_RSPHERE)
+    const std::array<std::string, 3> dirname{{"r", "theta", "phi"}};
+#else
+    const std::array<std::string, 3> dirname{{"x", "y", "z"}};
+#endif
 
     if (amrex::ParallelDescriptor::IOProcessor())
     {
@@ -68,6 +87,14 @@ FieldEnergy::FieldEnergy (const std::string& rd_name)
                 ofs << "[" << c++ << "]E_lev" + std::to_string(lev) + "(J)";
                 ofs << m_sep;
                 ofs << "[" << c++ << "]B_lev" + std::to_string(lev) + "(J)";
+                for (int d = 0; d < 3; ++d) {
+                    ofs << m_sep;
+                    ofs << "[" << c++ << "]E" + dirname[d] + "_lev" + std::to_string(lev) + "(J)";
+                }
+                for (int d = 0; d < 3; ++d) {
+                    ofs << m_sep;
+                    ofs << "[" << c++ << "]B" + dirname[d] + "_lev" + std::to_string(lev) + "(J)";
+                }
             }
             ofs << "\n";
             // close file
@@ -119,16 +146,28 @@ void FieldEnergy::ComputeDiags (int step)
         amrex::Real const Es = tmpEx + tmpEy + tmpEz;
         amrex::Real const Bs = tmpBx + tmpBy + tmpBz;
 
-        constexpr int noutputs = 3; // total energy, E-field energy and B-field energy
+        constexpr int noutputs = 9;
         constexpr int index_total = 0;
         constexpr int index_E = 1;
         constexpr int index_B = 2;
+        constexpr int index_Ex = 3;
+        constexpr int index_Ey = 4;
+        constexpr int index_Ez = 5;
+        constexpr int index_Bx = 6;
+        constexpr int index_By = 7;
+        constexpr int index_Bz = 8;
 
         // save data
         m_data[lev*noutputs+index_E] = 0.5_rt * Es * PhysConst::epsilon_0 * dV;
         m_data[lev*noutputs+index_B] = 0.5_rt * Bs / PhysConst::mu0 * dV;
         m_data[lev*noutputs+index_total] = m_data[lev*noutputs+index_E] +
                                            m_data[lev*noutputs+index_B];
+        m_data[lev*noutputs+index_Ex] = 0.5_rt * tmpEx * PhysConst::epsilon_0 * dV;
+        m_data[lev*noutputs+index_Ey] = 0.5_rt * tmpEy * PhysConst::epsilon_0 * dV;
+        m_data[lev*noutputs+index_Ez] = 0.5_rt * tmpEz * PhysConst::epsilon_0 * dV;
+        m_data[lev*noutputs+index_Bx] = 0.5_rt * tmpBx / PhysConst::mu0 * dV;
+        m_data[lev*noutputs+index_By] = 0.5_rt * tmpBy / PhysConst::mu0 * dV;
+        m_data[lev*noutputs+index_Bz] = 0.5_rt * tmpBz / PhysConst::mu0 * dV;
     }
     // end loop over refinement levels
 
