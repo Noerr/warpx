@@ -83,14 +83,15 @@ void WarpX::HybridPICEvolveFields ()
     for (int lev = 0; lev <= finest_level; ++lev)
     {
         for (int idim = 0; idim < 3; ++idim) {
-            // Perform a linear combination of values in the 0'th index (1 comp)
-            // of J_i^{n-1/2} and J_i^{n+1/2} (with 0.5 prefactors), writing
-            // the result into the 0'th index of `current_fp_temp[lev][idim]`
+            // Perform a linear combination of values (with 0.5 prefactors) of
+            // J_i^{n-1/2} and J_i^{n+1/2}, writing the result into
+            // `current_fp_temp[lev][idim]`. All components are averaged so that
+            // every azimuthal mode (m=0 and m>=1 in multi-mode RZ) is time-centered.
             MultiFab::LinComb(
                 *current_fp_temp[lev][idim],
                 0.5_rt, *current_fp_temp[lev][idim], 0,
                 0.5_rt, *m_fields.get(FieldType::current_fp, Direction{idim}, lev), 0,
-                0, 1, current_fp_temp[lev][idim]->nGrowVect()
+                0, current_fp_temp[lev][idim]->nComp(), current_fp_temp[lev][idim]->nGrowVect()
             );
         }
     }
@@ -115,12 +116,12 @@ void WarpX::HybridPICEvolveFields ()
     // Average rho^{n} and rho^{n+1} to get rho^{n+1/2} in rho_fp_temp
     for (int lev = 0; lev <= finest_level; ++lev)
     {
-        // Perform a linear combination of values in the 0'th index (1 comp)
-        // of rho^{n} and rho^{n+1} (with 0.5 prefactors), writing
-        // the result into the 0'th index of `rho_fp_temp[lev]`
+        // Perform a linear combination of values (with 0.5 prefactors) of
+        // rho^{n} and rho^{n+1}, writing the result into `rho_fp_temp[lev]`.
+        // All components are averaged so that every azimuthal mode is time-centered.
         MultiFab::LinComb(
             *rho_fp_temp[lev], 0.5_rt, *rho_fp_temp[lev], 0,
-            0.5_rt, *m_fields.get(FieldType::rho_fp, lev), 0, 0, 1, rho_fp_temp[lev]->nGrowVect()
+            0.5_rt, *m_fields.get(FieldType::rho_fp, lev), 0, 0, rho_fp_temp[lev]->nComp(), rho_fp_temp[lev]->nGrowVect()
         );
     }
 
@@ -152,14 +153,15 @@ void WarpX::HybridPICEvolveFields ()
     for (int lev = 0; lev <= finest_level; ++lev)
     {
         for (int idim = 0; idim < 3; ++idim) {
-            // Perform a linear combination of values in the 0'th index (1 comp)
-            // of J_i^{n-1/2} and J_i^{n+1/2} (with -1.0 and 2.0 prefactors),
-            // writing the result into the 0'th index of `current_fp_temp[lev][idim]`
+            // Perform a linear combination of values (with -1.0 and 2.0 prefactors)
+            // of J_i^{n-1/2} and J_i^{n+1/2}, writing the result into
+            // `current_fp_temp[lev][idim]`. All components are extrapolated so that
+            // every azimuthal mode (m=0 and m>=1 in multi-mode RZ) is handled.
             MultiFab::LinComb(
                 *current_fp_temp[lev][idim],
                 -1._rt, *current_fp_temp[lev][idim], 0,
                 2._rt, *m_fields.get(FieldType::current_fp, Direction{idim}, lev), 0,
-                0, 1, current_fp_temp[lev][idim]->nGrowVect()
+                0, current_fp_temp[lev][idim]->nComp(), current_fp_temp[lev][idim]->nGrowVect()
             );
         }
     }
@@ -209,12 +211,12 @@ void WarpX::HybridPICEvolveFields ()
     // rho^{n} and J_i^{n-1/2}.
     for (int lev = 0; lev <= finest_level; ++lev)
     {
-        // copy 1 component value starting at index 0 to index 0
+        // copy all components (every azimuthal mode) starting at index 0 to index 0
         MultiFab::Copy(*rho_fp_temp[lev], *m_fields.get(FieldType::rho_fp, lev),
-                        0, 0, 1, rho_fp_temp[lev]->nGrowVect());
+                        0, 0, rho_fp_temp[lev]->nComp(), rho_fp_temp[lev]->nGrowVect());
         for (int idim = 0; idim < 3; ++idim) {
             MultiFab::Copy(*current_fp_temp[lev][idim], *m_fields.get(FieldType::current_fp, Direction{idim}, lev),
-                           0, 0, 1, current_fp_temp[lev][idim]->nGrowVect());
+                           0, 0, current_fp_temp[lev][idim]->nComp(), current_fp_temp[lev][idim]->nGrowVect());
         }
     }
 
@@ -336,12 +338,12 @@ void WarpX::HybridPICInitializeRhoJandB ()
     ablastr::fields::MultiLevelVectorField current_fp_temp = m_fields.get_mr_levels_alldirs(FieldType::hybrid_current_fp_temp, finest_level);
     for (int lev = 0; lev <= finest_level; ++lev)
     {
-        // copy 1 component value starting at index 0 to index 0
+        // copy all components (every azimuthal mode) starting at index 0 to index 0
         MultiFab::Copy(*rho_fp_temp[lev], *m_fields.get(FieldType::rho_fp, lev),
-                        0, 0, 1, rho_fp_temp[lev]->nGrowVect());
+                        0, 0, rho_fp_temp[lev]->nComp(), rho_fp_temp[lev]->nGrowVect());
         for (int idim = 0; idim < 3; ++idim) {
             MultiFab::Copy(*current_fp_temp[lev][idim], *m_fields.get(FieldType::current_fp, Direction{idim}, lev),
-                        0, 0, 1, current_fp_temp[lev][idim]->nGrowVect());
+                        0, 0, current_fp_temp[lev][idim]->nComp(), current_fp_temp[lev][idim]->nGrowVect());
         }
     }
 }
