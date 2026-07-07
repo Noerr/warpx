@@ -539,14 +539,20 @@ void HybridPICModel::BfieldEvolveRK (
     std::array< MultiFab, 3 > K;
     for (int ii = 0; ii < 3; ii++)
     {
+        // nc = number of stored field components (2*n_rz_azimuthal_modes-1 in
+        // multi-mode RZ, 1 otherwise). ALL components must be carried through the
+        // RK scaffolding, else m>=1 modes are never RK-combined and get integrated
+        // as a raw accumulation of the 4 sub-pushes (over-advanced ~2.5x).
+        const int nc = Bfield[lev][ii]->nComp();
         B_old[ii] = MultiFab(
-            Bfield[lev][ii]->boxArray(), Bfield[lev][ii]->DistributionMap(), 1,
+            Bfield[lev][ii]->boxArray(), Bfield[lev][ii]->DistributionMap(), nc,
             Bfield[lev][ii]->nGrowVect()
         );
-        MultiFab::Copy(B_old[ii], *Bfield[lev][ii], 0, 0, 1, ng);
+        MultiFab::Copy(B_old[ii], *Bfield[lev][ii], 0, 0, nc, ng);
 
+        // 2 RK terms stored per component: [0, nc) = 0.5 dt K0, [nc, 2nc) = 0.5 dt K1.
         K[ii] = MultiFab(
-            Bfield[lev][ii]->boxArray(), Bfield[lev][ii]->DistributionMap(), 2,
+            Bfield[lev][ii]->boxArray(), Bfield[lev][ii]->DistributionMap(), 2*nc,
             Bfield[lev][ii]->nGrowVect()
         );
     }
@@ -562,9 +568,10 @@ void HybridPICModel::BfieldEvolveRK (
     // B_new = B_old + 0.5 * dt * [-curl x E(B_old)] = B_old + 0.5 * dt * K0.
     for (int ii = 0; ii < 3; ii++)
     {
-        // Extract 0.5 * dt * K0 for each direction into index 0 of K.
+        // Extract 0.5 * dt * K0 for each direction into components [0, nc) of K.
+        const int nc = Bfield[lev][ii]->nComp();
         MultiFab::LinComb(
-            K[ii], 1._rt, *Bfield[lev][ii], 0, -1._rt, B_old[ii], 0, 0, 1, ng
+            K[ii], 1._rt, *Bfield[lev][ii], 0, -1._rt, B_old[ii], 0, 0, nc, ng
         );
     }
 
@@ -603,23 +610,32 @@ void HybridPICModel::BfieldEvolveRK (
         Box const& tjy  = mfi.tilebox(Bfield[lev][1]->ixType().toIntVect(), ng);
         Box const& tjz  = mfi.tilebox(Bfield[lev][2]->ixType().toIntVect(), ng);
 
+        // number of azimuthal components (all must be RK-combined, not just m=0)
+        const int nc = Bfield[lev][0]->nComp();
+
         amrex::ParallelFor(tjx, tjy, tjz,
             // x calculation
             [=] AMREX_GPU_DEVICE (int i, int j, int k){
-                Bx(i, j, k) -= Kx(i, j, k, 0);
-                Kx(i, j, k, 1) = Bx(i, j, k) - Bx_old(i, j, k);
+                for (int c = 0; c < nc; ++c) {
+                    Bx(i, j, k, c) -= Kx(i, j, k, c);
+                    Kx(i, j, k, nc + c) = Bx(i, j, k, c) - Bx_old(i, j, k, c);
+                }
             },
 
             // y calculation
             [=] AMREX_GPU_DEVICE (int i, int j, int k){
-                By(i, j, k) -= Ky(i, j, k, 0);
-                Ky(i, j, k, 1) = By(i, j, k) - By_old(i, j, k);
+                for (int c = 0; c < nc; ++c) {
+                    By(i, j, k, c) -= Ky(i, j, k, c);
+                    Ky(i, j, k, nc + c) = By(i, j, k, c) - By_old(i, j, k, c);
+                }
             },
 
             // z calculation
             [=] AMREX_GPU_DEVICE (int i, int j, int k){
-                Bz(i, j, k) -= Kz(i, j, k, 0);
-                Kz(i, j, k, 1) = Bz(i, j, k) - Bz_old(i, j, k);
+                for (int c = 0; c < nc; ++c) {
+                    Bz(i, j, k, c) -= Kz(i, j, k, c);
+                    Kz(i, j, k, nc + c) = Bz(i, j, k, c) - Bz_old(i, j, k, c);
+                }
             }
         );
     }
@@ -635,9 +651,10 @@ void HybridPICModel::BfieldEvolveRK (
     //       = B_old + 0.5 * dt * K1 + dt * K2
     for (int ii = 0; ii < 3; ii++)
     {
-        // Subtract 0.5 * dt * K1 from the Bfield for each direction to get
-        // B_new = B_old + dt * K2.
-        MultiFab::Subtract(*Bfield[lev][ii], K[ii], 1, 0, 1, ng);
+        // Subtract 0.5 * dt * K1 (stored in components [nc, 2nc) of K) from the
+        // Bfield (components [0, nc)) for each direction to get B_new = B_old + dt*K2.
+        const int nc = Bfield[lev][ii]->nComp();
+        MultiFab::Subtract(*Bfield[lev][ii], K[ii], nc, 0, nc, ng);
     }
 
     // Step 4:
@@ -679,23 +696,31 @@ void HybridPICModel::BfieldEvolveRK (
         Box const& tjy  = mfi.tilebox(Bfield[lev][1]->ixType().toIntVect(), ng);
         Box const& tjz  = mfi.tilebox(Bfield[lev][2]->ixType().toIntVect(), ng);
 
+        const int nc = Bfield[lev][0]->nComp();
+
         amrex::ParallelFor(tjx, tjy, tjz,
             // Bx calculation
             [=] AMREX_GPU_DEVICE (int i, int j, int k){
-                Kx(i, j, k, 0) += Bx(i, j, k) - Bx_old(i, j, k) + 2.0 * Kx(i, j, k, 1);
-                Bx(i, j, k) = Bx_old(i, j, k) + Kx(i, j, k, 0) / 3.0;
+                for (int c = 0; c < nc; ++c) {
+                    Kx(i, j, k, c) += Bx(i, j, k, c) - Bx_old(i, j, k, c) + 2.0 * Kx(i, j, k, nc + c);
+                    Bx(i, j, k, c) = Bx_old(i, j, k, c) + Kx(i, j, k, c) / 3.0;
+                }
             },
 
             // By calculation
             [=] AMREX_GPU_DEVICE (int i, int j, int k){
-                Ky(i, j, k, 0) += By(i, j, k) - By_old(i, j, k) + 2.0 * Ky(i, j, k, 1);
-                By(i, j, k) = By_old(i, j, k) + Ky(i, j, k, 0) / 3.0;
+                for (int c = 0; c < nc; ++c) {
+                    Ky(i, j, k, c) += By(i, j, k, c) - By_old(i, j, k, c) + 2.0 * Ky(i, j, k, nc + c);
+                    By(i, j, k, c) = By_old(i, j, k, c) + Ky(i, j, k, c) / 3.0;
+                }
             },
 
             // Bz calculation
             [=] AMREX_GPU_DEVICE (int i, int j, int k){
-                Kz(i, j, k, 0) += Bz(i, j, k) - Bz_old(i, j, k) + 2.0 * Kz(i, j, k, 1);
-                Bz(i, j, k) = Bz_old(i, j, k) + Kz(i, j, k, 0) / 3.0;
+                for (int c = 0; c < nc; ++c) {
+                    Kz(i, j, k, c) += Bz(i, j, k, c) - Bz_old(i, j, k, c) + 2.0 * Kz(i, j, k, nc + c);
+                    Bz(i, j, k, c) = Bz_old(i, j, k, c) + Kz(i, j, k, c) / 3.0;
+                }
             }
         );
     }
