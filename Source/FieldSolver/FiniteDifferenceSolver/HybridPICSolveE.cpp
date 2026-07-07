@@ -1249,14 +1249,28 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
                 if (include_hyper_resistivity_term) {
                     // nabla^2 J_r mode-by-mode (linear in J modes).
                     // Vector r-component cylindrical Laplacian for mode m:
-                    //   (d/dr)(1/r d(r J)/dr) + d^2 J / dz^2 - (m^2 + 1) J / r^2
-                    // The (1/r)(d/dr)(r d/dr) part is handled by Dr_rDr_over_r.
+                    //   (1/r)(d/dr)(r dJr/dr) + d^2 Jr/dz^2 - (m^2 + 1) Jr/r^2
+                    //                                       - (2/r^2) d(Jtheta)/dtheta
+                    // The diagonal part is below; the cross-coupling term
+                    // -(2/r^2) d(Jtheta)/dtheta is added in the m-loop that
+                    // follows. Omitting that cross term (diagonal-only) gives
+                    // the WRONG vector Laplacian for m>=1 and under-damps the
+                    // transverse current; the 3D Cartesian hybrid includes it
+                    // automatically via the per-Cartesian-component Laplacian.
                     for (int c = 0; c < ncomps; ++c) {
                         const int mm = (c == 0) ? 0 : ((c + 1) / 2);
                         lapJr_m[c] =
                             T_Algo::Dr_rDr_over_r(Jr, r_Er, dr, coefs_r, n_coefs_r, i, j, 0, c)
                           + T_Algo::Dzz         (Jr,           coefs_z, n_coefs_z, i, j, 0, c)
                           - (static_cast<Real>(mm * mm) + 1._rt) * one_over_r2 * Jr(i, j, 0, c);
+                    }
+                    // Cross-coupling -(2/r^2) d(Jtheta)/dtheta. With the modal
+                    // convention d/dtheta: [Re,Im] -> [m*Im, -m*Re] (cf. gPt),
+                    // -(2m/r^2) acting on Jtheta gives the components below.
+                    for (int m = 1; m < nmodes; ++m) {
+                        const Real cc = 2._rt * static_cast<Real>(m) * one_over_r2;
+                        lapJr_m[2*m - 1] += -cc * Jt_m[2*m    ];
+                        lapJr_m[2*m    ] +=  cc * Jt_m[2*m - 1];
                     }
                 }
 
@@ -1365,13 +1379,22 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
 
                 if (include_hyper_resistivity_term) {
                     // Vector theta-component Laplacian, mode m:
-                    //   scalar_lap(J_theta) - J_theta/r^2 - (m^2)/r^2 J_theta
+                    //   (1/r)(d/dr)(r dJt/dr) + d^2 Jt/dz^2 - (m^2 + 1) Jt/r^2
+                    //                                       + (2/r^2) d(Jr)/dtheta
+                    // Diagonal part below; the cross-coupling term
+                    // +(2/r^2) d(Jr)/dtheta is added in the following m-loop.
                     for (int c = 0; c < ncomps; ++c) {
                         const int mm = (c == 0) ? 0 : ((c + 1) / 2);
                         lapJt_m[c] =
                             T_Algo::Dr_rDr_over_r(Jtheta, r, dr, coefs_r, n_coefs_r, i, j, 0, c)
                           + T_Algo::Dzz         (Jtheta,        coefs_z, n_coefs_z, i, j, 0, c)
                           - (static_cast<Real>(mm * mm) + 1._rt) * one_over_r2 * Jtheta(i, j, 0, c);
+                    }
+                    // Cross-coupling +(2/r^2) d(Jr)/dtheta.
+                    for (int m = 1; m < nmodes; ++m) {
+                        const Real cc = 2._rt * static_cast<Real>(m) * one_over_r2;
+                        lapJt_m[2*m - 1] +=  cc * Jr_m[2*m    ];
+                        lapJt_m[2*m    ] += -cc * Jr_m[2*m - 1];
                     }
                 }
 
