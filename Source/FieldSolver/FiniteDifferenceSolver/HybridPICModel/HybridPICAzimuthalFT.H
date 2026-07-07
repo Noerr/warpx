@@ -114,19 +114,31 @@ void apply_axis_bc_scalar (int nmodes, amrex::Real* AMREX_RESTRICT A_modes)
  *  the cross-coupling Re(V_r,1) = -Im(V_theta,1), Im(V_r,1) = +Re(V_theta,1).
  *  For m >= 2 both components vanish on axis.
  *
- *  Implementation: we only enforce modes m >= 1 here. Mode 0 is intentionally
- *  *not* forced to zero -- the existing m=0 hybrid kernel relies on the small
- *  non-zero values that come from interpolating Yee-staggered J and B through
- *  ghost cells at i=-1, and overriding them with exact zero diverges from
- *  that reference behavior. For m >= 1, both V_r and V_theta are zeroed
- *  (the m=1 cross-coupling is recovered by neighbor cells via linear-in-r
- *  extrapolation in the surrounding Faraday / Ampere kernels). */
+ *  Implementation: Mode 0 is intentionally *not* forced to zero -- the existing
+ *  m=0 hybrid kernel relies on the small non-zero values that come from
+ *  interpolating Yee-staggered J and B through ghost cells at i=-1, and
+ *  overriding them with exact zero diverges from that reference behavior.
+ *
+ *  For m == 1 the transverse vector is FINITE on axis (kink-class / rigid
+ *  transverse drift): V_+ = V_r + i V_theta ~ r^0 is the regular root while
+ *  V_- = V_r - i V_theta ~ r^2 -> 0. We therefore keep V_r,1 (the finite root)
+ *  and enforce the regularity cross-coupling V_theta,1 = -i V_r,1, i.e.
+ *  Re(V_theta,1) = Im(V_r,1), Im(V_theta,1) = -Re(V_r,1). This is the same
+ *  relation used by the canonical RZ EvolveE/EvolveB. (Previously both
+ *  components were zeroed -- correct only for laser-class m=1 where
+ *  V_theta,1 ~ r -> 0, but WRONG for the finite-at-axis kink.)
+ *  For m >= 2 both components vanish on axis (V ~ r^|m-1| >= r). */
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
 void apply_axis_bc_vector_rt (int nmodes,
                               amrex::Real* AMREX_RESTRICT Vr_modes,
                               amrex::Real* AMREX_RESTRICT Vt_modes)
 {
-    for (int m = 1; m < nmodes; ++m) {
+    if (nmodes > 1) {
+        // m == 1: keep V_r,1 (finite regular root); set V_theta,1 = -i V_r,1.
+        Vt_modes[1] =  Vr_modes[2];
+        Vt_modes[2] = -Vr_modes[1];
+    }
+    for (int m = 2; m < nmodes; ++m) {
         Vr_modes[2*m - 1] = amrex::Real{0};
         Vr_modes[2*m    ] = amrex::Real{0};
         Vt_modes[2*m - 1] = amrex::Real{0};
