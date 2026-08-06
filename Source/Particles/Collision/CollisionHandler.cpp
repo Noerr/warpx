@@ -42,14 +42,20 @@ CollisionHandler::CollisionHandler(MultiParticleContainer const * const mypc)
     for (int i = 0; i < static_cast<int>(ncollisions); ++i) {
         const amrex::ParmParse pp_collision_name(collision_names[i]);
 
-        WARPX_ALWAYS_ASSERT_WITH_MESSAGE(WarpX::n_rz_azimuthal_modes==1,
-        "RZ mode `warpx.n_rz_azimuthal_modes` must be 1 when using the binary collision module.");
-
         // For legacy, pairwisecoulomb is the default
         std::string type = "pairwisecoulomb";
 
         pp_collision_name.query("type", type);
         collision_types[i] = type;
+
+        // Multimode RZ (n_rz_azimuthal_modes>1) collisions are supported only for pairwise
+        // Coulomb, via r-adaptive azimuthal sub-binning (collisions.n_theta_subbins). The
+        // other binary-collision types still assume cylindrical symmetry (m=0 only): the RZ
+        // rotation trick in ElasticCollisionPerez.H is what makes ring-binning valid, and it
+        // requires an axisymmetric (m=0) momentum distribution.
+        WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
+            WarpX::n_rz_azimuthal_modes==1 || type=="pairwisecoulomb",
+            "In multimode RZ (n_rz_azimuthal_modes>1), only `pairwisecoulomb` collisions are supported.");
 
         if (type == "pairwisecoulomb") {
             allcollisions[i] =
