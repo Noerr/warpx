@@ -3455,6 +3455,22 @@ class EmbeddedBoundary(picmistandard.base._ClassWithInit):
         Whether to cover cells with multiple cuts.
         (If False, this will raise an error if some cells have multiple cuts)
 
+    particle_boundary_condition: string, default='Absorbing'
+        The boundary condition applied to the particles when they reach the
+        surface of the embedded boundary. Sets ``boundary.particle_eb``.
+        Options are:
+
+        - ``'Absorbing'``: particles that reach the embedded boundary are
+          deleted. This is the default behavior.
+        - ``'Reflecting'``: particles that reach the embedded boundary are
+          specularly reflected back into the simulation domain.
+        - ``'Thermal'``: particles that reach the embedded boundary are
+          re-emitted from a wall Maxwellian. The per-species thermal speed is
+          set through the grid's ``warpx_boundary_u_th`` argument.
+
+        Leaving this unspecified when an embedded boundary is present is
+        deprecated and emits a warning; set it explicitly.
+
     Parameters used in the analytic expressions should be given as additional keyword arguments.
 
     """
@@ -3468,6 +3484,7 @@ class EmbeddedBoundary(picmistandard.base._ClassWithInit):
         stl_reverse_normal=False,
         potential=None,
         cover_multiple_cuts=None,
+        particle_boundary_condition=None,
         **kw,
     ):
         assert stl_file is None or implicit_function is None, Exception(
@@ -3495,6 +3512,8 @@ class EmbeddedBoundary(picmistandard.base._ClassWithInit):
         self.potential = potential
 
         self.cover_multiple_cuts = cover_multiple_cuts
+
+        self.particle_boundary_condition = particle_boundary_condition
 
         # Handle keyword arguments used in expressions
         self.user_defined_kw = {}
@@ -3529,6 +3548,8 @@ class EmbeddedBoundary(picmistandard.base._ClassWithInit):
             pywarpx.eb2.stl_reverse_normal = self.stl_reverse_normal
 
         pywarpx.eb2.cover_multiple_cuts = self.cover_multiple_cuts
+
+        pywarpx.boundary.particle_eb = self.particle_boundary_condition
 
         if self.potential is not None:
             expression = pywarpx.my_constants.mangle_expression(
