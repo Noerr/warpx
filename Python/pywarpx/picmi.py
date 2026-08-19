@@ -3467,6 +3467,17 @@ class EmbeddedBoundary(
         default=None,
         description="Whether to cover cells with multiple cuts. (If False, this will raise an error if some cells have multiple cuts)",
     )
+    particle_boundary_condition: str | None = Field(
+        default=None,
+        description=(
+            "Boundary condition applied to particles reaching the embedded boundary; sets ``boundary.particle_eb``. "
+            "'Absorbing' (default): particles are deleted. "
+            "'Reflecting': particles are specularly reflected back into the domain. "
+            "'Thermal': particles are re-emitted from a wall Maxwellian (per-species thermal speed set via the grid's "
+            "``warpx_boundary_u_th``). Leaving this unspecified when an embedded boundary is present is deprecated "
+            "and emits a warning; set it explicitly."
+        ),
+    )
     user_defined_kw: dict = Field(
         default_factory=dict,
         description="Constants referenced in the expressions, collected from otherwise-unrecognized keyword arguments.",
@@ -3509,6 +3520,8 @@ class EmbeddedBoundary(
             pywarpx.eb2.stl_reverse_normal = self.stl_reverse_normal
 
         pywarpx.eb2.cover_multiple_cuts = self.cover_multiple_cuts
+
+        pywarpx.boundary.particle_eb = self.particle_boundary_condition
 
         if self.potential is not None:
             expression = pywarpx.my_constants.mangle_expression(

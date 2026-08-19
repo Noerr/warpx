@@ -294,6 +294,16 @@ void WarpX::MakeWarpX ()
     if (EB::enabled()) {
         amrex::ParmParse const pp_boundary("boundary");
         // Defaults to Absorbing; overwritten only if boundary.particle_eb is set.
+        if (!pp_boundary.contains("particle_eb")) {
+            ablastr::warn_manager::WMRecordWarning(
+                "EmbeddedBoundary",
+                "This simulation uses an embedded boundary, but boundary.particle_eb "
+                "is not specified. It currently defaults to Absorbing: particles that "
+                "reach the embedded boundary are deleted. Relying on this implicit "
+                "default is deprecated; please set boundary.particle_eb explicitly to "
+                "an allowed value.",
+                ablastr::warn_manager::WarnPriority::low);
+        }
         pp_boundary.query_enum_case_insensitive("particle_eb", eb_particle_boundary);
         WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
             eb_particle_boundary == ParticleBoundaryType::Absorbing ||
