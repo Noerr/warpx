@@ -31,8 +31,9 @@ HeatFluxFunctor::operator() (amrex::MultiFab& mf_dst, const int dcomp, const int
     WARPX_ALWAYS_ASSERT_WITH_MESSAGE(mass > 0.,
         "The heat flux diagnostic can not be calculated for a massless species.");
 
-    std::unique_ptr<amrex::MultiFab> heatflux = pc.GetAverageNGPHeatFlux(m_lev);
+    pc.DepositNGPHeatFlux(m_lev);
+    amrex::MultiFab const & heatflux = *warpx.m_fields.get("Q_" + pc.getName(), m_lev);
 
     // Coarsen and interpolate all 3 components from heatflux to the output diagnostic MultiFab.
-    ablastr::coarsen::sample::Coarsen(mf_dst, *heatflux, dcomp, 0, nComp(), 0, m_crse_ratio);
+    ablastr::coarsen::sample::Coarsen(mf_dst, heatflux, dcomp, 0, nComp(), 0, m_crse_ratio);
 }
