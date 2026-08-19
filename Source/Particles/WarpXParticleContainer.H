@@ -415,17 +415,25 @@ public:
     void DepositTotalNGPTemperature (int lev);
     void CalculateNuei(amrex::MultiFab & species_nuei,
                        WarpXParticleContainer const & electron_species, int lev);
-    void DepositTotalNGPTemperature (amrex::MultiFab* temperature, const int lev);
-    std::unique_ptr<amrex::MultiFab> GetAverageNGPTemperature (int lev);
 
-    void DepositNGPPressureTensor (amrex::MultiFab* ptensor, const int lev);
-    std::unique_ptr<amrex::MultiFab> GetAverageNGPPressureTensor (int lev);
+    /** Deposit the symmetric pressure tensor P_<species> (Pa) into the field
+     *  registry, as n*m*<(u_i - <u_i>)(u_j - <u_j>)>.
+     *
+     *  NOTE: this currently calls DepositTotalNGPTemperature() to obtain the
+     *  pass-1 moments N_<species> and u_<species>, which also computes
+     *  T_<species> even when only the pressure tensor was requested. A
+     *  follow-up should factor that first pass into a shared
+     *  DepositNGPMoments() helper used by all three.
+     */
+    void DepositNGPPressureTensor (int lev);
 
-    void DepositNGPHeatFlux (amrex::MultiFab* heatflux, const int lev);
-    std::unique_ptr<amrex::MultiFab> GetAverageNGPHeatFlux (int lev);
-
-    void DepositNumberDensity (amrex::MultiFab* number_density, const int lev);
-    std::unique_ptr<amrex::MultiFab> GetNumberDensity (int lev);
+    /** Deposit the heat flux vector Q_<species> (W/m^2) into the field
+     *  registry, as n*m/2*<|u - <u>|^2 (u_i - <u_i>)>.
+     *
+     *  See the note on DepositNGPPressureTensor() regarding the shared
+     *  first-pass moments.
+     */
+    void DepositNGPHeatFlux (int lev);
 
     std::unique_ptr<amrex::MultiFab> GetDebyeLength (int lev);
 

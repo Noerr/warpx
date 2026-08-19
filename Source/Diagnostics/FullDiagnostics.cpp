@@ -503,7 +503,7 @@ FullDiagnostics::InitializeFieldFunctorsRZopenPMD (int lev)
                 AddRZModesToOutputNames(std::string("T_") + m_all_species_names[m_T_per_species_index[i_T_species]], ncomp);
             }
             i_T_species++;
-        } else if ( m_varnames_fields[comp].rfind("P_", 0) == 0 ){
+        } else if ( m_varnames_fields[comp].starts_with("P_") ){
             // Initialize pressure tensor functor to dump 6-component tensor per species
             const std::string species_name = m_all_species_names[m_P_per_species_index[i_P_species]];
             m_all_field_functors[lev][comp] = std::make_unique<PressureTensorFunctor>(lev, m_crse_ratio, m_P_per_species_index[i_P_species], 6);
@@ -517,7 +517,7 @@ FullDiagnostics::InitializeFieldFunctorsRZopenPMD (int lev)
                 m_varnames.push_back("Pzz_" + species_name);
             }
             i_P_species++;
-        } else if ( m_varnames_fields[comp].rfind("Q_", 0) == 0 ){
+        } else if ( m_varnames_fields[comp].starts_with("Q_") ){
             // Initialize heat flux functor to dump 3-component vector per species
             const std::string species_name = m_all_species_names[m_Q_per_species_index[i_Q_species]];
             m_all_field_functors[lev][comp] = std::make_unique<HeatFluxFunctor>(lev, m_crse_ratio, m_Q_per_species_index[i_Q_species], 3);
@@ -996,11 +996,11 @@ FullDiagnostics::InitializeFieldFunctors (int lev)
             // Initialize temperature functor to dump temperature per species
             m_all_field_functors[lev][comp] = std::make_unique<TemperatureFunctor>(lev, m_crse_ratio, m_T_per_species_index[i_T_species]);
             i_T_species++;
-        } else if ( m_varnames_fields[comp].rfind("P_", 0) == 0 ){
+        } else if ( m_varnames_fields[comp].starts_with("P_") ){
             // Initialize pressure tensor functor to dump 6-component tensor per species
             m_all_field_functors[lev][comp] = std::make_unique<PressureTensorFunctor>(lev, m_crse_ratio, m_P_per_species_index[i_P_species], 6);
             i_P_species++;
-        } else if ( m_varnames_fields[comp].rfind("Q_", 0) == 0 ){
+        } else if ( m_varnames_fields[comp].starts_with("Q_") ){
             // Initialize heat flux functor to dump 3-component vector per species
             m_all_field_functors[lev][comp] = std::make_unique<HeatFluxFunctor>(lev, m_crse_ratio, m_Q_per_species_index[i_Q_species], 3);
             i_Q_species++;
