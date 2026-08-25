@@ -9,6 +9,9 @@
 #include "Utils/TextMsg.H"
 #include "Utils/Parser/ParserUtils.H"
 
+#include <cmath>
+#include <string>
+
 namespace SpeciesUtils {
 
     void StringParseAbortMessage(const std::string& var,
@@ -129,6 +132,14 @@ namespace SpeciesUtils {
 
         const amrex::ParmParse pp_species(species_name);
 
+        // Quiet (low-noise) velocity start. Read up front so that requesting it
+        // on a distribution that cannot provide it is a hard error rather than
+        // a silent fall back to pseudo-random sampling, which would run to
+        // completion while quietly being noisy.
+        int quiet_start = 0;
+        utils::parser::queryWithParser(pp_species, source_name,
+                                       "quiet_velocity_start", quiet_start);
+
         // parse momentum information
         std::string mom_dist_s;
         utils::parser::get(pp_species, source_name, "momentum_distribution_type", mom_dist_s);
@@ -207,7 +218,46 @@ namespace SpeciesUtils {
             const GetTemperatureVector getTempVec(*h_mom_temp);
             h_mom_vel = std::make_unique<VelocityProperties>(pp_species, source_name);
             const GetVelocityVector getVelVec(*h_mom_vel);
-            h_inj_mom.reset(new InjectorMomentum((InjectorMomentumMaxwellian*)nullptr, getTempVec, getVelVec));
+
+            // Optional quiet (low-noise) start: replace the independent
+            // pseudo-random normal draws by a stratified antithetic sample.
+            // The per-axis lattice has N points, with N^3 equal to the number
+            // of velocity samples taken per physical position.
+            if (quiet_start != 0) {
+                int M_vel = 1;
+                utils::parser::queryWithParser(pp_species, source_name,
+                                               "velocity_samples_per_position", M_vel);
+                WARPX_ALWAYS_ASSERT_WITH_MESSAGE(M_vel >= 1,
+                    "velocity_samples_per_position must be >= 1");
+                const int N_half = static_cast<int>(std::round(std::cbrt(double(M_vel))));
+                WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
+                    N_half >= 1 && N_half <= InjectorMomentumMaxwellianQuiet::K_MAX
+                    && N_half * N_half * N_half == M_vel,
+                    std::string("quiet_velocity_start requires ")
+                    + "velocity_samples_per_position to be a perfect cube in [1, "
+                    + std::to_string(InjectorMomentumMaxwellianQuiet::K_MAX
+                                     * InjectorMomentumMaxwellianQuiet::K_MAX
+                                     * InjectorMomentumMaxwellianQuiet::K_MAX)
+                    + "]. Got velocity_samples_per_position=" + std::to_string(M_vel)
+                    + ". Nearest valid: 1 8 27 64 125 216 343 512 729 1000 1331 "
+                    + "1728 2197 2744 3375 4096.");
+                if (M_vel == 1) {
+                    ablastr::warn_manager::WMRecordWarning("Species",
+                        "quiet_velocity_start was requested with "
+                        "velocity_samples_per_position = 1. The sampling is "
+                        "deterministic, but with a single sample per position "
+                        "there is no antithetic partner to cancel against, so "
+                        "none of the noise reduction is obtained. Set "
+                        "velocity_samples_per_position to a perfect cube > 1 "
+                        "(8, 27, 64, ...) for a quiet start.",
+                        ablastr::warn_manager::WarnPriority::high);
+                }
+                h_inj_mom.reset(new InjectorMomentum(
+                    (InjectorMomentumMaxwellianQuiet*)nullptr,
+                    getTempVec, getVelVec, N_half));
+            } else {
+                h_inj_mom.reset(new InjectorMomentum((InjectorMomentumMaxwellian*)nullptr, getTempVec, getVelVec));
+            }
         } else if (mom_dist_s == "maxwell_juttner"){
             h_mom_temp = std::make_unique<TemperatureProperties>(pp_species, source_name);
             const GetTemperature getTemp(*h_mom_temp);
@@ -226,6 +276,15 @@ namespace SpeciesUtils {
         } else {
             StringParseAbortMessage("Momentum distribution type", mom_dist_s);
         }
+
+        // A quiet start that was asked for but not applied would silently
+        // degrade to ordinary pseudo-random sampling, so refuse to run.
+        WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
+            quiet_start == 0 || mom_dist_s == "maxwellian",
+            std::string("quiet_velocity_start is only supported with "
+                        "momentum_distribution_type = maxwellian, but got '")
+            + mom_dist_s + "'. From PICMI, warpx_velocity_quiet_start=True "
+            "requires warpx_momentum_spread_expressions to be set.");
     }
 
 }

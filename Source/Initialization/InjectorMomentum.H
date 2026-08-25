@@ -243,6 +243,197 @@ private:
     GetTemperatureVector temperature;
 };
 
+// struct whose getMomentum returns a quiet-start Maxwellian momentum.
+//
+// This is the low-noise counterpart of InjectorMomentumMaxwellian: it draws the
+// same N(u_mean, u_std) per axis, but replaces the independent pseudo-random
+// draws by a stratified sample with strict pair antithesis, so that the
+// per-cell velocity moments carry far less shot noise. Mean and standard
+// deviation are obtained from the same GetVelocityVector / GetTemperatureVector
+// containers used by the non-quiet injector, so constant and parser-driven
+// inputs behave identically.
+//
+// For each per-position velocity-sample index i_part, decoded into bin
+// coordinates (jx,jy,jz) in [0,N)^3 with N^3 = velocity_samples_per_position,
+// the per-axis draw is q = Phi^{-1}((j + u)/N), where u in [0,1) is a
+// deterministic hash of (position, canonical_pair_index, axis_id). Pair
+// partners i_part and M-1-i_part share the canonical hash (hence the same u),
+// but the upper-half partner flips u -> 1-u; combined with the bin flip
+// j -> N-1-j this gives q_upper = -q_lower exactly, i.e. strict antithesis per
+// axis.
+//
+// Why this is unbiased:
+//   - Variance per axis = (1/N) sum_j integral_{j/N}^{(j+1)/N} Phi^{-1}(p)^2 N dp
+//     = integral_0^1 Phi^{-1}(p)^2 dp = 1, so <v_x^2> = u_std_x^2 exactly.
+//   - A deterministic midpoint lattice q_j = Phi^{-1}((2j-1)/(2N)) instead has
+//     empirical variance (1/N) sum_j q_j^2 < 1 (bias ~0.455 at N=2), and
+//     truncated tails. The stratified-random form avoids both.
+//   - The per-cell first moment is exactly zero by pair construction, so there
+//     is no shot-noise contribution to the bulk drift.
+struct InjectorMomentumMaxwellianQuiet
+{
+    static constexpr int K_MAX = 16;
+
+    InjectorMomentumMaxwellianQuiet (GetTemperatureVector const& t,
+                                     GetVelocityVector const& b,
+                                     int a_n_half_per_dim) noexcept
+        : velocity(b), temperature(t), m_n_half_per_dim(a_n_half_per_dim)
+        {}
+
+    // Acklam's rational approximation to Phi^{-1}(p), device-callable.
+    // Absolute error ~6e-9 for p in (0,1); endpoints are clipped to avoid
+    // returning -inf/+inf.
+    [[nodiscard]]
+    AMREX_GPU_HOST_DEVICE
+    static amrex::Real inv_norm_cdf (amrex::Real p) noexcept
+    {
+        const amrex::Real eps = amrex::Real(1.0e-15);
+        if (p < eps)                    { p = eps; }
+        if (p > amrex::Real(1.0) - eps) { p = amrex::Real(1.0) - eps; }
+        const amrex::Real a0 = amrex::Real(-3.969683028665376e+01);
+        const amrex::Real a1 = amrex::Real( 2.209460984245205e+02);
+        const amrex::Real a2 = amrex::Real(-2.759285104469687e+02);
+        const amrex::Real a3 = amrex::Real( 1.383577518672690e+02);
+        const amrex::Real a4 = amrex::Real(-3.066479806614716e+01);
+        const amrex::Real a5 = amrex::Real( 2.506628277459239e+00);
+        const amrex::Real b1 = amrex::Real(-5.447609879822406e+01);
+        const amrex::Real b2 = amrex::Real( 1.615858368580409e+02);
+        const amrex::Real b3 = amrex::Real(-1.556989798598866e+02);
+        const amrex::Real b4 = amrex::Real( 6.680131188771972e+01);
+        const amrex::Real b5 = amrex::Real(-1.328068155288572e+01);
+        const amrex::Real c0 = amrex::Real(-7.784894002430293e-03);
+        const amrex::Real c1 = amrex::Real(-3.223964580411365e-01);
+        const amrex::Real c2 = amrex::Real(-2.400758277161838e+00);
+        const amrex::Real c3 = amrex::Real(-2.549732539343734e+00);
+        const amrex::Real c4 = amrex::Real( 4.374664141464968e+00);
+        const amrex::Real c5 = amrex::Real( 2.938163982698783e+00);
+        const amrex::Real d1 = amrex::Real( 7.784695709041462e-03);
+        const amrex::Real d2 = amrex::Real( 3.224671290700398e-01);
+        const amrex::Real d3 = amrex::Real( 2.445134137142996e+00);
+        const amrex::Real d4 = amrex::Real( 3.754408661907416e+00);
+        const amrex::Real p_low  = amrex::Real(0.02425);
+        const amrex::Real p_high = amrex::Real(1.0) - p_low;
+        amrex::Real q, r;
+        if (p < p_low) {
+            q = std::sqrt(amrex::Real(-2.0) * std::log(p));
+            return (((((c0*q+c1)*q+c2)*q+c3)*q+c4)*q+c5) /
+                   ((((d1*q+d2)*q+d3)*q+d4)*q + amrex::Real(1.0));
+        } else if (p <= p_high) {
+            q = p - amrex::Real(0.5);
+            r = q*q;
+            return (((((a0*r+a1)*r+a2)*r+a3)*r+a4)*r+a5) * q /
+                   (((((b1*r+b2)*r+b3)*r+b4)*r+b5)*r + amrex::Real(1.0));
+        } else {
+            q = std::sqrt(amrex::Real(-2.0) * std::log(amrex::Real(1.0) - p));
+            return -(((((c0*q+c1)*q+c2)*q+c3)*q+c4)*q+c5) /
+                    ((((d1*q+d2)*q+d3)*q+d4)*q + amrex::Real(1.0));
+        }
+    }
+
+    // Deterministic uniform-[0,1) hash of (position, canonical_idx, axis_id),
+    // a SplitMix64-style mixer over the bit patterns of the coordinates. Pair
+    // partners share the position and canonical index, so they share u.
+    [[nodiscard]]
+    AMREX_GPU_HOST_DEVICE
+    static amrex::Real position_hash (amrex::Real x, amrex::Real y, amrex::Real z,
+                                      int canonical_idx, int axis_id) noexcept
+    {
+        amrex::ULong bx, by, bz;
+        if constexpr (sizeof(amrex::Real) == 8) {
+            double dx = static_cast<double>(x);
+            double dy = static_cast<double>(y);
+            double dz = static_cast<double>(z);
+            amrex::ULong tx, ty, tz;
+            __builtin_memcpy(&tx, &dx, 8);
+            __builtin_memcpy(&ty, &dy, 8);
+            __builtin_memcpy(&tz, &dz, 8);
+            bx = tx; by = ty; bz = tz;
+        } else {
+            float fx = static_cast<float>(x);
+            float fy = static_cast<float>(y);
+            float fz = static_cast<float>(z);
+            std::uint32_t tx, ty, tz;
+            __builtin_memcpy(&tx, &fx, 4);
+            __builtin_memcpy(&ty, &fy, 4);
+            __builtin_memcpy(&tz, &fz, 4);
+            bx = static_cast<amrex::ULong>(tx);
+            by = static_cast<amrex::ULong>(ty);
+            bz = static_cast<amrex::ULong>(tz);
+        }
+        amrex::ULong h = bx
+            ^ ((by << 17) | (by >> 47))
+            ^ ((bz << 31) | (bz >> 33));
+        h ^= static_cast<amrex::ULong>(canonical_idx) * amrex::ULong(0x9E3779B97F4A7C15ULL);
+        h ^= static_cast<amrex::ULong>(axis_id)       * amrex::ULong(0xBF58476D1CE4E5B9ULL);
+        h ^= h >> 30; h *= amrex::ULong(0xBF58476D1CE4E5B9ULL);
+        h ^= h >> 27; h *= amrex::ULong(0x94D049BB133111EBULL);
+        h ^= h >> 31;
+        // 53-bit mantissa -> [0, 1)
+        return static_cast<amrex::Real>(h >> 11)
+             * amrex::Real(1.0 / static_cast<double>(amrex::ULong(1) << 53));
+    }
+
+    [[nodiscard]]
+    AMREX_GPU_HOST_DEVICE
+    amrex::XDim3
+    getMomentum (int i_part,
+                 amrex::Real const x, amrex::Real const y, amrex::Real const z,
+                 amrex::RandomEngine const& /*engine*/) const noexcept
+    {
+        using namespace amrex::literals;
+
+        const amrex::XDim3 u_std  = temperature(x,y,z);
+        const amrex::XDim3 u_mean = velocity(x,y,z);
+        if (u_std.x < 0.0_rt || u_std.y < 0.0_rt || u_std.z < 0.0_rt) {
+            amrex::Abort("The standard deviation of normalized momentum must be non-negative.");
+        }
+
+        const int N = m_n_half_per_dim;
+        const int M = N*N*N;
+        const int jx =  i_part / (N*N);
+        const int jy = (i_part / N) % N;
+        const int jz =  i_part % N;
+
+        // The pair partner of i_part is M-1-i_part, whose bins are the flipped
+        // (N-1-jx, N-1-jy, N-1-jz). Both hash from the smaller of the two
+        // indices so that they share u.
+        const int i_canonical = (i_part <= M - 1 - i_part) ? i_part : (M - 1 - i_part);
+        const bool is_upper   = (i_part >  M - 1 - i_part);
+
+        amrex::Real ux_u = position_hash(x, y, z, i_canonical, 0);
+        amrex::Real uy_u = position_hash(x, y, z, i_canonical, 1);
+        amrex::Real uz_u = position_hash(x, y, z, i_canonical, 2);
+        if (is_upper) {
+            ux_u = amrex::Real(1.0) - ux_u;
+            uy_u = amrex::Real(1.0) - uy_u;
+            uz_u = amrex::Real(1.0) - uz_u;
+        }
+
+        const amrex::Real inv_N = amrex::Real(1.0) / static_cast<amrex::Real>(N);
+        const amrex::Real q_x = inv_norm_cdf((static_cast<amrex::Real>(jx) + ux_u) * inv_N);
+        const amrex::Real q_y = inv_norm_cdf((static_cast<amrex::Real>(jy) + uy_u) * inv_N);
+        const amrex::Real q_z = inv_norm_cdf((static_cast<amrex::Real>(jz) + uz_u) * inv_N);
+
+        return amrex::XDim3{u_mean.x + u_std.x * q_x,
+                            u_mean.y + u_std.y * q_y,
+                            u_mean.z + u_std.z * q_z};
+    }
+
+    [[nodiscard]]
+    AMREX_GPU_HOST_DEVICE
+    amrex::XDim3
+    getBulkMomentum (amrex::Real const x, amrex::Real const y, amrex::Real const z) const noexcept
+    {
+        const amrex::XDim3 u_mean = velocity(x,y,z);
+        return amrex::XDim3 {u_mean.x, u_mean.y, u_mean.z};
+    }
+
+private:
+    GetVelocityVector velocity;
+    GetTemperatureVector temperature;
+    int m_n_half_per_dim;
+};
+
 // struct whose getMomentum returns momentum for 1 particle with relativistic
 // bulk drift momentum u_mean, from the Maxwell-Juttner distribution. Method is
 // from Zenitani 2015 (Phys. Plasmas 22, 042116).
@@ -460,6 +651,14 @@ struct InjectorMomentum
            object(t, temperature, velocity)
     { }
 
+    // This constructor stores a InjectorMomentumMaxwellianQuiet in union object.
+    InjectorMomentum (InjectorMomentumMaxwellianQuiet* t,
+                       GetTemperatureVector const& temperature, GetVelocityVector const& velocity,
+                       int n_half_per_dim)
+         : type(Type::maxwellian_quiet),
+           object(t, temperature, velocity, n_half_per_dim)
+    { }
+
     // This constructor stores a InjectorMomentumJuttner in union object.
     InjectorMomentum (InjectorMomentumJuttner* t,
                       GetTemperature const& temperature, GetVelocityVector const& velocity)
@@ -509,6 +708,13 @@ struct InjectorMomentum
         {
             return object.maxwellian.getMomentum(x,y,z,engine);
         }
+        case Type::maxwellian_quiet:
+        {
+            // No velocity-sample index available at this call site; fall back to
+            // the first lattice point. Callers that group several velocity
+            // samples per position must use the overload taking i_part below.
+            return object.maxwellian_quiet.getMomentum(0,x,y,z,engine);
+        }
         case Type::juttner:
         {
             return object.juttner.getMomentum(x,y,z,engine);
@@ -523,6 +729,22 @@ struct InjectorMomentum
             return {0.0,0.0,0.0};
         }
         }
+    }
+
+    // As above, but for injectors that draw a different momentum per
+    // velocity-sample index within a group of particles sharing one position.
+    // Every injector except maxwellian_quiet ignores i_part, so this simply
+    // forwards to the index-free overload for them.
+    [[nodiscard]]
+    AMREX_GPU_HOST_DEVICE
+    amrex::XDim3
+    getMomentum (int i_part, amrex::Real x, amrex::Real y, amrex::Real z,
+                 amrex::RandomEngine const& engine) const noexcept
+    {
+        if (type == Type::maxwellian_quiet) {
+            return object.maxwellian_quiet.getMomentum(i_part,x,y,z,engine);
+        }
+        return getMomentum(x,y,z,engine);
     }
 
     // call getBulkMomentum from the object stored in the union
@@ -554,6 +776,10 @@ struct InjectorMomentum
         {
             return object.maxwellian.getBulkMomentum(x,y,z);
         }
+        case Type::maxwellian_quiet:
+        {
+            return object.maxwellian_quiet.getBulkMomentum(x,y,z);
+        }
         case Type::juttner:
         {
             return object.juttner.getBulkMomentum(x,y,z);
@@ -570,7 +796,8 @@ struct InjectorMomentum
         }
     }
 
-    enum struct Type { constant, gaussian, gaussianflux, uniform, maxwellian, juttner, parser };
+    enum struct Type { constant, gaussian, gaussianflux, uniform, maxwellian,
+                       maxwellian_quiet, juttner, parser };
     Type type;
 
 private:
@@ -600,6 +827,10 @@ private:
         Object (InjectorMomentumMaxwellian*,
                 GetTemperatureVector const& t, GetVelocityVector const& b) noexcept
             : maxwellian(t,b) {}
+        Object (InjectorMomentumMaxwellianQuiet*,
+                GetTemperatureVector const& t, GetVelocityVector const& b,
+                int n_half_per_dim) noexcept
+            : maxwellian_quiet(t,b,n_half_per_dim) {}
         Object (InjectorMomentumJuttner*,
                 GetTemperature const& t, GetVelocityVector const& b) noexcept
             : juttner(t,b) {}
@@ -611,6 +842,7 @@ private:
         InjectorMomentumGaussianFlux gaussianflux;
         InjectorMomentumUniform uniform;
         InjectorMomentumMaxwellian maxwellian;
+        InjectorMomentumMaxwellianQuiet maxwellian_quiet;
         InjectorMomentumJuttner juttner;
         InjectorMomentumParser parser;
     };

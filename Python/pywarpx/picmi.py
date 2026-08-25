@@ -615,6 +615,13 @@ class DensityDistributionBase(object):
                 "WarpX does not support the specified layout for this distribution"
             )
 
+        if getattr(layout, "velocity_samples_per_position", None) is not None:
+            species.add_new_group_attr(
+                source_name,
+                "velocity_samples_per_position",
+                layout.velocity_samples_per_position,
+            )
+
         species.add_new_group_attr(source_name, "xmin", self.lower_bound[0])
         species.add_new_group_attr(source_name, "xmax", self.upper_bound[0])
         species.add_new_group_attr(source_name, "ymin", self.lower_bound[1])
@@ -653,6 +660,8 @@ class DensityDistributionBase(object):
                 [0.0, 0.0, 0.0],
                 "u{dir}_std_function(x,y,z)",
             )
+            if getattr(self, "velocity_quiet_start", None):
+                species.add_new_group_attr(source_name, "quiet_velocity_start", 1)
         elif hasattr(self, "momentum_expressions") and np.any(
             np.not_equal(self.momentum_expressions, None)
         ):
@@ -875,6 +884,16 @@ class AnalyticDistribution(
         Expressions should be in terms of the position, written as 'x', 'y', and 'z'.
         Parameters can be used in the expression with the values given as keyword arguments.
         For any axis not supplied (set to None), zero will be used.
+
+    warpx_velocity_quiet_start: bool, default=False
+        Use a quiet (low-noise) start for the thermal velocities instead of
+        independent pseudo-random draws. The same Maxwellian mean and spread are
+        sampled on a stratified per-axis quantile lattice with strict pair
+        antithesis, which removes the shot noise from the per-cell velocity
+        moments. Requires ``warpx_momentum_spread_expressions`` (so that the
+        distribution is Maxwellian) and pairs with
+        ``warpx_velocity_samples_per_position`` on the layout, whose cube root
+        sets the per-axis lattice size.
     """
 
     def init(self, kw):
@@ -883,6 +902,7 @@ class AnalyticDistribution(
         self.momentum_spread_expressions = kw.pop(
             "warpx_momentum_spread_expressions", [None, None, None]
         )
+        self.velocity_quiet_start = kw.pop("warpx_velocity_quiet_start", None)
 
     def distribution_initialize_inputs(
         self, species_number, layout, species, density_scale, source_name
@@ -953,15 +973,41 @@ class ParticleDistributionPlanarInjector(
 
 
 class GriddedLayout(picmistandard.PICMI_GriddedLayout):
-    pass
+    """
+    Parameters
+    ----------
+    warpx_velocity_samples_per_position: int, default=1
+        Number of velocity samples drawn per physical particle position.
+        Particles are emitted in groups of this size, each group sharing one
+        position and differing only in its velocity sample. The total number of
+        particles per cell is the position count multiplied by this value.
+        Pairs with ``warpx_velocity_quiet_start=True`` on the distribution, for
+        which this must be a perfect cube (its cube root is the per-axis
+        quantile lattice size).
+    """
+
+    def init(self, kw):
+        self.velocity_samples_per_position = kw.pop(
+            "warpx_velocity_samples_per_position", None
+        )
 
 
 class PseudoRandomLayout(picmistandard.PICMI_PseudoRandomLayout):
+    """
+    Parameters
+    ----------
+    warpx_velocity_samples_per_position: int, default=1
+        See ``GriddedLayout``.
+    """
+
     def init(self, kw):
         if self.seed is not None:
             print(
                 "Warning: WarpX does not support specifying the random number seed in PseudoRandomLayout"
             )
+        self.velocity_samples_per_position = kw.pop(
+            "warpx_velocity_samples_per_position", None
+        )
 
 
 class BinomialSmoother(picmistandard.PICMI_BinomialSmoother):

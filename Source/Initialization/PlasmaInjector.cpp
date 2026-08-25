@@ -132,6 +132,16 @@ PlasmaInjector::PlasmaInjector (int ispecies, const std::string& name,
 
     num_particles_per_cell_each_dim.assign(3, 0);
 
+    // Number of velocity samples drawn per physical position. Applies to the
+    // per-cell injection styles; particles are emitted in groups of this size,
+    // each group sharing one position. Used by the quiet-start momentum
+    // injector, whose per-axis lattice size is the cube root of this value.
+    utils::parser::queryWithParser(pp_species, source_name,
+                                   "velocity_samples_per_position",
+                                   velocity_samples_per_position);
+    WARPX_ALWAYS_ASSERT_WITH_MESSAGE(velocity_samples_per_position >= 1,
+        "velocity_samples_per_position must be >= 1");
+
     if (injection_style == "singleparticle") {
         setupSingleParticle(pp_species);
         return;
@@ -299,6 +309,15 @@ void PlasmaInjector::setupGaussianBeam (amrex::ParmParse const& pp_species)
 void PlasmaInjector::setupNRandomPerCell (amrex::ParmParse const& pp_species)
 {
     utils::parser::getWithParser(pp_species, source_name, "num_particles_per_cell", num_particles_per_cell);
+    // For this injection style num_particles_per_cell is the TOTAL count, from
+    // which the number of distinct positions is num_particles_per_cell /
+    // velocity_samples_per_position. It must therefore divide evenly.
+    WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
+        num_particles_per_cell % velocity_samples_per_position == 0,
+        std::string("velocity_samples_per_position must be a divisor of "
+                    "num_particles_per_cell. Got velocity_samples_per_position=")
+        + std::to_string(velocity_samples_per_position)
+        + ", num_particles_per_cell=" + std::to_string(num_particles_per_cell));
 #if WARPX_DIM_RZ
     if ((WarpX::n_rz_azimuthal_modes > 1) && (num_particles_per_cell < 2*WarpX::n_rz_azimuthal_modes)) {
         ablastr::warn_manager::WMRecordWarning("Species",
@@ -471,9 +490,15 @@ void PlasmaInjector::setupNuniformPerCell (amrex::ParmParse const& pp_species)
 #else
     d_inj_pos = h_inj_pos.get();
 #endif
+    // For this injection style num_particles_per_cell_each_dim describes the
+    // lattice of physical POSITIONS. When several velocity samples are drawn
+    // per position, the total number of particles per cell is that lattice
+    // multiplied by velocity_samples_per_position, so that adding velocity
+    // samples does not thin out the position lattice.
     num_particles_per_cell = num_particles_per_cell_each_dim[0] *
                              num_particles_per_cell_each_dim[1] *
-                             num_particles_per_cell_each_dim[2];
+                             num_particles_per_cell_each_dim[2] *
+                             velocity_samples_per_position;
     SpeciesUtils::parseDensity(species_name, source_name, h_inj_rho, density_parser, m_geom);
     SpeciesUtils::parseMomentum(species_name, source_name, "nuniformpercell", h_inj_mom,
                                 h_mom_temp, h_mom_vel);

@@ -1783,6 +1783,28 @@ Particle initialization
         Particles may be relativistic in the lab frame, but the sampling model treats them as
         non-relativistic in the drift frame. For a relativistic thermal spread, use ``maxwell_juttner`` instead.
 
+      * ``<species_name>.quiet_velocity_start`` (`bool`, default ``0``):
+        If ``1``, the thermal velocities are drawn with a quiet (low-noise) start instead of
+        independent pseudo-random samples. The same mean and standard deviation are used, but
+        each axis is sampled on a stratified quantile lattice with strict pair antithesis:
+        for velocity-sample index :math:`i` decoded into bins :math:`(j_x,j_y,j_z)`, the draw is
+        :math:`q = \Phi^{-1}((j + u)/N)` with :math:`u` a deterministic hash of the position and
+        the pair index, and the partner sample :math:`M-1-i` using :math:`1-u` and the flipped
+        bin so that :math:`q` is exactly negated. This makes the per-cell first moment vanish
+        identically and leaves the per-axis variance unbiased, removing the shot noise that
+        pseudo-random sampling puts into the initial current density.
+
+        Requires ``<species_name>.velocity_samples_per_position`` to be a perfect cube;
+        its cube root is the per-axis lattice size :math:`N` (at most 16). Several velocity
+        samples must share a position, since the antithetic pairing cancels only within a group.
+
+      * ``<species_name>.velocity_samples_per_position`` (`integer`, default ``1``):
+        Number of velocity samples drawn per physical particle position. Particles within a cell
+        are emitted in groups of this size: every member of a group shares one position and
+        differs only in its velocity-sample index, so the number of particles per cell is the
+        number of positions multiplied by this value. The default of ``1`` reproduces one
+        position per particle.
+
     * ``maxwell_juttner``: Maxwell-Juttner distribution for relativistic plasma.
       More specifically, the plasma is initialized with a Maxwell-Juttner distribution
 
