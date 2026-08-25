@@ -951,6 +951,10 @@ FullDiagnostics::InitializeFieldFunctors (int lev)
     // Species index to loop over species that dump heat flux per species
     int i_Q_species = 0;
 
+    // Counter over m_J_per_species_index entries (one entry per jx_/jy_/jz_<species>
+    // occurrence, consumed here in directional order)
+    int i_J_species = 0;
+
     const auto nvar = static_cast<int>(m_varnames_fields.size());
     const auto nspec = static_cast<int>(m_pfield_species.size());
     const auto ntot = static_cast<int>(nvar + m_pfield_varnames.size() * nspec);
@@ -981,21 +985,31 @@ FullDiagnostics::InitializeFieldFunctors (int lev)
             } else if ( m_varnames_fields[comp] == "B"+field_names[idir] ){
                 m_all_field_functors[lev][comp] = std::make_unique<CellCenterFunctor>(warpx.m_fields.get(FieldType::Bfield_aux, Direction{idir}, lev), lev, m_crse_ratio);
             } else if ( m_varnames_fields[comp] == "j"+field_names[idir] ){
-                m_all_field_functors[lev][comp] = std::make_unique<JFunctor>(idir, lev, m_crse_ratio, true, deposit_current);
+                m_all_field_functors[lev][comp] = std::make_unique<JFunctor>(idir, lev, m_crse_ratio, true, deposit_current,
+                                                                             /*species_index=*/-1);
                 deposit_current = false;
+            } else if ( m_varnames_fields[comp].starts_with("j"+field_names[idir]+"_")
+                        && m_varnames_fields[comp] != "j"+field_names[idir]+"_displacement" ){
+                // Per-species current density component. The JFunctor allocates a
+                // fresh per-species J at diagnostic time via DepositCurrent on
+                // local MultiFabs.
+                const int sp_idx = m_J_per_species_index[i_J_species];
+                m_all_field_functors[lev][comp] = std::make_unique<JFunctor>(idir, lev, m_crse_ratio, true,
+                                                                             /*deposit_current=*/false, sp_idx);
+                ++i_J_species;
             } else if ( m_varnames_fields[comp] == "j"+field_names[idir]+"_displacement" ) {
                     m_all_field_functors[lev][comp] = std::make_unique<JdispFunctor>(idir, lev, m_crse_ratio, true);
             } else if ( m_varnames_fields[comp] == "A"+field_names[idir] ){
                 m_all_field_functors[lev][comp] = std::make_unique<CellCenterFunctor>(warpx.m_fields.get(FieldType::vector_potential_fp_nodal, Direction{idir}, lev), lev, m_crse_ratio);
-            } else if ( m_varnames[comp].starts_with("T"+field_names[idir]+"_")){
+            } else if ( m_varnames_fields[comp].starts_with("T"+field_names[idir]+"_")){
                 // Remove component to get string to lookup in field register.
                 std::string T_arr_str = std::string(m_varnames_fields[comp]);
                 T_arr_str.erase(T_arr_str.begin() + 1);
                 m_all_field_functors[lev][comp] = std::make_unique<CellCenterFunctor>(warpx.m_fields.get(T_arr_str, Direction{idir}, lev), lev, m_crse_ratio);
-            } else if ( warpx.m_fields.has(m_varnames[comp].substr(0, m_varnames[comp].size() - 1), lev) &&
-                        m_varnames[comp].back() == field_names[idir].front()) {
+            } else if ( warpx.m_fields.has(m_varnames_fields[comp].substr(0, m_varnames_fields[comp].size() - 1), lev) &&
+                        m_varnames_fields[comp].back() == field_names[idir].front()) {
                 // This assumes a name like fieldname + field_names[idir]
-                const std::string fieldname = m_varnames[comp].substr(0, m_varnames[comp].size() - 1);
+                const std::string fieldname = m_varnames_fields[comp].substr(0, m_varnames_fields[comp].size() - 1);
                 const amrex::MultiFab * mf = warpx.m_fields.get(fieldname, Direction{idir}, lev);
                 m_all_field_functors[lev][comp] = std::make_unique<CellCenterFunctor>(mf, lev, m_crse_ratio);
             }
@@ -1006,11 +1020,11 @@ FullDiagnostics::InitializeFieldFunctors (int lev)
         if ( m_varnames_fields[comp] == "rho" ){
             // Initialize rho functor to dump total rho
             m_all_field_functors[lev][comp] = std::make_unique<RhoFunctor>(lev, m_crse_ratio, true);
-        } else if ( m_varnames[comp].starts_with("rho_")){
+        } else if ( m_varnames_fields[comp].starts_with("rho_")){
             // Initialize rho functor to dump rho per species
             m_all_field_functors[lev][comp] = std::make_unique<RhoFunctor>(lev, m_crse_ratio, true, m_rho_per_species_index[i]);
             i++;
-        } else if ( m_varnames[comp].starts_with("T_")){
+        } else if ( m_varnames_fields[comp].starts_with("T_")){
             // Initialize temperature functor to dump temperature per species
             m_all_field_functors[lev][comp] = std::make_unique<TemperatureFunctor>(lev, m_crse_ratio, m_T_per_species_index[i_T_species]);
             i_T_species++;
@@ -1024,7 +1038,7 @@ FullDiagnostics::InitializeFieldFunctors (int lev)
             i_Q_species++;
         } else if ( m_varnames_fields[comp] == "F" ){
             m_all_field_functors[lev][comp] = std::make_unique<CellCenterFunctor>(warpx.m_fields.get(FieldType::F_fp, lev), lev, m_crse_ratio);
-        } else if ( m_varnames[comp] == "Te" ){
+        } else if ( m_varnames_fields[comp] == "Te" ){
             // Electron temperature [K]: closure-implied by default, the
             // QDSMC electron-energy-equation state variable when that
             // equation is solved.
@@ -1035,7 +1049,7 @@ FullDiagnostics::InitializeFieldFunctors (int lev)
             m_all_field_functors[lev][comp] = std::make_unique<CellCenterFunctor>(
                 warpx.m_fields.get(FieldType::hybrid_electron_temperature_fp, lev),
                 lev, m_crse_ratio);
-        } else if ( m_varnames[comp] == "Pe" ){
+        } else if ( m_varnames_fields[comp] == "Pe" ){
             // Electron pressure [Pa] consumed by the Ohm's-law E-solve.
             WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
                 WarpX::electromagnetic_solver_id == ElectromagneticSolverAlgo::HybridPIC,
@@ -1044,7 +1058,7 @@ FullDiagnostics::InitializeFieldFunctors (int lev)
             m_all_field_functors[lev][comp] = std::make_unique<CellCenterFunctor>(
                 warpx.m_fields.get(FieldType::hybrid_electron_pressure_fp, lev),
                 lev, m_crse_ratio);
-        } else if ( m_varnames[comp] == "G" ){
+        } else if ( m_varnames_fields[comp] == "G" ){
             m_all_field_functors[lev][comp] = std::make_unique<CellCenterFunctor>(warpx.m_fields.get(FieldType::G_fp, lev), lev, m_crse_ratio);
         } else if ( m_varnames_fields[comp] == "phi" ){
             m_all_field_functors[lev][comp] = std::make_unique<PhiFunctor>(lev, m_crse_ratio);
@@ -1060,8 +1074,8 @@ FullDiagnostics::InitializeFieldFunctors (int lev)
             m_all_field_functors[lev][comp] = std::make_unique<DivEFunctor>(warpx.m_fields.get_alldirs(FieldType::Efield_aux, lev), lev, m_crse_ratio);
         } else if ( m_varnames_fields[comp] == "eb_covered" ){
             m_all_field_functors[lev][comp] = std::make_unique<EBCoveredFunctor>(lev, m_crse_ratio);
-        } else if ( warpx.m_fields.has(m_varnames[comp], lev) ) {
-            m_all_field_functors[lev][comp] = std::make_unique<CellCenterFunctor>(warpx.m_fields.get(m_varnames[comp], lev), lev, m_crse_ratio);
+        } else if ( warpx.m_fields.has(m_varnames_fields[comp], lev) ) {
+            m_all_field_functors[lev][comp] = std::make_unique<CellCenterFunctor>(warpx.m_fields.get(m_varnames_fields[comp], lev), lev, m_crse_ratio);
         } else {
             WARPX_ABORT_WITH_MESSAGE(
                 "Error on component " + m_varnames_fields[comp] + ": "
