@@ -65,6 +65,12 @@ public:
     int num_particles_per_cell;
     amrex::Real num_particles_per_cell_real;
 
+    /** Number of velocity samples drawn per physical particle position.
+     *  Particles within a cell are emitted in groups of this size: each group
+     *  shares one position and differs only in its velocity-sample index.
+     *  Defaults to 1, which reproduces one position per particle. */
+    int velocity_samples_per_position = 1;
+
     amrex::Vector<int> num_particles_per_cell_each_dim;
 
     // gamma * beta

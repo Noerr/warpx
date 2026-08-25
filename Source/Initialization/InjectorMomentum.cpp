@@ -18,6 +18,7 @@ void InjectorMomentum::clear () // NOLINT(readability-make-member-function-const
     case Type::gaussianflux:
     case Type::uniform:
     case Type::maxwellian:
+    case Type::maxwellian_quiet:
     case Type::juttner:
     case Type::constant:
     {
