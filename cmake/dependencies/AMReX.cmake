@@ -326,7 +326,15 @@ set(WarpX_amrex_src ""
     "Local path to AMReX source directory (preferred if set)")
 
 # Git fetcher
-set(WarpX_amrex_repo "https://github.com/AMReX-Codes/amrex.git"
+#
+# NOTE: this branch pulls AMReX from a fork rather than from AMReX-Codes/amrex.
+# The fork carries a single patch on top of the upstream 26.08 tag, streaming
+# the per-box real data in ParticleContainer::ReadParticles so that the restart
+# host transient reaches parity with the checkpoint write (~1x instead of ~2x
+# per box). See Docs/source/developers/amrex_fork.rst. Once that change is
+# upstreamed, revert this default and the commit_amrex pin in dependencies.json
+# back to AMReX-Codes/amrex.
+set(WarpX_amrex_repo "https://github.com/Noerr/amrex.git"
     CACHE STRING
     "Repository URI to pull and build AMReX from if(WarpX_amrex_internal)")
 
