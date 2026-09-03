@@ -59,6 +59,7 @@ class FiniteDifferenceSolver
                        PatchType patch_type,
                        std::array< std::unique_ptr<amrex::iMultiFab>, 3 >& flag_info_cell,
                        std::array< std::unique_ptr<amrex::LayoutData<FaceInfoBox> >, 3 >& borrowing,
+                       std::array< std::unique_ptr<amrex::iMultiFab>,3 > const& eb_update_B,
                        amrex::Real dt );
 
         void EvolveE ( ablastr::fields::MultiFabRegister & fields,
@@ -275,6 +276,7 @@ class FiniteDifferenceSolver
         void EvolveBCylindrical (
             ablastr::fields::VectorField const& Bfield,
             ablastr::fields::VectorField const& Efield,
+            std::array< std::unique_ptr<amrex::iMultiFab>,3 > const& eb_update_B,
             int lev,
             amrex::Real dt );
 
@@ -359,6 +361,7 @@ class FiniteDifferenceSolver
         void EvolveBSpherical (
             ablastr::fields::VectorField const& Bfield,
             ablastr::fields::VectorField const& Efield,
+            std::array< std::unique_ptr<amrex::iMultiFab>,3 > const& eb_update_B,
             int lev,
             amrex::Real dt );
 
@@ -441,6 +444,7 @@ class FiniteDifferenceSolver
             ablastr::fields::VectorField const& Bfield,
             ablastr::fields::VectorField const& Efield,
             amrex::MultiFab const * Gfield,
+            std::array< std::unique_ptr<amrex::iMultiFab>,3 > const& eb_update_B,
             int lev, amrex::Real dt );
 
         template< typename T_Algo >

@@ -6,6 +6,7 @@
  */
 #include "FiniteDifferenceSolver.H"
 
+#include "EmbeddedBoundary/Enabled.H"
 #include "EmbeddedBoundary/WarpXFaceInfoBox.H"
 #include "Fields.H"
 #if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER)
@@ -56,6 +57,7 @@ void FiniteDifferenceSolver::EvolveB (
     PatchType patch_type,
     [[maybe_unused]] std::array< std::unique_ptr<amrex::iMultiFab>, 3 >& flag_info_cell,
     [[maybe_unused]] std::array< std::unique_ptr<amrex::LayoutData<FaceInfoBox> >, 3 >& borrowing,
+    std::array< std::unique_ptr<amrex::iMultiFab>,3 > const& eb_update_B,
     [[maybe_unused]] amrex::Real const dt )
 {
 
@@ -72,11 +74,11 @@ void FiniteDifferenceSolver::EvolveB (
 #if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER)
     if ((m_fdtd_algo == ElectromagneticSolverAlgo::Yee)||
         (m_fdtd_algo == ElectromagneticSolverAlgo::HybridPIC)){
-        EvolveBCylindrical <CylindricalYeeAlgorithm> ( Bfield, Efield, lev, dt );
+        EvolveBCylindrical <CylindricalYeeAlgorithm> ( Bfield, Efield, eb_update_B, lev, dt );
 #elif defined(WARPX_DIM_RSPHERE)
     if ((m_fdtd_algo == ElectromagneticSolverAlgo::Yee)||
         (m_fdtd_algo == ElectromagneticSolverAlgo::HybridPIC)){
-        EvolveBSpherical <SphericalYeeAlgorithm> ( Bfield, Efield, lev, dt );
+        EvolveBSpherical <SphericalYeeAlgorithm> ( Bfield, Efield, eb_update_B, lev, dt );
 #else
 
     amrex::MultiFab const * Gfield = nullptr;
@@ -103,16 +105,16 @@ void FiniteDifferenceSolver::EvolveB (
 
     if (m_grid_type == GridType::Collocated) {
 
-        EvolveBCartesian <CartesianNodalAlgorithm> ( Bfield, Efield, Gfield, lev, dt );
+        EvolveBCartesian <CartesianNodalAlgorithm> ( Bfield, Efield, Gfield, eb_update_B, lev, dt );
 
     } else if ((m_fdtd_algo == ElectromagneticSolverAlgo::Yee) ||
                (m_fdtd_algo == ElectromagneticSolverAlgo::HybridPIC)) {
 
-        EvolveBCartesian <CartesianYeeAlgorithm> ( Bfield, Efield, Gfield, lev, dt );
+        EvolveBCartesian <CartesianYeeAlgorithm> ( Bfield, Efield, Gfield, eb_update_B, lev, dt );
 
     } else if (m_fdtd_algo == ElectromagneticSolverAlgo::CKC) {
 
-        EvolveBCartesian <CartesianCKCAlgorithm> ( Bfield, Efield, Gfield, lev, dt );
+        EvolveBCartesian <CartesianCKCAlgorithm> ( Bfield, Efield, Gfield, eb_update_B, lev, dt );
     } else if (m_fdtd_algo == ElectromagneticSolverAlgo::ECT) {
         EvolveBCartesianECT(Bfield, face_areas, area_mod, ECTRhofield, Venl, flag_info_cell,
                             borrowing, lev, dt);
@@ -130,6 +132,7 @@ void FiniteDifferenceSolver::EvolveBCartesian (
     ablastr::fields::VectorField const& Bfield,
     ablastr::fields::VectorField const& Efield,
     amrex::MultiFab const * Gfield,
+    std::array< std::unique_ptr<amrex::iMultiFab>,3 > const& eb_update_B,
     int lev, amrex::Real const dt ) {
 
     amrex::LayoutData<amrex::Real>* cost = WarpX::getCosts(lev);
@@ -153,6 +156,14 @@ void FiniteDifferenceSolver::EvolveBCartesian (
         Array4<Real> const& Ey = Efield[1]->array(mfi);
         Array4<Real> const& Ez = Efield[2]->array(mfi);
 
+        // Extract structures indicating whether the B field should be updated
+        amrex::Array4<int> update_Bx_arr, update_By_arr, update_Bz_arr;
+        if (EB::enabled()) {
+            update_Bx_arr = eb_update_B[0]->array(mfi);
+            update_By_arr = eb_update_B[1]->array(mfi);
+            update_Bz_arr = eb_update_B[2]->array(mfi);
+        }
+
         // Extract stencil coefficients
         Real const * const AMREX_RESTRICT coefs_x = m_stencil_coefs_x.dataPtr();
         auto const n_coefs_x = static_cast<int>(m_stencil_coefs_x.size());
@@ -171,6 +182,9 @@ void FiniteDifferenceSolver::EvolveBCartesian (
 
             [=] AMREX_GPU_DEVICE (int i, int j, int k){
 
+                // Skip field push in the embedded boundaries
+                if (update_Bx_arr && update_Bx_arr(i, j, k) == 0) { return; }
+
                 Bx(i, j, k) += dt * T_Algo::UpwardDz(Ey, coefs_z, n_coefs_z, i, j, k)
                              - dt * T_Algo::UpwardDy(Ez, coefs_y, n_coefs_y, i, j, k);
 
@@ -178,12 +192,18 @@ void FiniteDifferenceSolver::EvolveBCartesian (
 
             [=] AMREX_GPU_DEVICE (int i, int j, int k){
 
+                // Skip field push in the embedded boundaries
+                if (update_By_arr && update_By_arr(i, j, k) == 0) { return; }
+
                 By(i, j, k) += dt * T_Algo::UpwardDx(Ez, coefs_x, n_coefs_x, i, j, k)
                              - dt * T_Algo::UpwardDz(Ex, coefs_z, n_coefs_z, i, j, k);
 
             },
 
             [=] AMREX_GPU_DEVICE (int i, int j, int k){
+
+                // Skip field push in the embedded boundaries
+                if (update_Bz_arr && update_Bz_arr(i, j, k) == 0) { return; }
 
                 Bz(i, j, k) += dt * T_Algo::UpwardDy(Ex, coefs_y, n_coefs_y, i, j, k)
                              - dt * T_Algo::UpwardDx(Ey, coefs_x, n_coefs_x, i, j, k);
@@ -202,14 +222,23 @@ void FiniteDifferenceSolver::EvolveBCartesian (
 
                 [=] AMREX_GPU_DEVICE (int i, int j, int k)
                 {
+                    // Skip field push in the embedded boundaries
+                    if (update_Bx_arr && update_Bx_arr(i, j, k) == 0) { return; }
+
                     Bx(i,j,k) += dt * T_Algo::DownwardDx(G, coefs_x, n_coefs_x, i, j, k);
                 },
                 [=] AMREX_GPU_DEVICE (int i, int j, int k)
                 {
+                    // Skip field push in the embedded boundaries
+                    if (update_By_arr && update_By_arr(i, j, k) == 0) { return; }
+
                     By(i,j,k) += dt * T_Algo::DownwardDy(G, coefs_y, n_coefs_y, i, j, k);
                 },
                 [=] AMREX_GPU_DEVICE (int i, int j, int k)
                 {
+                    // Skip field push in the embedded boundaries
+                    if (update_Bz_arr && update_Bz_arr(i, j, k) == 0) { return; }
+
                     Bz(i,j,k) += dt * T_Algo::DownwardDz(G, coefs_z, n_coefs_z, i, j, k);
                 }
             );
@@ -399,6 +428,7 @@ template<typename T_Algo>
 void FiniteDifferenceSolver::EvolveBCylindrical (
     ablastr::fields::VectorField const& Bfield,
     ablastr::fields::VectorField const& Efield,
+    std::array< std::unique_ptr<amrex::iMultiFab>,3 > const& eb_update_B,
     int lev, amrex::Real const dt ) {
 
     amrex::LayoutData<amrex::Real>* cost = WarpX::getCosts(lev);
@@ -422,6 +452,14 @@ void FiniteDifferenceSolver::EvolveBCylindrical (
         Array4<Real> const& Etheta = Efield[1]->array(mfi);
         Array4<Real> const& Ez = Efield[2]->array(mfi);
 
+        // Extract structures indicating whether the B field should be updated
+        amrex::Array4<int> update_Br_arr, update_Btheta_arr, update_Bz_arr;
+        if (EB::enabled()) {
+            update_Br_arr = eb_update_B[0]->array(mfi);
+            update_Btheta_arr = eb_update_B[1]->array(mfi);
+            update_Bz_arr = eb_update_B[2]->array(mfi);
+        }
+
         // Extract stencil coefficients
         Real const * const AMREX_RESTRICT coefs_r = m_stencil_coefs_r.dataPtr();
         auto const n_coefs_r = static_cast<int>(m_stencil_coefs_r.size());
@@ -442,6 +480,10 @@ void FiniteDifferenceSolver::EvolveBCylindrical (
         amrex::ParallelFor(tbr, tbt, tbz,
 
             [=] AMREX_GPU_DEVICE (int i, int j, int /*k*/){
+
+                // Skip field push in the embedded boundaries
+                if (update_Br_arr && update_Br_arr(i, j, 0) == 0) { return; }
+
                 Real const r = rmin + i*dr; // r on nodal point (Br is nodal in r)
                 if (r != 0) { // Off-axis, regular Maxwell equations
                     Br(i, j, 0, 0) += dt * T_Algo::UpwardDz(Etheta, coefs_z, n_coefs_z, i, j, 0, 0); // Mode m=0
@@ -475,6 +517,10 @@ void FiniteDifferenceSolver::EvolveBCylindrical (
             },
 
             [=] AMREX_GPU_DEVICE (int i, int j, int /*k*/){
+
+                // Skip field push in the embedded boundaries
+                if (update_Btheta_arr && update_Btheta_arr(i, j, 0) == 0) { return; }
+
                 Btheta(i, j, 0, 0) += dt*(
                     T_Algo::UpwardDr(Ez, coefs_r, n_coefs_r, i, j, 0, 0)
                     - T_Algo::UpwardDz(Er, coefs_z, n_coefs_z, i, j, 0, 0)); // Mode m=0
@@ -489,6 +535,10 @@ void FiniteDifferenceSolver::EvolveBCylindrical (
             },
 
             [=] AMREX_GPU_DEVICE (int i, int j, int /*k*/){
+
+                // Skip field push in the embedded boundaries
+                if (update_Bz_arr && update_Bz_arr(i, j, 0) == 0) { return; }
+
                 Real const r = rmin + (i + 0.5_rt)*dr; // r on a cell-centered grid (Bz is cell-centered in r)
                 Bz(i, j, 0, 0) += dt*( - T_Algo::UpwardDrr_over_r(Etheta, r, dr, coefs_r, n_coefs_r, i, j, 0, 0));
                 for (int m=1 ; m<nmodes ; m++) { // Higher-order modes
@@ -516,7 +566,11 @@ template<typename T_Algo>
 void FiniteDifferenceSolver::EvolveBSpherical (
     ablastr::fields::VectorField const& Bfield,
     ablastr::fields::VectorField const& Efield,
+    [[maybe_unused]] std::array< std::unique_ptr<amrex::iMultiFab>,3 > const& eb_update_B,
     int lev, amrex::Real const dt ) {
+
+    // Embedded boundaries are not currently supported in spherical geometry
+    amrex::ignore_unused(eb_update_B);
 
     amrex::LayoutData<amrex::Real>* cost = WarpX::getCosts(lev);
 
