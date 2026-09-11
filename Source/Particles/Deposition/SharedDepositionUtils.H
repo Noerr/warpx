@@ -18,6 +18,30 @@
 #include <AMReX.H>
 
 /*
+ * \brief atomically add value into an element of the per-block temporary
+ * deposition buffer that lives in GPU shared/local memory (j_buff, backed by
+ * amrex::Gpu::Handler::sharedMemory() on SYCL). AMReX's Gpu::Atomic::AddNoRet
+ * defaults its SYCL address_space template parameter to global_space; against
+ * an address that actually lives in SYCL local memory (a sycl::local_accessor
+ * allocation), that mismatch corrupts the address on PVC and crashes with a
+ * GPU-side atomic page fault. Target local_space explicitly here instead.
+ */
+#if defined(AMREX_USE_SYCL)
+AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+void addToSharedBuffer (amrex::Real* const address, amrex::Real const value) noexcept
+{
+    amrex::Gpu::Atomic::AddNoRet<amrex::Real, sycl::access::address_space::local_space>(
+        address, value);
+}
+#else
+AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+void addToSharedBuffer (amrex::Real* const address, amrex::Real const value) noexcept
+{
+    amrex::Gpu::Atomic::AddNoRet(address, value);
+}
+#endif
+
+/*
  * \brief gets the maximum width, height, or length of a tilebox. In number of cells.
  * \param nCells : Number of cells in the direction to be considered
  * \param tilesize : The 1D tilesize in the direction to be considered
@@ -60,9 +84,36 @@ void addLocalToGlobal (const amrex::Box& bx,
         }
     }
 }
+#elif defined(AMREX_USE_SYCL)
+AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+void addLocalToGlobal (const amrex::Box& bx,
+                       const amrex::Array4<amrex::Real>& global,
+                       const amrex::Array4<amrex::Real>& local,
+                       amrex::Gpu::Handler const& handler) noexcept
+{
+    using namespace amrex::literals;
+
+    const int thread_idx = int(handler.threadIdx());
+    const int block_dim = int(handler.blockDim());
+
+    const auto lo  = amrex::lbound(bx);
+    const auto len = amrex::length(bx);
+    for (int icell = thread_idx; icell < bx.numPts(); icell += block_dim)
+    {
+        int k =  icell / (len.x*len.y);
+        int j = (icell - k*(len.x*len.y)) /   len.x;
+        int i = (icell - k*(len.x*len.y)) - j*len.x;
+        i += lo.x;
+        j += lo.y;
+        k += lo.z;
+        if (amrex::Math::abs(local(i, j, k)) > 0.0_rt) {
+            amrex::Gpu::Atomic::AddNoRet( &global(i, j, k), local(i, j, k));
+        }
+    }
+}
 #endif
 
-#if (defined(AMREX_USE_HIP) || defined(AMREX_USE_CUDA)) && \
+#if (defined(AMREX_USE_HIP) || defined(AMREX_USE_CUDA) || defined(AMREX_USE_SYCL)) && \
     !(defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE))
 template <int depos_order>
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
@@ -225,26 +276,26 @@ void depositComponent (const GetParticlePosition<PIdx>& GetPosition,
     }
     int const l_j = ((j_type[zdir] == NODE) ? l_node : l_cell);
 
-    // Deposit current into j_buff
+    // Deposit current into j_buff (shared/local memory buffer)
 #if defined(WARPX_DIM_1D_Z)
     for (int iz=0; iz<=depos_order; iz++){
-        amrex::Gpu::Atomic::AddNoRet(
-                                     &j_buff(lo.x+l_j+iz, 0, 0, 0),
-                                     sz_j[iz]*pcurrent);
+        addToSharedBuffer(
+                          &j_buff(lo.x+l_j+iz, 0, 0, 0),
+                          sz_j[iz]*pcurrent);
     }
 #endif
 #if defined(WARPX_DIM_XZ) || defined(WARPX_DIM_RZ)
     for (int iz=0; iz<=depos_order; iz++){
         for (int ix=0; ix<=depos_order; ix++){
-            amrex::Gpu::Atomic::AddNoRet(
-                                         &j_buff(lo.x+j_j+ix, lo.y+l_j+iz, 0, 0),
-                                         sx_j[ix]*sz_j[iz]*pcurrent);
+            addToSharedBuffer(
+                              &j_buff(lo.x+j_j+ix, lo.y+l_j+iz, 0, 0),
+                              sx_j[ix]*sz_j[iz]*pcurrent);
 #if defined(WARPX_DIM_RZ)
             Complex xy = xy0; // Note that xy is equal to e^{i m theta}
             for (int imode=1 ; imode < n_rz_azimuthal_modes ; imode++) {
                 // The factor 2 on the weighting comes from the normalization of the modes
-                amrex::Gpu::Atomic::AddNoRet( &j_buff(lo.x+j_j+ix, lo.y+l_j+iz, 0, 2*imode-1), 2._rt*sx_j[ix]*sz_j[iz]*wqx*xy.real());
-                amrex::Gpu::Atomic::AddNoRet( &j_buff(lo.x+j_j+ix, lo.y+l_j+iz, 0, 2*imode  ), 2._rt*sx_j[ix]*sz_j[iz]*wqx*xy.imag());
+                addToSharedBuffer( &j_buff(lo.x+j_j+ix, lo.y+l_j+iz, 0, 2*imode-1), 2._rt*sx_j[ix]*sz_j[iz]*wqx*xy.real());
+                addToSharedBuffer( &j_buff(lo.x+j_j+ix, lo.y+l_j+iz, 0, 2*imode  ), 2._rt*sx_j[ix]*sz_j[iz]*wqx*xy.imag());
                 xy = xy*xy0;
             }
 #endif
@@ -254,9 +305,9 @@ void depositComponent (const GetParticlePosition<PIdx>& GetPosition,
     for (int iz=0; iz<=depos_order; iz++){
         for (int iy=0; iy<=depos_order; iy++){
             for (int ix=0; ix<=depos_order; ix++){
-                amrex::Gpu::Atomic::AddNoRet(
-                                             &j_buff(lo.x+j_j+ix, lo.y+k_j+iy, lo.z+l_j+iz),
-                                             sx_j[ix]*sy_j[iy]*sz_j[iz]*pcurrent);
+                addToSharedBuffer(
+                                  &j_buff(lo.x+j_j+ix, lo.y+k_j+iy, lo.z+l_j+iz),
+                                  sx_j[ix]*sy_j[iy]*sz_j[iz]*pcurrent);
             }
         }
     }
