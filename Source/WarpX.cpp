@@ -920,13 +920,27 @@ WarpX::ReadParameters ()
 #endif
         pp_warpx.query("do_shared_mem_charge_deposition", do_shared_mem_charge_deposition);
         pp_warpx.query("do_shared_mem_current_deposition", do_shared_mem_current_deposition);
-#if !(defined(AMREX_USE_HIP) || defined(AMREX_USE_CUDA)) || \
+#if !(defined(AMREX_USE_HIP) || defined(AMREX_USE_CUDA) || defined(AMREX_USE_SYCL)) || \
     (defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE))
         WARPX_ALWAYS_ASSERT_WITH_MESSAGE(!do_shared_mem_current_deposition,
             "requested shared memory for current deposition,\
-            but shared memory is only available for CUDA or HIP,\
+            but shared memory is only available for CUDA, HIP, or SYCL,\
             and for geometries other than 1D cylindrical and 1D spherical."
         );
+#endif
+#if defined(WARPX_DIM_3D) && defined(AMREX_USE_SYCL)
+        // The (tpb=128, tilesize=(6,6,8)) defaults above were tuned for
+        // HIP/CUDA. On Intel Data Center GPU Max ("PVC"), they give no
+        // speedup at all over direct deposition; (tpb=512, tilesize=(8,8,8))
+        // measured 1.15x-3.8x faster than direct deposition (higher speedup
+        // at higher particles-per-cell) on Sunspot. Detect PVC at runtime
+        // (rather than gating on AMREX_USE_SYCL alone) so a future
+        // non-Intel or non-PVC SYCL target isn't silently given PVC-tuned
+        // values it wasn't measured on.
+        if (amrex::Gpu::Device::deviceName().find("Data Center GPU Max") != std::string::npos) {
+            shared_mem_current_tpb = 512;
+            shared_tilesize = amrex::IntVect(AMREX_D_DECL(8,8,8));
+        }
 #endif
         pp_warpx.query("shared_mem_current_tpb", shared_mem_current_tpb);
 

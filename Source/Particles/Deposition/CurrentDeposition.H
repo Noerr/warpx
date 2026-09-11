@@ -501,7 +501,7 @@ void doDepositionSharedShapeN (const GetParticlePosition<PIdx>& GetPosition,
 {
     using namespace amrex::literals;
 
-#if (defined(AMREX_USE_HIP) || defined(AMREX_USE_CUDA)) && \
+#if (defined(AMREX_USE_HIP) || defined(AMREX_USE_CUDA) || defined(AMREX_USE_SYCL)) && \
     !(defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE))
     using namespace amrex;
 
@@ -542,10 +542,20 @@ void doDepositionSharedShapeN (const GetParticlePosition<PIdx>& GetPosition,
 
     amrex::ignore_unused(np_to_deposit);
     // Launch one thread-block per bin
+#if defined(AMREX_USE_SYCL)
+    auto shared_dep_lambda =
+            [=] AMREX_GPU_DEVICE (amrex::Gpu::Handler const& handler) noexcept {
+        const int bin_id = int(handler.blockIdx());
+        const int thread_idx = int(handler.threadIdx());
+        const int block_dim = int(handler.blockDim());
+#else
     amrex::launch(
             nblocks, threads_per_block, shared_mem_bytes, amrex::Gpu::gpuStream(),
             [=] AMREX_GPU_DEVICE () noexcept {
         const int bin_id = blockIdx.x;
+        const int thread_idx = threadIdx.x;
+        const int block_dim = blockDim.x;
+#endif
         const unsigned int bin_start = offsets_ptr[bin_id];
         const unsigned int bin_stop = offsets_ptr[bin_id+1];
 
@@ -577,8 +587,12 @@ void doDepositionSharedShapeN (const GetParticlePosition<PIdx>& GetPosition,
         Box tbox_y = convert(buffer_box, jy_type);
         Box tbox_z = convert(buffer_box, jz_type);
 
+#if defined(AMREX_USE_SYCL)
+        amrex::Real* const shared = static_cast<amrex::Real*>(handler.sharedMemory());
+#else
         Gpu::SharedMemory<amrex::Real> gsm;
         amrex::Real* const shared = gsm.dataPtr();
+#endif
 
         amrex::Array4<amrex::Real> const jx_buff(shared,
                 amrex::begin(tbox_x), amrex::end(tbox_x), 1);
@@ -589,11 +603,15 @@ void doDepositionSharedShapeN (const GetParticlePosition<PIdx>& GetPosition,
 
         // Zero-initialize the temporary array in shared memory
         volatile amrex::Real* vs = shared;
-        for (int i = threadIdx.x; i < npts; i += blockDim.x){
+        for (int i = thread_idx; i < npts; i += block_dim){
             vs[i] = 0.0;
         }
+#if defined(AMREX_USE_SYCL)
+        handler.sharedBarrier();
+#else
         __syncthreads();
-        for (unsigned int ip_orig = bin_start+threadIdx.x; ip_orig<bin_stop; ip_orig += blockDim.x)
+#endif
+        for (unsigned int ip_orig = bin_start+thread_idx; ip_orig<bin_stop; ip_orig += block_dim)
         {
             const unsigned int ip = permutation[ip_orig];
             depositComponent<depos_order>(GetPosition, wp, uxp, uyp, uzp, ion_lev, jx_buff, jx_type,
@@ -601,14 +619,23 @@ void doDepositionSharedShapeN (const GetParticlePosition<PIdx>& GetPosition,
                                           ip, zdir, NODE, CELL, 0);
         }
 
+#if defined(AMREX_USE_SYCL)
+        handler.sharedBarrier();
+        addLocalToGlobal(tbox_x, jx_arr, jx_buff, handler);
+#else
         __syncthreads();
         addLocalToGlobal(tbox_x, jx_arr, jx_buff);
-        for (int i = threadIdx.x; i < npts; i += blockDim.x){
+#endif
+        for (int i = thread_idx; i < npts; i += block_dim){
             vs[i] = 0.0;
         }
 
+#if defined(AMREX_USE_SYCL)
+        handler.sharedBarrier();
+#else
         __syncthreads();
-        for (unsigned int ip_orig = bin_start+threadIdx.x; ip_orig<bin_stop; ip_orig += blockDim.x)
+#endif
+        for (unsigned int ip_orig = bin_start+thread_idx; ip_orig<bin_stop; ip_orig += block_dim)
         {
             const unsigned int ip = permutation[ip_orig];
             depositComponent<depos_order>(GetPosition, wp, uxp, uyp, uzp, ion_lev, jy_buff, jy_type,
@@ -616,14 +643,23 @@ void doDepositionSharedShapeN (const GetParticlePosition<PIdx>& GetPosition,
                                           ip, zdir, NODE, CELL, 1);
         }
 
+#if defined(AMREX_USE_SYCL)
+        handler.sharedBarrier();
+        addLocalToGlobal(tbox_y, jy_arr, jy_buff, handler);
+#else
         __syncthreads();
         addLocalToGlobal(tbox_y, jy_arr, jy_buff);
-        for (int i = threadIdx.x; i < npts; i += blockDim.x){
+#endif
+        for (int i = thread_idx; i < npts; i += block_dim){
             vs[i] = 0.0;
         }
 
+#if defined(AMREX_USE_SYCL)
+        handler.sharedBarrier();
+#else
         __syncthreads();
-        for (unsigned int ip_orig = bin_start+threadIdx.x; ip_orig<bin_stop; ip_orig += blockDim.x)
+#endif
+        for (unsigned int ip_orig = bin_start+thread_idx; ip_orig<bin_stop; ip_orig += block_dim)
         {
             const unsigned int ip = permutation[ip_orig];
             depositComponent<depos_order>(GetPosition, wp, uxp, uyp, uzp, ion_lev, jz_buff, jz_type,
@@ -631,10 +667,22 @@ void doDepositionSharedShapeN (const GetParticlePosition<PIdx>& GetPosition,
                                           ip, zdir, NODE, CELL, 2);
         }
 
+#if defined(AMREX_USE_SYCL)
+        handler.sharedBarrier();
+        addLocalToGlobal(tbox_z, jz_arr, jz_buff, handler);
+#else
         __syncthreads();
         addLocalToGlobal(tbox_z, jz_arr, jz_buff);
+#endif
+#if defined(AMREX_USE_SYCL)
+    };
+    amrex::launch(
+            nblocks, threads_per_block, shared_mem_bytes, amrex::Gpu::gpuStream(),
+            shared_dep_lambda);
+#else
     });
-#else // not using hip/cuda
+#endif
+#else // not using hip/cuda/sycl
     // Note, you should never reach this part of the code. This funcion cannot be called unless
     // using HIP/CUDA, and those things are checked prior
     //don't use any args

@@ -236,7 +236,7 @@ void doChargeDepositionSharedShapeN (const GetParticlePosition<PIdx>& GetPositio
     constexpr int CELL = amrex::IndexType::CELL;
 
     // Loop over particles and deposit into rho_fab
-#if defined(AMREX_USE_CUDA) || defined(AMREX_USE_HIP)
+#if defined(AMREX_USE_CUDA) || defined(AMREX_USE_HIP) || defined(AMREX_USE_SYCL)
     const auto plo = geom.ProbLoArray();
     const auto domain = geom.Domain();
 
@@ -259,21 +259,32 @@ void doChargeDepositionSharedShapeN (const GetParticlePosition<PIdx>& GetPositio
                                      "Tile size too big for GPU shared memory charge deposition");
 #endif
 
-#if defined(AMREX_USE_CUDA) || defined(AMREX_USE_HIP)
+#if defined(AMREX_USE_CUDA) || defined(AMREX_USE_HIP) || defined(AMREX_USE_SYCL)
     amrex::ignore_unused(np_to_deposit);
     // Loop with one block per tile (the shared memory is allocated on a per-block basis)
     // The threads within each block loop over the particles of its tile
     // (Each threads processes a different set of particles.)
+#if defined(AMREX_USE_SYCL)
+    auto shared_dep_lambda =
+            [=] AMREX_GPU_DEVICE (amrex::Gpu::Handler const& handler) noexcept {
+        const int bin_id = int(handler.blockIdx());
+        const int thread_idx = int(handler.threadIdx());
+        const int block_dim = int(handler.blockDim());
+#else
     amrex::launch(
                   nblocks, threads_per_block, shared_mem_bytes, amrex::Gpu::gpuStream(),
                   [=] AMREX_GPU_DEVICE () noexcept
-#else // defined(AMREX_USE_CUDA) || defined(AMREX_USE_HIP)
+      {
+        const int bin_id = blockIdx.x;
+        const int thread_idx = threadIdx.x;
+        const int block_dim = blockDim.x;
+#endif
+#else // defined(AMREX_USE_CUDA) || defined(AMREX_USE_HIP) || defined(AMREX_USE_SYCL)
     // amrex::For: iterations scatter-add into shared rho nodes (no SIMD pragma, see issue #7097)
     amrex::For(np_to_deposit, [=] AMREX_GPU_DEVICE (long ip_orig) noexcept
-#endif
       {
-#if defined(AMREX_USE_CUDA) || defined(AMREX_USE_HIP)
-        const int bin_id = blockIdx.x;
+#endif
+#if defined(AMREX_USE_CUDA) || defined(AMREX_USE_HIP) || defined(AMREX_USE_SYCL)
         const unsigned int bin_start = offsets_ptr[bin_id];
         const unsigned int bin_stop = offsets_ptr[bin_id+1];
 
@@ -302,24 +313,32 @@ void doChargeDepositionSharedShapeN (const GetParticlePosition<PIdx>& GetPositio
         Box tbx = convert( buffer_box, ix_type);
         tbx.grow(depos_order);
 
+#if defined(AMREX_USE_SYCL)
+        amrex::Real* const shared = static_cast<amrex::Real*>(handler.sharedMemory());
+#else
         Gpu::SharedMemory<amrex::Real> gsm;
         amrex::Real* const shared = gsm.dataPtr();
+#endif
 
         amrex::Array4<amrex::Real> buf(shared, amrex::begin(tbx), amrex::end(tbx), 1);
 
         // Zero-initialize the temporary array in shared memory
         volatile amrex::Real* vs = shared;
-        for (int i = threadIdx.x; i < tbx.numPts(); i += blockDim.x) {
+        for (int i = thread_idx; i < tbx.numPts(); i += block_dim) {
           vs[i] = 0.0;
         }
+#if defined(AMREX_USE_SYCL)
+        handler.sharedBarrier();
+#else
         __syncthreads();
+#endif
 #else
         amrex::Array4<amrex::Real> const &buf = rho_arr;
-#endif // defined(AMREX_USE_CUDA) || defined(AMREX_USE_HIP)
+#endif // defined(AMREX_USE_CUDA) || defined(AMREX_USE_HIP) || defined(AMREX_USE_SYCL)
 
-#if defined(AMREX_USE_CUDA) || defined(AMREX_USE_HIP)
-        // Loop over macroparticles: each threads loops over particles with a stride of `blockDim.x`
-        for (unsigned int ip_orig = bin_start + threadIdx.x; ip_orig < bin_stop; ip_orig += blockDim.x)
+#if defined(AMREX_USE_CUDA) || defined(AMREX_USE_HIP) || defined(AMREX_USE_SYCL)
+        // Loop over macroparticles: each threads loops over particles with a stride of `block_dim`
+        for (unsigned int ip_orig = bin_start + thread_idx; ip_orig < bin_stop; ip_orig += block_dim)
 #endif
         {
             const unsigned int ip = permutation[ip_orig];
@@ -394,31 +413,36 @@ void doChargeDepositionSharedShapeN (const GetParticlePosition<PIdx>& GetPositio
             }
 #endif
 
-            // Deposit charge into buf
+            // Deposit charge into buf. On CUDA/HIP/SYCL, buf is the
+            // per-block shared/local-memory buffer; on CPU (the amrex::For
+            // fallback above), buf is rho_arr directly. addToSharedBuffer
+            // (SharedDepositionUtils.H) targets the correct SYCL address
+            // space (local_space) for the former case and is equivalent to
+            // a plain AddNoRet everywhere else.
 #if defined(WARPX_DIM_1D_Z)
             for (int iz=0; iz<=depos_order; iz++){
-                amrex::Gpu::Atomic::AddNoRet(
+                addToSharedBuffer(
                     &buf(lo.x+k+iz, 0, 0, 0),
                     sz[iz]*wq);
             }
 #elif defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE)
             for (int ix=0; ix<=depos_order; ix++){
-                amrex::Gpu::Atomic::AddNoRet(
+                addToSharedBuffer(
                     &buf(lo.x+i+ix, 0, 0, 0),
                     sx[ix]*wq);
             }
 #elif defined(WARPX_DIM_XZ) || defined(WARPX_DIM_RZ)
             for (int iz=0; iz<=depos_order; iz++){
                 for (int ix=0; ix<=depos_order; ix++){
-                    amrex::Gpu::Atomic::AddNoRet(
+                    addToSharedBuffer(
                         &buf(lo.x+i+ix, lo.y+k+iz, 0, 0),
                         sx[ix]*sz[iz]*wq);
 #if defined(WARPX_DIM_RZ)
                     Complex xy = xy0; // Throughout the following loop, xy takes the value e^{i m theta}
                     for (int imode=1 ; imode < n_rz_azimuthal_modes ; imode++) {
                         // The factor 2 on the weighting comes from the normalization of the modes
-                        amrex::Gpu::Atomic::AddNoRet( &buf(lo.x+i+ix, lo.y+k+iz, 0, 2*imode-1), 2._rt*sx[ix]*sz[iz]*wq*xy.real());
-                        amrex::Gpu::Atomic::AddNoRet( &buf(lo.x+i+ix, lo.y+k+iz, 0, 2*imode  ), 2._rt*sx[ix]*sz[iz]*wq*xy.imag());
+                        addToSharedBuffer( &buf(lo.x+i+ix, lo.y+k+iz, 0, 2*imode-1), 2._rt*sx[ix]*sz[iz]*wq*xy.real());
+                        addToSharedBuffer( &buf(lo.x+i+ix, lo.y+k+iz, 0, 2*imode  ), 2._rt*sx[ix]*sz[iz]*wq*xy.imag());
                         xy = xy*xy0;
                     }
 #endif
@@ -428,7 +452,7 @@ void doChargeDepositionSharedShapeN (const GetParticlePosition<PIdx>& GetPositio
             for (int iz=0; iz<=depos_order; iz++){
                 for (int iy=0; iy<=depos_order; iy++){
                     for (int ix=0; ix<=depos_order; ix++){
-                        amrex::Gpu::Atomic::AddNoRet(
+                        addToSharedBuffer(
                             &buf(lo.x+i+ix, lo.y+j+iy, lo.z+k+iz),
                             sx[ix]*sy[iy]*sz[iz]*wq);
                     }
@@ -437,13 +461,23 @@ void doChargeDepositionSharedShapeN (const GetParticlePosition<PIdx>& GetPositio
 #endif
         }
 
-#if defined(AMREX_USE_CUDA) || defined(AMREX_USE_HIP)
+#if defined(AMREX_USE_SYCL)
+          handler.sharedBarrier();
+          addLocalToGlobal(tbx, rho_arr, buf, handler);
+#elif defined(AMREX_USE_CUDA) || defined(AMREX_USE_HIP)
           __syncthreads();
 
           addLocalToGlobal(tbx, rho_arr, buf);
-#endif // defined(AMREX_USE_CUDA) || defined(AMREX_USE_HIP)
+#endif // defined(AMREX_USE_CUDA) || defined(AMREX_USE_HIP) || defined(AMREX_USE_SYCL)
+#if defined(AMREX_USE_SYCL)
+    };
+    amrex::launch(
+            nblocks, threads_per_block, shared_mem_bytes, amrex::Gpu::gpuStream(),
+            shared_dep_lambda);
+#else
       }
       );
+#endif
 }
 
 #endif // WARPX_CHARGEDEPOSITION_H_
