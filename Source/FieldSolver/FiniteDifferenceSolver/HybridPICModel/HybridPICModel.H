@@ -194,6 +194,22 @@ public:
     /** Plasma density floor - if n < n_floor it will be set to n_floor */
     amrex::Real m_n_floor = 1.0;
 
+    /** Density regularization mode for Ohm's law in low-density regions.
+     *  0 = hard max(rho,n_floor) (+ holmstrom E=0 if enabled) [default].
+     *  1 = softened reciprocal: 1/rho -> rho/(rho^2+n_floor^2); regularizes only
+     *      the 1/rho (Hall/pressure) denominator, rolling those terms to 0 in
+     *      vacuum but leaving the numerator/resistive terms untapered.
+     *  2 = full-E vacuum taper: compute E with 1/max(rho,n_floor), then multiply
+     *      the TOTAL E (Hall + pressure + resistive + hyper) by the smooth factor
+     *      S(rho)=rho^2/(rho^2+n_floor^2). NOTE: counterproductive -- it also taperes
+     *      the stabilizing hyper term in the skirt; kept only for comparison.
+     *  3 = split taper (recommended for deep vacuum): E = -v x B + (jxB - grad p_e)/ne
+     *      + resistive + hyper, where -v x B = -(J_i x B)/rho is REGULAR (the n cancels)
+     *      and NON-accelerating, kept untapered; only the singular jxB and grad p_e
+     *      terms are tapered by S(rho). Dissipation stays fully live. Requires the ion
+     *      part J_i x B stored separately in Pass 1 (6*ncomps nodal scratch). */
+    int m_soft_floor = 0;
+
     /** Plasma resistivity */
     std::string m_eta_expression = "0.0";
     std::unique_ptr<amrex::Parser> m_resistivity_parser;

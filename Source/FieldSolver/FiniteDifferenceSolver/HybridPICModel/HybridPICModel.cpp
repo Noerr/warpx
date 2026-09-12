@@ -66,6 +66,7 @@ void HybridPICModel::ReadParameters ()
     pp_hybrid.query("plasma_hyper_resistivity(rho,B)", m_eta_h_expression);
 
     utils::parser::queryWithParser(pp_hybrid, "n_floor", m_n_floor);
+    utils::parser::queryWithParser(pp_hybrid, "soft_floor", m_soft_floor);
 
     // convert electron temperature from eV to J
     m_elec_temp *= PhysConst::q_e;

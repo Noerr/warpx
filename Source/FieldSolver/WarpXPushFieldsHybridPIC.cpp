@@ -263,6 +263,76 @@ void WarpX::HybridPICDepositRhoAndJ ()
     // and apply boundary conditions
     SyncCurrentAndRho();
 
+    // On-axis modal BC for the charge density. A scalar density's m>=1 azimuthal
+    // components must vanish on the axis (rho_m ~ r^|m| as r->0), but the RZ
+    // deposition leaves a spurious value there (volume-amplified by the 1/(pi dr)
+    // axis factor). Left uncleaned it contaminates the E_r/E_theta Hall term --
+    // which interpolates nodal rho onto its off-axis stagger -- and the rho
+    // diagnostic. ApplyRhofieldBoundary only handles the wall/PEC boundaries, so
+    // zero the m>=1 modes of rho_fp at i=0 here. rho_fp_temp (used by the E-solve)
+    // is copied/averaged from rho_fp, so this keeps every downstream rho correct.
+    // Mode 0 (component 0) is physical on axis and left untouched.
+#if defined(WARPX_DIM_RZ)
+    for (int lev = 0; lev <= finest_level; ++lev) {
+        amrex::MultiFab& rho = *m_fields.get(FieldType::rho_fp, lev);
+        const int ncr = rho.nComp();
+        if (ncr <= 1) { continue; }   // single mode: nothing to zero
+        for (amrex::MFIter mfi(rho, TilingIfNotGPU()); mfi.isValid(); ++mfi) {
+            amrex::Box tb = mfi.tilebox();
+            if (tb.smallEnd(0) > 0) { continue; }   // only tiles touching the axis
+            amrex::Array4<amrex::Real> const& rho_arr = rho.array(mfi);
+            tb.setRange(0, 0, 1);                    // i = 0 (r = 0) column only
+            amrex::ParallelFor(tb, ncr - 1,
+            [=] AMREX_GPU_DEVICE (int i, int j, int k, int n) {
+                rho_arr(i, j, k, n + 1) = 0._rt;     // zero components 1..ncr-1 (m>=1)
+            });
+        }
+    }
+#endif
+
+    // On-axis modal regularity for the deposited ion current J_i. J is a vector
+    // like E, so this mirrors the E-field axis treatment:
+    //   - J_z is scalar-like (J_{z,m} ~ r^|m|): its m>=1 modes must vanish at the
+    //     axis, but the RZ deposition divides them by the tiny axis volume
+    //     (~1/(pi dr)), amplifying deposition noise ~6x. Zero them (as for rho).
+    //   - J_theta is a transverse vector: its m=1 mode is FINITE at the axis with
+    //     J_{theta,1} = -i J_{r,1} (odd-parity regularity), not zero. The deposition
+    //     forces all m>=1 transverse modes to zero on axis (laser-class); restore
+    //     J_{theta,1} from J_r.
+    //   - J_r is cell-centered in r (innermost sample at r=dr/2, no node at r=0); it
+    //     has no on-axis pathology and is left untouched, supplying J_{r,1}(0) by
+    //     linear extrapolation from its two innermost cells.
+    // J_theta and J_z are nodal in r (node at i=0); J_r is cell-centered. These
+    // relations are linear, so applying them once to current_fp propagates through
+    // the linear time-averaging/extrapolation into current_fp_temp.
+#if defined(WARPX_DIM_RZ)
+    for (int lev = 0; lev <= finest_level; ++lev) {
+        amrex::MultiFab& Jr = *m_fields.get(FieldType::current_fp, Direction{0}, lev);
+        amrex::MultiFab& Jt = *m_fields.get(FieldType::current_fp, Direction{1}, lev);
+        amrex::MultiFab& Jz = *m_fields.get(FieldType::current_fp, Direction{2}, lev);
+        const int ncj = Jz.nComp();
+        if (ncj <= 1) { continue; }   // single mode: nothing to do
+        for (amrex::MFIter mfi(Jt, TilingIfNotGPU()); mfi.isValid(); ++mfi) {
+            amrex::Box tb = mfi.tilebox();
+            if (tb.smallEnd(0) > 0) { continue; }   // only tiles touching the axis
+            amrex::Array4<amrex::Real> const& Jr_arr = Jr.array(mfi);
+            amrex::Array4<amrex::Real> const& Jt_arr = Jt.array(mfi);
+            amrex::Array4<amrex::Real> const& Jz_arr = Jz.array(mfi);
+            tb.setRange(0, 0, 1);                    // i = 0 (r = 0) column only
+            amrex::ParallelFor(tb,
+            [=] AMREX_GPU_DEVICE (int i, int j, int k) {
+                for (int n = 1; n < ncj; ++n) { Jz_arr(i, j, k, n) = 0._rt; }
+                if (ncj >= 3) {
+                    const amrex::Real Jr1_re = 1.5_rt*Jr_arr(i,j,k,1) - 0.5_rt*Jr_arr(i+1,j,k,1);
+                    const amrex::Real Jr1_im = 1.5_rt*Jr_arr(i,j,k,2) - 0.5_rt*Jr_arr(i+1,j,k,2);
+                    Jt_arr(i, j, k, 1) =  Jr1_im;   // Re(J_theta,1) =  Im(J_r,1)
+                    Jt_arr(i, j, k, 2) = -Jr1_re;   // Im(J_theta,1) = -Re(J_r,1)
+                }
+            });
+        }
+    }
+#endif
+
     // SyncCurrent does not include a call to FillBoundary, but it is needed
     // for the hybrid-PIC solver since current values are interpolated to
     // a nodal grid
