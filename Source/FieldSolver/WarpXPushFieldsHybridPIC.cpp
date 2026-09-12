@@ -354,6 +354,65 @@ void WarpX::HybridPICDepositRhoAndJ ()
             );
         }
     }
+
+#if defined(WARPX_DIM_RZ)
+    // PROTOTYPE near-axis noise filter for the scalar-like m>=1 moments (rho, Jz).
+    // Their deposition noise is peaked near the axis (tracks n0(r)) while the
+    // physical m=1 signal ~ r vanishes there (S/N ~ r^{3/2} -> 0), so a sqrt(r)
+    // variance-stabilized radial smooth (x sqrt(r) -> 3-pt binomial -> / sqrt(r))
+    // suppresses near-axis noise with minimal signal loss. Parity-aware: the m>=1
+    // axis node stays 0 (skipped). Applied only to m>=1 components (m=0 equilibrium
+    // untouched). Gated by env HYBRID_AXIS_FILTER_PASSES (0 = off) for prototyping.
+    static const int filter_passes = [](){
+        const char* e = std::getenv("HYBRID_AXIS_FILTER_PASSES");
+        return e ? std::atoi(e) : 0;
+    }();
+    if (filter_passes > 0) {
+        const amrex::Real dr = Geom(0).CellSize(0);
+        for (int lev = 0; lev <= finest_level; ++lev) {
+            for (int t = 0; t < 2; ++t) {
+                amrex::MultiFab* q = (t == 0)
+                    ? m_fields.get(FieldType::rho_fp, lev)
+                    : m_fields.get(FieldType::current_fp, Direction{2}, lev);
+                const int nc = q->nComp();
+                if (nc <= 1) { continue; }
+                for (int pass = 0; pass < filter_passes; ++pass) {
+                    amrex::MultiFab qcopy(q->boxArray(), q->DistributionMap(), nc, q->nGrowVect());
+                    amrex::MultiFab::Copy(qcopy, *q, 0, 0, nc, q->nGrowVect());
+                    for (amrex::MFIter mfi(*q, TilingIfNotGPU()); mfi.isValid(); ++mfi) {
+                        amrex::Box tb = mfi.tilebox();
+                        amrex::Array4<amrex::Real> const& qa = q->array(mfi);
+                        amrex::Array4<amrex::Real const> const& qc = qcopy.const_array(mfi);
+                        const int ilo = tb.smallEnd(0);
+                        const int ihi = tb.bigEnd(0);
+                        amrex::ParallelFor(tb, nc - 1,
+                        [=] AMREX_GPU_DEVICE (int i, int j, int k, int n) {
+                            const int c = n + 1;                 // m>=1 components only
+                            if (i <= ilo || i >= ihi) { return; } // skip axis node & wall edge
+                            const amrex::Real wi  = std::sqrt(amrex::max<amrex::Real>(i*dr,       0.25_rt*dr));
+                            const amrex::Real wim = std::sqrt(amrex::max<amrex::Real>((i-1)*dr,   0.25_rt*dr));
+                            const amrex::Real wip = std::sqrt(amrex::max<amrex::Real>((i+1)*dr,   0.25_rt*dr));
+                            const amrex::Real sm = 0.25_rt*qc(i-1,j,k,c)*wim
+                                                 + 0.5_rt *qc(i  ,j,k,c)*wi
+                                                 + 0.25_rt*qc(i+1,j,k,c)*wip;
+                            qa(i,j,k,c) = sm / wi;
+                        });
+                    }
+                }
+            }
+        }
+        for (int lev = 0; lev <= finest_level; ++lev) {
+            ablastr::utils::communication::FillBoundary(
+                *m_fields.get(FieldType::rho_fp, lev),
+                m_fields.get(FieldType::rho_fp, lev)->nGrowVect(),
+                WarpX::do_single_precision_comms, Geom(lev).periodicity(), true);
+            ablastr::utils::communication::FillBoundary(
+                *m_fields.get(FieldType::current_fp, Direction{2}, lev),
+                m_fields.get(FieldType::current_fp, Direction{2}, lev)->nGrowVect(),
+                WarpX::do_single_precision_comms, Geom(lev).periodicity(), true);
+        }
+    }
+#endif
 }
 
 void WarpX::HybridPICInitializeRhoJandB ()
