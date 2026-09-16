@@ -122,6 +122,16 @@ public:
             pp_collision_name.query("beta_weight_exponent", m_beta_weight_exponent);
             pp_collision_name.query("energy_fraction", m_energy_fraction);
             pp_collision_name.query("energy_fraction_max", m_energy_fraction_max);
+
+            // Multimode RZ: number of azimuthal sub-bins per (r,z) cell. Default resolves
+            // exactly the retained azimuthal modes (Orszag n_theta = 3*n_modes); 1 in
+            // single-mode reproduces the legacy cylindrical ring-binning. Overridable via
+            // `collisions.n_theta_subbins` (global) or `<collision>.n_theta_subbins`.
+            m_ntheta_subbins = (WarpX::n_rz_azimuthal_modes == 1)
+                             ? 1 : 3*WarpX::n_rz_azimuthal_modes;
+            pp_collisions.query("n_theta_subbins", m_ntheta_subbins);
+            pp_collision_name.query("n_theta_subbins", m_ntheta_subbins);
+            if (m_ntheta_subbins < 1) { m_ntheta_subbins = 1; }
         }
 
         // If DSMC the colliding species are also product species.
@@ -330,13 +340,21 @@ public:
         auto const dr = geom_lev.CellSize(0);
 #endif
 
+        const int n_theta_sub = m_ntheta_subbins;
+
         auto volume_factor = [=] AMREX_GPU_DEVICE(int i_cell) noexcept {
 #if defined(WARPX_DIM_RZ)
-            // Return the radial factor for the volume element, dV
-            int const ri = (i_cell - i_cell%nz)/nz;
+            // Strip the azimuthal sector, then decode the radial cell index. The sub-cell dV
+            // is the full-ring value divided by the r-adaptive sector count N_theta(r) (which
+            // MUST match findParticlesInEachCylSubCell). n_theta_sub=1 -> legacy full ring.
+            int const cell2d = i_cell / n_theta_sub;
+            int const ri = (cell2d - cell2d%nz)/nz;
             // rr is radius at the cell center
             amrex::ParticleReal const rr = rmin + (ri + 0.5_prt)*dr;
-            return 2.0_prt*static_cast<amrex::ParticleReal>(MathConst::pi)*rr;
+            int const nth = amrex::min(n_theta_sub, amrex::max(1,
+                static_cast<int>(2.0_prt*static_cast<amrex::ParticleReal>(MathConst::pi)*rr/dr)));
+            return (2.0_prt*static_cast<amrex::ParticleReal>(MathConst::pi)
+                    / static_cast<amrex::ParticleReal>(nth)) * rr;
 #elif defined(WARPX_DIM_RCYLINDER)
             int const ri = i_cell;
             // rr is radius at the cell center
@@ -362,7 +380,11 @@ public:
 
             // Find the particles that are in each cell of this tile
             ABLASTR_PROFILE_VAR("BinaryCollision::doCollisionsWithinTile::findParticlesInEachCell", prof_findParticlesInEachCell);
+#if defined(WARPX_DIM_RZ)
+            ParticleBins bins_1 = findParticlesInEachCylSubCell( geom_lev, mfi, ptile_1, m_ntheta_subbins );
+#else
             ParticleBins bins_1 = findParticlesInEachCell( geom_lev, mfi, ptile_1 );
+#endif
             ABLASTR_PROFILE_VAR_STOP(prof_findParticlesInEachCell);
 
             // Loop over cells, and collide the particles in each cell
@@ -803,8 +825,13 @@ public:
 
             // Find the particles that are in each cell of this tile
             ABLASTR_PROFILE_VAR("BinaryCollision::doCollisionsWithinTile::findParticlesInEachCell", prof_findParticlesInEachCell);
+#if defined(WARPX_DIM_RZ)
+            ParticleBins bins_1 = findParticlesInEachCylSubCell( geom_lev, mfi, ptile_1, m_ntheta_subbins );
+            ParticleBins bins_2 = findParticlesInEachCylSubCell( geom_lev, mfi, ptile_2, m_ntheta_subbins );
+#else
             ParticleBins bins_1 = findParticlesInEachCell( geom_lev, mfi, ptile_1 );
             ParticleBins bins_2 = findParticlesInEachCell( geom_lev, mfi, ptile_2 );
+#endif
             ABLASTR_PROFILE_VAR_STOP(prof_findParticlesInEachCell);
 
             // Loop over cells, and collide the particles in each cell
@@ -1478,6 +1505,9 @@ private:
     amrex::ParticleReal m_beta_weight_exponent = 1.;
     amrex::ParticleReal m_energy_fraction = 0.05;
     amrex::ParticleReal m_energy_fraction_max = 0.5;
+    // Multimode RZ: number of azimuthal sub-bins per (r,z) cell for collision locality.
+    // Default 1 (single-mode ring-binning); auto-set to 3*n_rz_azimuthal_modes in multimode.
+    int m_ntheta_subbins = 1;
 
     amrex::Vector<std::string> m_product_species;
     // functor that performs collisions within a cell

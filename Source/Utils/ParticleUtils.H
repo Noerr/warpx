@@ -39,6 +39,27 @@ namespace ParticleUtils {
                              WarpXParticleContainer::ParticleTileType & ptile);
 
     /**
+     * \brief Like findParticlesInEachCell, but for multimode RZ it additionally sub-bins each
+     * (r,z) cylindrical cell into azimuthal sectors, so that binary collisions become local in
+     * theta (required once m>=1 azimuthal modes break the cylindrical symmetry that the single-mode
+     * ring-binning + momentum-rotation relied on). The number of sectors is r-adaptive:
+     * N_theta(r) = clamp( floor(2*pi*r_c/dr), 1, n_theta_max ), so it is 1 near the axis (where the
+     * m>=1 field amplitude vanishes ~r^m and sub-cells would starve) and ramps to n_theta_max
+     * outward. The flat bin index is (ir*nz + iz)*n_theta_max + isec, matching the volume_factor
+     * decode in BinaryCollision.H. With n_theta_max=1 this reproduces the single-mode grouping.
+     *
+     * @param[in] geom_lev the geometry of the current refinement level.
+     * @param[in] mfi the MultiFAB iterator.
+     * @param[in] ptile the particle tile.
+     * @param[in] n_theta_max maximum number of azimuthal sectors per (r,z) cell.
+     */
+    amrex::DenseBins<ParticleTileDataType>
+    findParticlesInEachCylSubCell (amrex::Geometry const& geom_lev,
+                                   amrex::MFIter const & mfi,
+                                   WarpXParticleContainer::ParticleTileType & ptile,
+                                   int n_theta_max);
+
+    /**
      * \brief Return (relativistic) collision energy assuming the target (with
      * mass M) is stationary and the projectile is approaching with the
      * the given speed and mass m. Note the use of `double` since this
