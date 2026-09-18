@@ -6,10 +6,11 @@ AMReX fork used by this branch
 This branch does **not** build against ``AMReX-Codes/amrex``. It pulls AMReX
 from ``https://github.com/Noerr/amrex.git``, branch
 ``noerr/restart-1x-read-26.08``, which is the upstream ``26.08`` tag plus
-three commits.
+seven commits.
 
-They address two *different* problems that both surface during checkpoint
-restart, and which were conflated during the investigation:
+They address three *different* defects. The first two both surface during
+checkpoint **restart** and were conflated during the investigation; the third
+is on the **write** side and is unrelated to either:
 
 .. list-table::
    :header-rows: 1
@@ -24,13 +25,25 @@ restart, and which were conflated during the investigation:
      - restart reads boxes on ranks that do not own them, forcing a full
        redistribute
      - **device** (arena)
+   * - ``470aac36b``
+     - async particle **writes** are unchecked, so a failed write produces a
+       short checkpoint and the run still exits 0
+     - correctness (silent data loss)
+   * - ``dbed1035b`` ``41cfd2910`` ``10d5dac2e``
+     - asynchronous output was invisible: not profiled, and nothing recorded
+       when a write finished or when the drain at exit began
+     - observability
    * - ``f4f45de84``
      - temporary diagnostics, off unless ``AMREX_RESTART_DEBUG`` is set
      - —
 
-The second is the one that actually blocks restart at scale. The first is real
-but was never the blocker, and earlier revisions of this document wrongly
-implied it was.
+Of the two restart defects, ``beb8c444b`` is the one that actually blocks
+restart at scale. ``219119eb6`` is real but was never the blocker, and earlier
+revisions of this document wrongly implied it was.
+
+``470aac36b`` is the most serious of the three in kind, if not in frequency: the
+other two make a run fail loudly, whereas an unchecked write lets a run succeed
+while producing output that cannot be restarted from.
 
 Problem 1: two full-box host copies (``219119eb6``)
 ---------------------------------------------------
@@ -200,6 +213,57 @@ note it lowers the transient without removing it: each rank still generally
 reads a box it does not own, so the redistribute still happens. Only the patch
 eliminates it.
 
+Problem 3: unchecked asynchronous writes (``470aac36b``)
+---------------------------------------------------------
+
+Unrelated to the two restart defects above, and different in kind: this one does
+not make a run fail. It makes a run *succeed* while producing a checkpoint that
+cannot be restarted from.
+
+``WriteBinaryParticleDataAsync`` validates the Header stream and aborts on
+failure, but never checks the particle **data** stream. ``std::ofstream`` does
+not throw by default, so ``writeIntData``, ``writeDoubleData`` and ``flush()``
+all fail silently — a full disk, an exceeded quota or a transient OST error
+produces a short file while execution continues normally — and the stream is
+then closed by RAII, where a failed close is discarded.
+
+The result is worse than a plain truncated file. The Header's per-grid particle
+counts are computed from the in-memory container, not measured from what reached
+disk, so the Header still claims the full count. Header and data disagree, and
+nothing notices until a later restart trusts the Header and reads past EOF, in a
+different job, as an abort deep in the read path.
+
+Observed on Aurora at 3072 ranks: a checkpoint with 39 of 2688 electron data
+files short by 31.4 GiB in total, written by a job that exited 0 with seven
+minutes of walltime to spare; the chained successor died in
+``RealDescriptor::convertToNativeDoubleFormat``.
+
+The patch closes the stream explicitly and checks ``good()`` afterwards. Because
+the write runs on the ``BackgroundThread``, where ``amrex::Abort()`` may not
+produce a usable backtrace or a clean ``MPI_Abort``, the failure is *recorded*
+rather than acted on there:
+
+* ``AsyncOut::RecordWriteFailure()`` logs immediately with ``AllPrint`` (the
+  failing rank is generally not the I/O process, and that line survives a job
+  killed before any abort) and sets an atomic flag.
+* ``AsyncOut::CheckWriteFailures()`` runs on the main thread and aborts. It is
+  called when submitting a new job, so a run does not keep emitting output after
+  its output has started failing, and again after the final drain in
+  ``Finalize()`` — the latter is what guarantees a failed write cannot exit 0.
+
+.. important::
+
+   Detecting this in existing checkpoints requires comparing expected against
+   actual bytes, using the Header's ``(which, count, where)`` triplets. A file
+   census does not find it: file counts, headers and directory structure are all
+   intact in a damaged checkpoint. Neither does ``find -size 0`` — a box with no
+   particles legitimately writes an empty data file, and in the observed case
+   384 files per species were legitimately zero-length while the real damage lay
+   in files that were merely short.
+
+Not addressed: the field/plotfile async path has not been audited for the same
+gap.
+
 Diagnostics (``f4f45de84`` and ``beb8c444b``)
 ---------------------------------------------
 
@@ -266,6 +330,11 @@ Keep the deck setting anyway: it is harmless here, it still governs
 a stock-AMReX build.
 
 .. warning::
+
+   ``470aac36b`` (Problem 3, unchecked writes) is **compile-verified only**.
+   Exercising it requires making a write actually fail, which has not been
+   staged; the detection path, the deferred abort and the non-zero exit are
+   reasoned rather than observed. It is also not yet reported upstream.
 
    ``219119eb6`` (Problem 1, host streaming) remains **unvalidated**. It has not
    been shown to reproduce an unpatched restart bit-for-bit. Its host benefit
