@@ -25,7 +25,7 @@ is on the **write** side and is unrelated to either:
      - restart reads boxes on ranks that do not own them, forcing a full
        redistribute
      - **device** (arena)
-   * - ``470aac36b``
+   * - ``470aac36b`` ``cbad3f124``
      - async particle **writes** are unchecked, so a failed write produces a
        short checkpoint and the run still exits 0
      - correctness (silent data loss)
@@ -41,9 +41,10 @@ Of the two restart defects, ``beb8c444b`` is the one that actually blocks
 restart at scale. ``219119eb6`` is real but was never the blocker, and earlier
 revisions of this document wrongly implied it was.
 
-``470aac36b`` is the most serious of the three in kind, if not in frequency: the
+Problem 3 is the most serious of the three in kind, if not in frequency: the
 other two make a run fail loudly, whereas an unchecked write lets a run succeed
-while producing output that cannot be restarted from.
+while producing output that cannot be restarted from. It took two commits,
+because the obvious fix does not work; see below.
 
 Problem 1: two full-box host copies (``219119eb6``)
 ---------------------------------------------------
@@ -213,8 +214,8 @@ note it lowers the transient without removing it: each rank still generally
 reads a box it does not own, so the redistribute still happens. Only the patch
 eliminates it.
 
-Problem 3: unchecked asynchronous writes (``470aac36b``)
----------------------------------------------------------
+Problem 3: unchecked asynchronous writes (``470aac36b``, ``cbad3f124``)
+-----------------------------------------------------------------------
 
 Unrelated to the two restart defects above, and different in kind: this one does
 not make a run fail. It makes a run *succeed* while producing a checkpoint that
@@ -238,10 +239,10 @@ files short by 31.4 GiB in total, written by a job that exited 0 with seven
 minutes of walltime to spare; the chained successor died in
 ``RealDescriptor::convertToNativeDoubleFormat``.
 
-The patch closes the stream explicitly and checks ``good()`` afterwards. Because
-the write runs on the ``BackgroundThread``, where ``amrex::Abort()`` may not
-produce a usable backtrace or a clean ``MPI_Abort``, the failure is *recorded*
-rather than acted on there:
+The first patch (``470aac36b``) closes the stream explicitly and checks
+``good()`` afterwards. Because the write runs on the ``BackgroundThread``, where
+``amrex::Abort()`` may not produce a usable backtrace or a clean ``MPI_Abort``,
+the failure is *recorded* rather than acted on there:
 
 * ``AsyncOut::RecordWriteFailure()`` logs immediately with ``AllPrint`` (the
   failing rank is generally not the I/O process, and that line survives a job
@@ -250,6 +251,49 @@ rather than acted on there:
   called when submitting a new job, so a run does not keep emitting output after
   its output has started failing, and again after the final drain in
   ``Finalize()`` — the latter is what guarantees a failed write cannot exit 0.
+
+Why that was not enough (``cbad3f124``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``470aac36b`` was tested in production and **did not fire**. A run with the
+check in place wrote a short checkpoint and still exited 0; nothing on the
+stream ever reported an error.
+
+The cause is delayed allocation. ``write(2)`` only dirties page cache — blocks
+are not allocated and the quota is not charged until the kernel writes back — so
+by the time the quota is exceeded, both ``write(2)`` and ``close(2)`` have
+already returned success and the ``ofstream`` has no way to learn otherwise.
+Checking the stream is necessary but detects only the subset of failures the
+stream itself can see, which on a delayed-allocation filesystem excludes the
+case that actually happened.
+
+``fsync(2)`` documents this failure mode explicitly under ``EDQUOT``, "some
+previous write failed due to insufficient storage space", and is the point at
+which the error is still reportable. ``cbad3f124`` therefore forces write-back
+and checks it: a second descriptor is opened on the file, the stream is written
+and closed as before, and ``fsync()`` then runs on that descriptor, with a
+failure from either it or its ``close()`` routed to
+``AsyncOut::RecordWriteFailure()`` like any other.
+
+The descriptor is opened **before** the writes, not after the close. Write-back
+errors are delivered to the descriptors that were open on the file when the
+error was recorded (``fsync(2)``, ``EIO``, Linux 4.13 and later), and write-back
+can fire at any point once ``write(2)`` has returned, so a descriptor opened
+after the fact may report success for a write that has already failed.
+``std::ofstream`` exposes no portable way to reach its own descriptor, hence the
+separate open; ``fsync()`` acts on the file rather than on the descriptor that
+dirtied it, so it covers everything the stream wrote.
+
+Controlled by ``amrex.async_out_fsync``, **default true**. The cost is real:
+``fsync`` blocks until the data is durable where write-back is otherwise lazy
+and overlapped, which lengthens the drain at exit and serialises ranks that
+share an output file. It runs on the writer thread, so stepping is unaffected,
+and a silently truncated checkpoint costs far more than a slower one. Set it to
+``0`` only to establish what the syncing is costing.
+
+One caveat on attribution: ``fsync`` flushes the whole inode, so where several
+ranks share a file, one rank may surface another's error. At
+``async_out_nfiles = nranks`` this is moot.
 
 .. important::
 
@@ -331,10 +375,13 @@ a stock-AMReX build.
 
 .. warning::
 
-   ``470aac36b`` (Problem 3, unchecked writes) is **compile-verified only**.
-   Exercising it requires making a write actually fail, which has not been
-   staged; the detection path, the deferred abort and the non-zero exit are
-   reasoned rather than observed. It is also not yet reported upstream.
+   ``cbad3f124`` (Problem 3, the ``fsync``) is **compile-verified only**. Take
+   that seriously here rather than as boilerplate: ``470aac36b`` was also
+   compile-verified, was also reasoned from the documented semantics, and then
+   failed in production against the exact case it was written for. Only a run
+   that genuinely exhausts its quota will establish that this one fires. Until
+   then, keep checking checkpoints with the byte comparison described above.
+   Neither commit has been reported upstream yet.
 
    ``219119eb6`` (Problem 1, host streaming) remains **unvalidated**. It has not
    been shown to reproduce an unpatched restart bit-for-bit. Its host benefit
