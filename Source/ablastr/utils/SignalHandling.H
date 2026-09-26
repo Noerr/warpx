@@ -75,11 +75,30 @@ public:
     //! WarpX::ReadParameters has parsed break_signals / checkpoint_signals).
     static void InitTimers ();
 
-    //! Check elapsed wall-clock time against configured timers; self-signal via
-    //! std::raise(sig) when a timer elapses. Cheap no-op when both timers are
-    //! disabled. Rank 0 only; other ranks return immediately. The existing
-    //! per-step CheckSignals() then broadcasts the resulting action flag to all
-    //! ranks, so no separate MPI coordination is needed for the timer.
+    //! Check elapsed wall-clock time against configured timers, and poll for
+    //! sentinel files; self-signal via std::raise(sig) when either fires.
+    //! Cheap no-op when both timers are disabled and sentinel polling is off.
+    //! Rank 0 only; other ranks return immediately. The existing per-step
+    //! CheckSignals() then broadcasts the resulting action flag to all ranks,
+    //! so no separate MPI coordination is needed.
+    //!
+    //! Sentinel files (in the working directory, rank 0 only):
+    //!   SIGNAL_CHECKPOINT — request a checkpoint, then continue
+    //!   SIGNAL_TERMINATE  — request a clean break (same action as a break signal)
+    //!
+    //! The file is removed before the signal is raised, so each request fires
+    //! once. If both are present in the same poll, SIGNAL_CHECKPOINT is handled
+    //! first so a checkpoint is written before the run stops.
+    //!
+    //! If a sentinel exists but cannot be removed, the request cannot be
+    //! consumed and would otherwise re-fire on every poll. SIGNAL_TERMINATE is
+    //! still honoured once (a repeated break is idempotent); SIGNAL_CHECKPOINT
+    //! is not (a checkpoint storm costs more than a missed checkpoint). Either
+    //! way a single warning is emitted and that file is then ignored for the
+    //! rest of the run. Polling is
+    //! throttled by WARPX_SIGNAL_FILE_POLL_SECONDS (default 5; 0 = every step;
+    //! negative = disabled) to keep metadata traffic off the parallel
+    //! filesystem on long runs.
     static void CheckTimers ();
 
     //! Check whether a given action has been requested, and reset the associated flag
@@ -113,6 +132,23 @@ private:
     static bool m_timer_break_fired;
     //! Next wall-time threshold at which a checkpoint should fire (relative to start)
     static double m_timer_next_checkpoint_at;
+
+    //
+    // Sentinel-file polling state (rank 0 only). Independent of the timers:
+    // enabled whenever a signal is configured for the corresponding action,
+    // even if no WARPX_*_SECONDS timer is set.
+    //
+    //! Configured WARPX_SIGNAL_FILE_POLL_SECONDS (default 5), or -1 if disabled
+    static int m_sentinel_poll_seconds;
+    //! Next elapsed-time threshold, in whole seconds, at which to poll for
+    //! sentinel files. Integer because the interval is integer seconds and
+    //! advances by fixed multiples — unlike m_timer_next_checkpoint_at, which
+    //! re-anchors on measured elapsed time and is therefore fractional.
+    static int m_sentinel_next_poll_at;
+
+    //! Poll for SIGNAL_CHECKPOINT / SIGNAL_TERMINATE in the working directory.
+    //! Removes the file and raises the mapped signal. Rank 0 only.
+    static void CheckSentinelFiles ();
 
 #if defined(AMREX_USE_MPI)
     //! MPI requests for the asynchronous broadcasts of the signal-requested actions
