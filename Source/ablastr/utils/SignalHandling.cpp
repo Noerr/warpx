@@ -14,7 +14,10 @@
 #include <AMReX_Utility.H>
 
 #include <cctype>
+#include <cerrno>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 
 // For sigaction() et al.
@@ -40,6 +43,19 @@ int    SignalHandling::m_timer_break_signal = -1;
 int    SignalHandling::m_timer_checkpoint_signal = -1;
 bool   SignalHandling::m_timer_break_fired = false;
 double SignalHandling::m_timer_next_checkpoint_at = 0.0;
+
+// Sentinel-file polling state (rank 0 only).
+int    SignalHandling::m_sentinel_poll_seconds = -1;
+int    SignalHandling::m_sentinel_next_poll_at = 0;
+
+namespace {
+    //! Sentinel filenames polled in the working directory by rank 0.
+    constexpr const char* SENTINEL_CHECKPOINT = "SIGNAL_CHECKPOINT";
+    constexpr const char* SENTINEL_TERMINATE  = "SIGNAL_TERMINATE";
+
+    //! Default sentinel poll interval, seconds.
+    constexpr int SENTINEL_POLL_SECONDS_DEFAULT = 5;
+}
 
 int
 SignalHandling::parseSignalNameToNumber (const std::string &str)
@@ -264,8 +280,13 @@ SignalHandling::InitTimers ()
         return -1;
     };
 
+    // Resolve the signal for each action unconditionally. The sentinel-file
+    // path needs these even when no WARPX_*_SECONDS timer is configured, so
+    // this must not be nested inside the timer blocks below.
+    m_timer_break_signal      = first_signal(SIGNAL_REQUESTS_BREAK);
+    m_timer_checkpoint_signal = first_signal(SIGNAL_REQUESTS_CHECKPOINT);
+
     if (m_timer_break_after_seconds >= 0) {
-        m_timer_break_signal = first_signal(SIGNAL_REQUESTS_BREAK);
         if (m_timer_break_signal < 0) {
             amrex::Print() << "[Self-signal timer] WARNING: "
                            << "WARPX_BREAK_AFTER_SECONDS="
@@ -283,7 +304,6 @@ SignalHandling::InitTimers ()
     }
 
     if (m_timer_checkpoint_every_seconds >= 0) {
-        m_timer_checkpoint_signal = first_signal(SIGNAL_REQUESTS_CHECKPOINT);
         if (m_timer_checkpoint_signal < 0) {
             amrex::Print() << "[Self-signal timer] WARNING: "
                            << "WARPX_CHECKPOINT_EVERY_SECONDS="
@@ -300,11 +320,128 @@ SignalHandling::InitTimers ()
         }
     }
 
+    // ---- Sentinel-file polling ------------------------------------------
+    // Independent of the timers: a user may want file-driven control without
+    // any WARPX_*_SECONDS set. Enabled whenever at least one action has a
+    // signal configured.
+    {
+        const char* val = std::getenv("WARPX_SIGNAL_FILE_POLL_SECONDS");
+        if (val == nullptr || val[0] == '\0') {
+            m_sentinel_poll_seconds = SENTINEL_POLL_SECONDS_DEFAULT;
+        } else {
+            char* end = nullptr;
+            const long n = std::strtol(val, &end, 10);
+            if (end == val || *end != '\0'
+                || n > std::numeric_limits<int>::max()
+                || n < std::numeric_limits<int>::min())
+            {
+                amrex::Print() << "[Signal file] WARNING: "
+                               << "WARPX_SIGNAL_FILE_POLL_SECONDS=" << val
+                               << " is not a valid integer; using default "
+                               << SENTINEL_POLL_SECONDS_DEFAULT << "s.\n";
+                m_sentinel_poll_seconds = SENTINEL_POLL_SECONDS_DEFAULT;
+            } else {
+                // Negative disables polling entirely.
+                m_sentinel_poll_seconds = static_cast<int>(n);
+            }
+        }
+
+        if (m_sentinel_poll_seconds >= 0
+            && m_timer_break_signal < 0 && m_timer_checkpoint_signal < 0)
+        {
+            amrex::Print() << "[Signal file] WARNING: no signal is configured "
+                           << "for either break or checkpoint "
+                           << "(warpx.break_signals / warpx.checkpoint_signals "
+                           << "are both empty) — disabling sentinel-file "
+                           << "polling.\n";
+            m_sentinel_poll_seconds = -1;
+        }
+
+        if (m_sentinel_poll_seconds >= 0) {
+            amrex::Print() << "[Signal file] polling every "
+                           << m_sentinel_poll_seconds << "s for "
+                           << SENTINEL_CHECKPOINT << " (signal "
+                           << m_timer_checkpoint_signal << ") and "
+                           << SENTINEL_TERMINATE << " (signal "
+                           << m_timer_break_signal
+                           << ") in the working directory\n";
+        }
+    }
+
     // Anchor wall-time start; first checkpoint fires at +interval (relative).
     m_timer_wall_start = amrex::second();
     m_timer_next_checkpoint_at =
         static_cast<double>(m_timer_checkpoint_every_seconds);
     m_timer_break_fired = false;
+    m_sentinel_next_poll_at = m_sentinel_poll_seconds;
+#endif
+}
+
+void
+SignalHandling::CheckSentinelFiles ()
+{
+#if defined(__linux__) || defined(__APPLE__)
+    // One-shot latches so an undeletable sentinel cannot spam the log. Without
+    // these, a file we cannot remove warns on every poll — at the 5s default
+    // that is ~17k lines/day from rank 0 into the job output.
+    static bool warned_checkpoint = false;
+    static bool warned_terminate  = false;
+
+    // Remove-and-test in one syscall: std::remove() succeeds only if the file
+    // existed, which both detects the request and consumes it. Doing it this
+    // way (rather than stat() then unlink()) costs one metadata operation
+    // instead of two and cannot race with a file created between the two.
+    //
+    // If the file is present but undeletable (permissions, read-only mount,
+    // a filesystem error), we cannot consume the request, so acting on it
+    // would re-fire on every subsequent poll. Whether that is acceptable
+    // depends on the action, hence act_even_if_undeletable:
+    //   SIGNAL_TERMINATE  — yes. A repeated break request is idempotent; the
+    //                       run is already stopping. Better to honour it.
+    //   SIGNAL_CHECKPOINT — no. Re-firing every poll would be a checkpoint
+    //                       storm, which costs far more than a missed
+    //                       checkpoint.
+    // Either way we warn exactly once and then stay inert for that file.
+    auto consume = [] (const char* name, bool act_even_if_undeletable,
+                       bool& warned) -> bool
+    {
+        errno = 0;
+        if (std::remove(name) == 0) { return true; }
+        if (errno == ENOENT) { return false; }
+        if (warned) { return false; }
+        warned = true;
+        amrex::Print() << "[Signal file] WARNING: " << name
+                       << " exists but could not be removed: "
+                       << std::strerror(errno) << ". "
+                       << (act_even_if_undeletable
+                           ? "Acting on it once; it will be ignored hereafter."
+                           : "Ignoring it — repeated checkpoints would cost "
+                             "more than a missed one.")
+                       << " Remove the file by hand to re-arm.\n";
+        return act_even_if_undeletable;
+    };
+
+    // Checkpoint first, so that if both files are present the run writes a
+    // checkpoint before it stops.
+    if (m_timer_checkpoint_signal >= 0
+        && consume(SENTINEL_CHECKPOINT, /*act_even_if_undeletable=*/false,
+                   warned_checkpoint))
+    {
+        amrex::Print() << "[Signal file] " << SENTINEL_CHECKPOINT
+                       << " found — sending signal "
+                       << m_timer_checkpoint_signal << "\n";
+        std::raise(m_timer_checkpoint_signal);
+    }
+
+    if (m_timer_break_signal >= 0
+        && consume(SENTINEL_TERMINATE, /*act_even_if_undeletable=*/true,
+                   warned_terminate))
+    {
+        amrex::Print() << "[Signal file] " << SENTINEL_TERMINATE
+                       << " found — sending signal "
+                       << m_timer_break_signal << "\n";
+        std::raise(m_timer_break_signal);
+    }
 #endif
 }
 
@@ -317,14 +454,34 @@ SignalHandling::CheckTimers ()
     if (amrex::ParallelDescriptor::MyProc() != 0) {
         return;
     }
-    // Cheap fast-path when both timers are disabled (the common case).
+    // Cheap fast-path when both timers are disabled AND sentinel polling is
+    // off. Sentinel polling is independent of the timers, so it must be part
+    // of this condition or file-driven control silently never runs.
     if (m_timer_break_after_seconds < 0
-        && m_timer_checkpoint_every_seconds < 0)
+        && m_timer_checkpoint_every_seconds < 0
+        && m_sentinel_poll_seconds < 0)
     {
         return;
     }
 
     const double elapsed = amrex::second() - m_timer_wall_start;
+
+    // Sentinel files, throttled. Checked before the timers so that a manual
+    // request is not delayed by a timer firing in the same step.
+    if (m_sentinel_poll_seconds >= 0
+        && elapsed >= static_cast<double>(m_sentinel_next_poll_at))
+    {
+        // Fixed cadence: advance by whole intervals past the current elapsed
+        // time, so a slow step cannot make the poll drift later and later.
+        // With m_sentinel_poll_seconds == 0 the threshold stays put and we
+        // poll every step, as documented.
+        if (m_sentinel_poll_seconds > 0) {
+            do {
+                m_sentinel_next_poll_at += m_sentinel_poll_seconds;
+            } while (static_cast<double>(m_sentinel_next_poll_at) <= elapsed);
+        }
+        CheckSentinelFiles();
+    }
 
     // Break: one-shot.
     if (m_timer_break_after_seconds >= 0
