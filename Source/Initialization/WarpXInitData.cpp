@@ -1401,6 +1401,34 @@ void ComputeExternalFieldOnGridUsingParser_template (
     const amrex::IntVect y_nodal_flag = mfy->ixType().toIntVect();
     const amrex::IntVect z_nodal_flag = mfz->ixType().toIntVect();
 
+    // The field written here and the EB update flags read below are allocated
+    // with different ghost-cell counts, and the loop covers the field's full
+    // grown box, so the outer ghost layers can have no corresponding flag
+    // entry. The field gets `ng_alloc_EB`, derived from the particle shape
+    // order and then rounded up to an even number; the flags get
+    // `ng_FieldSolver`, the solver stencil width (1 for Yee). At the default
+    // `particle_shape = 1` that is 2 against 1, so the mismatch is the normal
+    // case rather than an unusual one -- hence a note under `warpx.verbose`
+    // rather than a warning, which would fire on essentially every run that
+    // combines an embedded boundary with a parsed external field.
+    //
+    // Reading those points was an out-of-bounds access: silent on HIP, where
+    // the stray read lands in mapped arena memory, but fatal on CUDA
+    // (`illegal memory access`). The kernel now bounds-checks each flag read
+    // and treats a point with no flag as "update", which is what happens when
+    // EB is disabled.
+    if (use_eb_flags && EB::enabled() && warpx.Verbose()) {
+        const amrex::IntVect ng_field = mfx->nGrowVect();
+        const amrex::IntVect ng_flags = eb_update_field[lev][0]->nGrowVect();
+        if (! ng_field.allLE(ng_flags)) {
+            amrex::Print() << "    ComputeExternalFieldOnGridUsingParser: level " << lev
+                           << " field ghost cells " << ng_field
+                           << " exceed EB update-flag ghost cells " << ng_flags
+                           << "; ghost points beyond the flags are initialized as if"
+                              " outside the embedded boundary.\n";
+        }
+    }
+
     for ( MFIter mfi(*mfx, TilingIfNotGPU()); mfi.isValid(); ++mfi) {
         const amrex::Box& tbx = mfi.tilebox( x_nodal_flag, mfx->nGrowVect() );
         const amrex::Box& tby = mfi.tilebox( y_nodal_flag, mfy->nGrowVect() );
@@ -1421,7 +1449,8 @@ void ComputeExternalFieldOnGridUsingParser_template (
             [=] AMREX_GPU_DEVICE (int i, int j, int k) {
 
                 // Do not set fields inside the embedded boundary
-                if (update_fx_arr && update_fx_arr(i,j,k) == 0) { return; }
+                if (update_fx_arr && update_fx_arr.contains(i,j,k)
+                    && update_fx_arr(i,j,k) == 0) { return; }
 
                 // Shift required in the x-, y-, or z- position
                 // depending on the index type of the multifab
@@ -1455,7 +1484,8 @@ void ComputeExternalFieldOnGridUsingParser_template (
             [=] AMREX_GPU_DEVICE (int i, int j, int k) {
 
                 // Do not set fields inside the embedded boundary
-                if (update_fy_arr && update_fy_arr(i,j,k) == 0) { return; }
+                if (update_fy_arr && update_fy_arr.contains(i,j,k)
+                    && update_fy_arr(i,j,k) == 0) { return; }
 
 #if defined(WARPX_DIM_1D_Z)
                 const amrex::Real x = 0._rt;
@@ -1487,7 +1517,8 @@ void ComputeExternalFieldOnGridUsingParser_template (
             [=] AMREX_GPU_DEVICE (int i, int j, int k) {
 
                 // Do not set fields inside the embedded boundary
-                if (update_fz_arr && update_fz_arr(i,j,k) == 0) { return; }
+                if (update_fz_arr && update_fz_arr.contains(i,j,k)
+                    && update_fz_arr(i,j,k) == 0) { return; }
 
 #if defined(WARPX_DIM_1D_Z)
                 const amrex::Real x = 0._rt;
