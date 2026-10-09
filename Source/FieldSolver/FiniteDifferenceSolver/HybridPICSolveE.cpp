@@ -1655,7 +1655,10 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
         // r = dr/2), so extrapolate E_r,1 linearly to the axis, then impose the
         // cross-coupling on E_theta,1(0). Run as a separate pass after the fused
         // ParallelFor so E_r is fully updated for this tile (no read/write race).
-        if (rmin == 0._rt && nmodes > 1) {
+        // Only tiles that contain the axis: m_rmin is the DOMAIN rmin, so without
+        // the smallEnd check a box at i >= 1 (radial domain decomposition) would
+        // write E_theta(0,j) / read E_r(0..1,j) outside its own allocation.
+        if (rmin == 0._rt && nmodes > 1 && mfi.tilebox().smallEnd(0) == 0) {
             amrex::Box tet_axis = amrex::convert(mfi.tilebox(),
                                                  Efield[1]->ixType().toIntVect());
             tet_axis.setRange(0, 0, 1);   // i = 0 nodal column (r = 0) only
