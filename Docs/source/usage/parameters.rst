@@ -4895,7 +4895,8 @@ In-situ capabilities can be used by turning on Sensei or Ascent (provided they a
     ``P_<species_name>`` is the pressure tensor, output as 6 components (``Pxx``, ``Pxy``, ``Pxz``, ``Pyy``, ``Pyz``, ``Pzz``) in Pa.
     The trace ``(Pxx + Pyy + Pzz) / 3`` equals ``n * k_B * T`` where ``n`` is the number density and ``T`` is the scalar temperature.
     ``Q_<species_name>`` is the heat flux vector, output as 3 components (``Qx``, ``Qy``, ``Qz``) in W/m^2.
-    With the hybrid-PIC solver (:pp:param:`algo.maxwell_solver` = ``hybrid``), the scalar fields ``Te`` (electron temperature in K: implied by the electron-pressure closure, or the evolved state variable when :pp:param:`hybrid_pic_model.solve_electron_energy_equation` is on) and ``Pe`` (electron pressure in Pa, as used in the Ohm's-law E-field solve) are also available.
+    With :pp:param:`<species_name>.do_temperature_deposition`, the per-direction temperatures ``Tx_<species_name>``, ``Ty_<species_name>`` and ``Tz_<species_name>`` (``Tr_``, ``Tt_`` and ``Tz_`` in RZ and RCYLINDER, ``Tr_``, ``Tt_`` and ``Tp_`` in RSPHERE) are also available, in K.
+    In openPMD output, all of these temperatures carry the temperature unit dimension. ``T_<species_name>`` is still written in eV, but with ``unitSI`` = :math:`q_e/k_B`, so readers that apply ``unitSI`` (e.g., openPMD-viewer) return it in K. Plotfile readers (e.g., yt) return ``T_<species_name>`` in eV.
     ``eb_covered`` is a number between 0 and 1 that indicates the fraction of the cell that is covered by the embedded boundary.
     Note that ``phi`` will only be written out when ``do_electrostatic==labframe``.
     Also, note that for :pp:param:`<diag_name>.diag_type = BackTransformed`, the only scalar field currently supported is ``rho``.
