@@ -21,6 +21,26 @@
 using namespace ablastr::utils::communication;
 using namespace amrex;
 
+#if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE)
+namespace
+{
+    // Radial factor removed by charge/current inverse-volume scaling.
+    AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+    amrex::Real RadialVolumeFactor (amrex::Real r, amrex::Real dr, bool use_axis_correction)
+    {
+        using namespace amrex::literals;
+        r = amrex::Math::abs(r);
+#if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER)
+        const amrex::Real axis_factor = use_axis_correction ? 1.0_rt/3.0_rt : 1.0_rt/4.0_rt;
+        return (r == 0.0_rt) ? MathConst::pi*dr*axis_factor : 2.0_rt*MathConst::pi*r;
+#else
+        const amrex::Real axis_factor = use_axis_correction ? 1.0_rt/4.0_rt : 1.0_rt/8.0_rt;
+        return (r == 0.0_rt) ? 4.0_rt/3.0_rt*MathConst::pi*dr*dr*axis_factor : 4.0_rt*MathConst::pi*r*r;
+#endif
+    }
+}
+#endif
+
 
 WarpXFluidContainer::WarpXFluidContainer(int ispecies, const std::string &name):
     species_id{ispecies},
@@ -35,7 +55,7 @@ WarpXFluidContainer::WarpXFluidContainer(int ispecies, const std::string &name):
     const ParmParse pp_species_name(species_name);
     SpeciesUtils::parseDensity(species_name, "", h_inj_rho, density_parser, geom);
     SpeciesUtils::parseMomentum(species_name, "", "none", h_inj_mom,
-        ux_parser, uy_parser, uz_parser, ux_th_parser, uy_th_parser, uz_th_parser, h_mom_temp, h_mom_vel);
+        h_mom_temp, h_mom_vel, geom);
     if (h_inj_rho) {
 #ifdef AMREX_USE_GPU
         d_inj_rho = static_cast<InjectorDensity*>
@@ -372,6 +392,11 @@ void WarpXFluidContainer::ApplyBcFluidsAndComms (ablastr::fields::MultiFabRegist
         //Grow the tilebox
         tile_box.grow(1);
 
+        // In-place update: iterations write only the two outermost boundary
+        // planes (domain end +/- 1) and read two cells inward (+/- 2), so the
+        // written and read index sets are disjoint and the iterations are
+        // independent, as required by ParallelFor. A +/- 1 stencil would break
+        // this and require amrex::For (see issue #7097).
         amrex::ParallelFor(tile_box,
             [=] AMREX_GPU_DEVICE(int i, int j, int k) noexcept
             {
@@ -587,9 +612,9 @@ void WarpXFluidContainer::AdvectivePush_Muscl (ablastr::fields::MultiFabRegister
                     amrex::Real Uz = (NUz_arr(i, j, k) / N_arr(i,j,k));
 
                     // Compute useful quantities for J
-                    const amrex::Real c_sq = clight*clight;
-                    const amrex::Real gamma = std::sqrt(1.0_rt + (Ux*Ux + Uy*Uy + Uz*Uz)/(c_sq) );
-                    const amrex::Real inv_c2_gamma3 = 1._rt/(c_sq*gamma*gamma*gamma);
+                   constexpr amrex::Real c2 = PhysConst::c2;
+                    const amrex::Real gamma = std::sqrt(1.0_rt + (Ux*Ux + Uy*Uy + Uz*Uz)/c2 );
+                    const amrex::Real inv_c2_gamma3 = 1._rt/(c2*gamma*gamma*gamma);
 
                     // J represents are 4x4 matrices that show up in the advection
                     // equations written as a function of U = {N, Ux, Uy, Uz}:
@@ -598,7 +623,7 @@ void WarpXFluidContainer::AdvectivePush_Muscl (ablastr::fields::MultiFabRegister
                     const amrex::Real Vx = Ux/gamma;
                     // Compute the non-zero element of Jx
                     const amrex::Real J00x = Vx;
-                    const amrex::Real J01x = N_arr(i,j,k)*(1/gamma)*(1-Vx*Vx/c_sq);
+                    const amrex::Real J01x = N_arr(i,j,k)*(1/gamma)*(1-Vx*Vx/c2);
                     const amrex::Real J02x = -N_arr(i,j,k)*Uy*Ux*inv_c2_gamma3;
                     const amrex::Real J03x = -N_arr(i,j,k)*Uz*Ux*inv_c2_gamma3;
                     const amrex::Real J11x = Vx;
@@ -620,7 +645,7 @@ void WarpXFluidContainer::AdvectivePush_Muscl (ablastr::fields::MultiFabRegister
                     // Compute the non-zero element of Jy
                     const amrex::Real J00y = Vy;
                     const amrex::Real J01y = -N_arr(i,j,k)*Ux*Uy*inv_c2_gamma3;
-                    const amrex::Real J02y = N_arr(i,j,k)*(1/gamma)*(1-Vy*Vy/c_sq);
+                    const amrex::Real J02y = N_arr(i,j,k)*(1/gamma)*(1-Vy*Vy/c2);
                     const amrex::Real J03y = -N_arr(i,j,k)*Uz*Uy*inv_c2_gamma3;
                     const amrex::Real J11y = Vy;
                     const amrex::Real J22y = Vy;
@@ -640,7 +665,7 @@ void WarpXFluidContainer::AdvectivePush_Muscl (ablastr::fields::MultiFabRegister
                     const amrex::Real J00z = Vz;
                     const amrex::Real J01z = -N_arr(i,j,k)*Ux*Uz*inv_c2_gamma3;
                     const amrex::Real J02z = -N_arr(i,j,k)*Uy*Uz*inv_c2_gamma3;
-                    const amrex::Real J03z = N_arr(i,j,k)*(1/gamma)*(1-Vz*Vz/c_sq);
+                    const amrex::Real J03z = N_arr(i,j,k)*(1/gamma)*(1-Vz*Vz/c2);
                     const amrex::Real J11z = Vz;
                     const amrex::Real J22z = Vz;
                     const amrex::Real J33z = Vz;
@@ -810,7 +835,7 @@ void WarpXFluidContainer::AdvectivePush_Muscl (ablastr::fields::MultiFabRegister
 #elif defined(WARPX_DIM_1D_Z)
                     set_U_edges_to_zero(U_minus_z, U_plus_z, i, j, k, box_z, 2);
 #elif defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE)
-                    set_U_edges_to_zero(U_minus_x, U_plus_x, i, j, k, box_x, 2);
+                    set_U_edges_to_zero(U_minus_x, U_plus_x, i, j, k, box_x, 0);
 #endif
                 }
             }
@@ -1274,7 +1299,7 @@ void WarpXFluidContainer::GatherAndPush (
                             const amrex::Real z_lab = gamma_boost*(z + beta_boost*PhysConst::c*t);
 
                             // Grab the external fields in the lab frame:
-                            if ( exte_control == has_exte ) {
+                            if constexpr ( exte_control == has_exte ) {
                                 Ex_ext_lab = Exfield_parser(x, y, z_lab, t_lab);
                                 Ey_ext_lab = Eyfield_parser(x, y, z_lab, t_lab);
                                 Ez_ext_lab = Ezfield_parser(x, y, z_lab, t_lab);
@@ -1283,7 +1308,7 @@ void WarpXFluidContainer::GatherAndPush (
                                 Ey_ext_lab = 0.0;
                                 Ez_ext_lab = 0.0;
                             }
-                            if ( extb_control == has_extb ) {
+                            if constexpr ( extb_control == has_extb ) {
                                 Bx_ext_lab = Bxfield_parser(x, y, z_lab, t_lab);
                                 By_ext_lab = Byfield_parser(x, y, z_lab, t_lab);
                                 Bz_ext_lab = Bzfield_parser(x, y, z_lab, t_lab);
@@ -1339,7 +1364,7 @@ void WarpXFluidContainer::GatherAndPush (
                         }
 
                         // Added external b fields:
-                        if ( extb_control == has_extb ){
+                        if constexpr ( extb_control == has_extb ){
 #if defined(WARPX_DIM_3D)
                             const amrex::Real x = problo[0] + i * dx[0];
                             const amrex::Real y = problo[1] + j * dx[1];
@@ -1402,12 +1427,18 @@ void WarpXFluidContainer::DepositCharge (ablastr::fields::MultiFabRegister& fiel
     const amrex::Geometry &geom = warpx.Geom(lev);
     const amrex::Periodicity &period = geom.periodicity();
     const amrex::Real q = getCharge();
+#if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE)
+    const amrex::Real dr = WarpX::CellSize(lev)[0];
+    const bool use_axis_correction = warpx.UseVerboncoeurAxisCorrection();
+#endif
     auto const &owner_mask_rho = amrex::OwnerMask(rho, period);
 
     // Assertion, make sure rho is at the same location as N
     AMREX_ALWAYS_ASSERT(rho.ixType().nodeCentered());
 
-    // Loop over and deposit charge density
+    // Multiply physical fluid charge density by the volume factor to match
+    // the raw charge deposited by PIC particles. The inverse-volume scaling
+    // in FinalizeRho restores physical charge density.
 #ifdef AMREX_USE_OMP
 #pragma omp parallel if (amrex::Gpu::notInLaunchRegion())
 #endif
@@ -1419,11 +1450,24 @@ void WarpXFluidContainer::DepositCharge (ablastr::fields::MultiFabRegister& fiel
         const amrex::Array4<amrex::Real> rho_arr = rho.array(mfi);
         const amrex::Array4<int> owner_mask_rho_arr = owner_mask_rho->array(mfi);
 
+#if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE)
+        const amrex::Real rmin = WarpX::LowerCorner(tile_box, lev, 0.0_rt).x;
+        const int irmin = amrex::lbound(tile_box).x;
+#endif
+
         // Deposit Rho
         amrex::ParallelFor(tile_box,
             [=] AMREX_GPU_DEVICE(int i, int j, int k) noexcept
             {
-                if ( owner_mask_rho_arr(i,j,k) ) { rho_arr(i,j,k,icomp) += q*N_arr(i,j,k); }
+                if (owner_mask_rho_arr(i,j,k)) {
+#if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE)
+                    const amrex::Real volume_factor = RadialVolumeFactor(
+                        rmin + (i - irmin)*dr, dr, use_axis_correction);
+#else
+                    const amrex::Real volume_factor = 1.0_rt;
+#endif
+                    rho_arr(i,j,k,icomp) += volume_factor*q*N_arr(i,j,k);
+                }
             }
         );
     }
@@ -1443,7 +1487,7 @@ void WarpXFluidContainer::DepositCurrent(
     amrex::MultiFab tmp_jy_fluid(fields.get(name_mf_N, lev)->boxArray(), fields.get(name_mf_N, lev)->DistributionMap(), 1, 0);
     amrex::MultiFab tmp_jz_fluid(fields.get(name_mf_N, lev)->boxArray(), fields.get(name_mf_N, lev)->DistributionMap(), 1, 0);
 
-    const amrex::Real inv_clight_sq = 1.0_prt / PhysConst::c / PhysConst::c;
+    const amrex::Real inv_c2 = PhysConst::inv_c2;
     const amrex::Real q = getCharge();
 
     // Prepare interpolation of current components to cell center
@@ -1466,6 +1510,10 @@ void WarpXFluidContainer::DepositCurrent(
     auto const &owner_mask_x = amrex::OwnerMask(jx, period);
     auto const &owner_mask_y = amrex::OwnerMask(jy, period);
     auto const &owner_mask_z = amrex::OwnerMask(jz, period);
+#if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE)
+    const amrex::Real dr = WarpX::CellSize(lev)[0];
+    const bool use_axis_correction = warpx.UseVerboncoeurAxisCorrection();
+#endif
 
     // Calculate j at the nodes
 #ifdef AMREX_USE_OMP
@@ -1493,7 +1541,7 @@ void WarpXFluidContainer::DepositCurrent(
                     Ux = NUx_arr(i, j, k)/N_arr(i, j, k);
                     Uy = NUy_arr(i, j, k)/N_arr(i, j, k);
                     Uz = NUz_arr(i, j, k)/N_arr(i, j, k);
-                    gamma = std::sqrt(1.0_rt + ( Ux*Ux + Uy*Uy + Uz*Uz) * inv_clight_sq ) ;
+                    gamma = std::sqrt(1.0_rt + ( Ux*Ux + Uy*Uy + Uz*Uz) * inv_c2 ) ;
                 }
                 tmp_jx_fluid_arr(i, j, k) = q * (NUx_arr(i, j, k) / gamma);
                 tmp_jy_fluid_arr(i, j, k) = q * (NUy_arr(i, j, k) / gamma);
@@ -1524,31 +1572,70 @@ void WarpXFluidContainer::DepositCurrent(
         const amrex::Array4<int> owner_mask_y_arr = owner_mask_y->array(mfi);
         const amrex::Array4<int> owner_mask_z_arr = owner_mask_z->array(mfi);
 
+#if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE)
+        const amrex::Box tile_box = mfi.tilebox(fields.get(name_mf_N, lev)->ixType().toIntVect());
+        const amrex::Real rmin = WarpX::LowerCorner(tile_box, lev, 0.0_rt).x;
+        const int irmin = amrex::lbound(tile_box).x;
+        const amrex::Real rmin_x = rmin
+            + (jx_type[0] == amrex::IndexType::NODE ? 0.0_rt : 0.5_rt*dr);
+        const amrex::Real rmin_y = rmin
+            + (jy_type[0] == amrex::IndexType::NODE ? 0.0_rt : 0.5_rt*dr);
+        const amrex::Real rmin_z = rmin
+            + (jz_type[0] == amrex::IndexType::NODE ? 0.0_rt : 0.5_rt*dr);
+#endif
+
         // When using the `Interp` function, one needs to specify whether coarsening is desired.
         // Here, we do not perform any coarsening.
         const amrex::GpuArray<int, 3U> coarsening_ratio = {1, 1, 1};
 
 
-        // Interpolate fluid current and deposit it
+        // Interpolate physical fluid current density, then multiply by the volume
+        // factor at each destination component's location to match the raw current
+        // deposited by PIC particles. The inverse-volume scaling in FinalizeJ
+        // restores physical current density.
         // ( mask double counting )
         amrex::ParallelFor( tile_box_x, tile_box_y, tile_box_z,
             [=] AMREX_GPU_DEVICE(int i, int j, int k) noexcept
             {
                 const amrex::Real jx_tmp = ablastr::coarsen::sample::Interp(tmp_jx_fluid_arr,
                     j_nodal_type, jx_type, coarsening_ratio, i, j, k, 0);
-                if ( owner_mask_x_arr(i,j,k) ) { jx_arr(i, j, k) += jx_tmp; }
+                if (owner_mask_x_arr(i,j,k)) {
+#if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE)
+                    const amrex::Real volume_factor = RadialVolumeFactor(
+                        rmin_x + (i - irmin)*dr, dr, use_axis_correction);
+#else
+                    const amrex::Real volume_factor = 1.0_rt;
+#endif
+                    jx_arr(i, j, k) += volume_factor*jx_tmp;
+                }
             },
             [=] AMREX_GPU_DEVICE(int i, int j, int k) noexcept
             {
                 const amrex::Real jy_tmp = ablastr::coarsen::sample::Interp(tmp_jy_fluid_arr,
                     j_nodal_type, jy_type, coarsening_ratio, i, j, k, 0);
-                if ( owner_mask_y_arr(i,j,k) ) { jy_arr(i, j, k) += jy_tmp; }
+                if (owner_mask_y_arr(i,j,k)) {
+#if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE)
+                    const amrex::Real volume_factor = RadialVolumeFactor(
+                        rmin_y + (i - irmin)*dr, dr, use_axis_correction);
+#else
+                    const amrex::Real volume_factor = 1.0_rt;
+#endif
+                    jy_arr(i, j, k) += volume_factor*jy_tmp;
+                }
             },
             [=] AMREX_GPU_DEVICE(int i, int j, int k) noexcept
             {
                 const amrex::Real jz_tmp = ablastr::coarsen::sample::Interp(tmp_jz_fluid_arr,
                     j_nodal_type, jz_type, coarsening_ratio, i, j, k, 0);
-                if ( owner_mask_z_arr(i,j,k) ) { jz_arr(i, j, k) += jz_tmp; }
+                if (owner_mask_z_arr(i,j,k)) {
+#if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE)
+                    const amrex::Real volume_factor = RadialVolumeFactor(
+                        rmin_z + (i - irmin)*dr, dr, use_axis_correction);
+#else
+                    const amrex::Real volume_factor = 1.0_rt;
+#endif
+                    jz_arr(i, j, k) += volume_factor*jz_tmp;
+                }
             }
         );
     }

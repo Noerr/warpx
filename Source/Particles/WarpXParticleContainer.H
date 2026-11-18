@@ -49,13 +49,14 @@
 #include <iosfwd>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 
 /** Real Particle Attributes stored in amrex::ParticleContainer's struct of array
  *
  *  x, y, z  : position components
- *  ux uy uz : normalized momentum components
+ *  ux uy uz : momentum components, stored as proper velocity, i.e. gamma*v
  *  w        : weight
  *  theta    : azimuthal angle
  *  phi      : polar angle, relative to the x-y plane
@@ -70,13 +71,13 @@ struct PIdx
     enum                          { x ,  z ,  w ,  ux ,  uy ,  uz,                 nattribs};
     static constexpr auto names = {"x", "z", "w", "ux", "uy", "uz"};
 #elif defined(WARPX_DIM_RZ)
-    enum                          { x ,  z ,  w ,  ux ,  uy ,  uz ,  theta,        nattribs};
+    enum                          { r ,  z ,  w ,  ux ,  uy ,  uz ,  theta,        nattribs};
     static constexpr auto names = {"r", "z", "w", "ux", "uy", "uz", "theta"};
 #elif defined(WARPX_DIM_RCYLINDER)
-    enum                          { x ,  w ,  ux ,  uy ,  uz ,  theta,             nattribs};
+    enum                          { r ,  w ,  ux ,  uy ,  uz ,  theta,             nattribs};
     static constexpr auto names = {"r", "w", "ux", "uy", "uz", "theta"};
 #elif defined(WARPX_DIM_RSPHERE)
-    enum                          { x ,  w ,  ux ,  uy ,  uz ,  theta ,  phi,      nattribs};
+    enum                          { r ,  w ,  ux ,  uy ,  uz ,  theta ,  phi,      nattribs};
     static constexpr auto names = {"r", "w", "ux", "uy", "uz", "theta", "phi"};
 #elif defined(WARPX_DIM_3D)
     enum                          { x ,  y,   z,   w,   ux,   uy,   uz,            nattribs};
@@ -115,7 +116,7 @@ public:
 
     WarpXParIter (ContainerType& pc, int level);
 
-    WarpXParIter (ContainerType& pc, int level, amrex::MFItInfo& info);
+    WarpXParIter (ContainerType& pc, int level, const amrex::MFItInfo& info);
 
     [[nodiscard]] const std::array<RealVector, PIdx::nattribs>& GetAttribs () const
     {
@@ -169,6 +170,21 @@ public:
 };
 
 /**
+ * \brief Field gather orders for PushP, when they are set explicitly rather than from
+ * the global WarpX::nox and WarpX::galerkin_interpolation settings.
+ *
+ * E is gathered with shape order e_shape and, if e_galerkin is true, one order lower
+ * along each component's own direction (i.e. the Galerkin scheme on the Yee grid).
+ * B is gathered with shape order b_shape and no order reduction.
+ */
+struct FieldGatherOrders
+{
+    int e_shape;
+    bool e_galerkin;
+    int b_shape;
+};
+
+/**
  * WarpXParticleContainer is the base polymorphic class from which all concrete
  * particle container classes (that store a collection of particles) derive. Derived
  * classes can be used for plasma particles, photon particles, or non-physical
@@ -207,7 +223,7 @@ public:
     // DiagnosticParticleData (see above) on this tile.
     using DiagnosticParticles = amrex::Vector<std::map<std::pair<int, int>, DiagnosticParticleData> >;
 
-    WarpXParticleContainer (amrex::AmrCore* amr_core, int ispecies);
+    WarpXParticleContainer (amrex::AmrCore* amr_core, int ispecies, const std::string& name);
     ~WarpXParticleContainer() override = default;
 
     // Move and copy operations
@@ -238,13 +254,36 @@ public:
                          ImplicitOptions const * implicit_options = nullptr) = 0;
 
     /**
+     * \brief Finish the implicit particle update at the end of a time step.
+     *
+     * The default implementation extrapolates position and momentum from
+     * time n+1/2 to n+1, which is appropriate for physical and laser particles.
+     *
+     * Photon particles override this to instead perform a full explicit
+     * push over the step (without deposition).
+     *
+     * \param fields  field register
+     * \param lev     AMR level
+     * \param t       time at end of the step (n+1)
+     * \param dt      step size on this level
+     */
+    virtual void FinishImplicitParticleUpdate (
+        ablastr::fields::MultiFabRegister& fields,
+        int lev, amrex::Real t, amrex::Real dt);
+
+    /** \brief Reset the particle data to the values at the start of the step
+     */
+    virtual void ResetImplicitParticleData (int lev);
+
+    /**
      * \brief virtual function to deposit mass matrices for charged particles
      */
     virtual void DepositMassMatrices (ablastr::fields::MultiFabRegister& fields,
                                       int lev,
-                                      amrex::Real dt)
+                                      amrex::Real dt,
+                                      ImplicitOptions const& implicit_options)
     {
-        amrex::ignore_unused(fields,lev,dt);
+        amrex::ignore_unused(fields,lev,dt,implicit_options);
     }
 
     virtual void PostRestart () = 0;
@@ -270,6 +309,8 @@ public:
 
     ///
     /// This pushes the particle momenta by dt.
+    /// If gather_orders is set, E and B are gathered with these orders instead of
+    /// WarpX::nox and WarpX::galerkin_interpolation (see FieldGatherOrders).
     ///
     virtual void PushP (int lev, amrex::Real dt,
                         const amrex::MultiFab& Ex,
@@ -278,7 +319,8 @@ public:
                         const amrex::MultiFab& Bx,
                         const amrex::MultiFab& By,
                         const amrex::MultiFab& Bz,
-                        MomentumPushType momentum_push_type = MomentumPushType::Full) = 0;
+                        MomentumPushType momentum_push_type = MomentumPushType::Full,
+                        std::optional<FieldGatherOrders> gather_orders = std::nullopt) = 0;
 
     /**
      * \brief Deposit current density.
@@ -290,32 +332,68 @@ public:
      *                          current positions of the particles. When different than 0,
      *                          the particle position will be temporarily modified to match
      *                          the time of the deposition.
+     * \param[in] push_type Type of particle push used with the deposition. With
+     *                      PushType::Implicit the time-centered velocities are used.
+     * \param[in] particle_shape Order of the particle shape factors used for the
+     *                           deposition (defaults to algo.particle_shape).
      */
     void DepositCurrent (ablastr::fields::MultiLevelVectorField const & J,
-                         amrex::Real dt, amrex::Real relative_time);
+                         amrex::Real dt, amrex::Real relative_time,
+                         PushType push_type = PushType::Explicit,
+                         std::optional<int> particle_shape = std::nullopt);
 
     /**
-     * \brief Deposit charge density.
+     * \brief Deposit current density, sum guard values, and apply boundary conditions.
      *
-     * \param[in,out] rho vector of charge densities (one pointer to MultiFab per mesh refinement level)
-     * \param[in] local if false, exchange the data in the guard cells after the deposition
-     * \param[in] reset if true, reset all values of rho to zero
-     * \param[in] apply_boundary_and_scale_volume whether to apply boundary conditions and scale the
-     *            final density by some volume norm in cylindrical and spherical geometry
+     * \param[in] mf_name Name of vector field in which current density should be deposited
+     * \param[in] lev Mesh refinement level for deposition
+     * \param[in] dt Time step for particle level
+     * \param[in] relative_time Time at which to deposit J, relative to the time of the
+     *                          current positions of the particles. When different than 0,
+     *                          the particle position will be temporarily modified to match
+     *                          the time of the deposition.
+     */
+    void DepositCurrentOnLevel (const std::string& mf_name, int lev,
+                                amrex::Real dt, amrex::Real relative_time);
+
+    /**
+     * \brief Deposit charge without physical boundary folding or radial volume scaling.
+     *
+     * \param[in,out] rho Charge deposits, one MultiFab per mesh refinement level.
+     * \param[in] local If false, sum overlapping valid- and guard-cell deposits.
+     * \param[in] reset If true, zero the deposited time component and its guard cells.
      * \param[in] interpolate_across_levels whether to average down from the fine patch to the coarse patch
      * \param[in] icomp component of the MultiFab where rho is deposited (old, new)
      */
     void DepositCharge (const ablastr::fields::MultiLevelScalarField& rho,
                         bool local = false, bool reset = false,
-                        bool apply_boundary_and_scale_volume = false,
                         bool interpolate_across_levels = true,
                         int icomp = 0);
-    void DepositCharge (amrex::MultiFab* rho, int lev,
+
+    /**
+     * \brief Deposit charge on one level without physical boundary folding or radial
+     *        volume scaling.
+     *
+     * \param[in,out] rho MultiFab receiving the charge deposits.
+     * \param[in] lev Mesh refinement level for deposition.
+     * \param[in] local If false, sum overlapping valid- and guard-cell deposits.
+     * \param[in] reset If true, zero the deposited time component and its guard cells.
+     * \param[in] icomp Time component of rho to deposit into (old or new).
+     */
+    void DepositChargeOnLevel (amrex::MultiFab* rho, int lev,
                         bool local = false, bool reset = false,
-                        bool apply_boundary_and_scale_volume = false,
                         int icomp = 0);
 
-    std::unique_ptr<amrex::MultiFab> GetChargeDensity(int lev, bool local = false);
+    /**
+     * \brief Deposit charge from this species on one level with optional summation and finalization.
+     *
+     * \param[in] lev Mesh refinement level for deposition.
+     * \param[in] local If false, sum overlapping valid- and guard-cell deposits.
+     * \param[in] finalize If true, apply physical boundary conditions and radial volume
+     *                     scaling to return physical charge density; requires local=false.
+     *                     If false, leave boundary handling and radial scaling to the caller.
+     */
+    std::unique_ptr<amrex::MultiFab> GetChargeDensityOnLevel (int lev, bool local, bool finalize);
 
     virtual void DepositCharge (WarpXParIter& pti,
                                RealVector const & wp,
@@ -344,7 +422,8 @@ public:
                                 int depos_lev,
                                 amrex::Real dt,
                                 amrex::Real relative_time,
-                                PushType push_type);
+                                PushType push_type,
+                                int particle_shape);
     /**
      * \brief Accumulate velocity moments for matched temperature deposition using particle shapes
      *
@@ -380,13 +459,15 @@ public:
         [[maybe_unused]]const warpx::particles::deposition::TemperatureDepositionPass pass)
     {}
 
-    void DepositTotalNGPTemperature (amrex::MultiFab* temperature, const int lev);
-    std::unique_ptr<amrex::MultiFab> GetAverageNGPTemperature (int lev);
+    void DepositTotalNGPTemperature (int lev);
+    void CalculateNuei(amrex::MultiFab & species_nuei,
+                       WarpXParticleContainer const & electron_species, int lev);
+    std::unique_ptr<amrex::MultiFab> GetDebyeLength (int lev);
 
-    void DepositNumberDensity (amrex::MultiFab* number_density, const int lev);
+    void DepositNumberDensity (amrex::MultiFab* number_density, int lev);
     std::unique_ptr<amrex::MultiFab> GetNumberDensity (int lev);
 
-    std::unique_ptr<amrex::MultiFab> GetDebyeLength (int lev);
+    std::unique_ptr<amrex::MultiFab> GetPlasmaFrequency (int lev);
 
     void DepositMassMatrices (WarpXParIter& pti,
                         const RealVector& wp,
@@ -410,7 +491,8 @@ public:
                               int thread_num,
                               int lev,
                               int depos_lev,
-                              amrex::Real dt);
+                              amrex::Real dt,
+                              ImplicitOptions const& implicit_options);
 
     // If particles start outside of the domain, ContinuousInjection
     // makes sure that they are initialized when they enter the domain, and
@@ -445,7 +527,19 @@ public:
 
     std::array<amrex::ParticleReal, 3> meanParticleVelocity(bool local = false);
 
-    amrex::ParticleReal maxParticleVelocity(bool local = false);
+    amrex::ParticleReal maxParticleDtInv(bool local = false);
+
+    /**
+     * \brief Map the momentum of the particles to and from the curvilinear frame.
+     *        This is equivalent to mapping to the X-axis, i.e. theta = 0
+     *        cylinderical and theta = phi = 0 for spherical. This mapping is used
+     *        for binary collisions to put the colliding particles in a spatially local
+     *        frame.
+     *
+     * \param[in] forward When true, maps to the frame, when false maps from the frame
+     *            to the original location
+     */
+    void TransformMomentumToCurvilinear (bool forward);
 
     /**
      * \brief Adds n particles to the simulation
@@ -503,6 +597,7 @@ public:
     void ApplyBoundaryConditions ();
 
     bool do_splitting = false;
+
     int do_not_deposit = 0;
     bool initialize_self_fields = false;
     amrex::Real self_fields_required_precision = amrex::Real(1.e-11);
@@ -532,9 +627,17 @@ public:
         return m_do_back_transformed_particles;
     }
 
-    amrex::ParticleReal getCharge () const {return charge;}
+    amrex::ParticleReal getCharge () const {return m_charge;}
 
     amrex::ParticleReal getMass () const {return m_mass;}
+
+    /** Thermal velocity (normalized by c) used by thermal particle boundaries
+     *  for this species, parsed from ``boundary.\<species_name\>.u_th``.
+     */
+    amrex::ParticleReal getBoundaryThermalVelocity () const
+    {
+        return static_cast<amrex::ParticleReal>(m_boundary_conditions.data.m_uth);
+    }
 
     int DoFieldIonization() const { return do_field_ionization; }
 
@@ -543,6 +646,7 @@ public:
     virtual bool has_quantum_sync() const {return false;}
     virtual bool has_breit_wheeler() const {return false;}
     virtual bool has_virtual_photons() const {return false;}
+    virtual bool has_virtual_photons_beam_size_effect() const {return false;}
     virtual int getVirtualPhotonSpeciesIndex() const { return -1; }
     int DoQED() const { return has_quantum_sync() || has_breit_wheeler(); }
 #else
@@ -598,14 +702,17 @@ public:
     bool HasiAttrib (const std::string& name)
     {
         std::vector<std::string> const & int_names = GetIntSoANames();
-        auto const pos = std::find(int_names.begin(), int_names.end(), name);
+        auto const pos = std::ranges::find(int_names, name);
         return (pos != int_names.end());
     }
 
+    std::string const & getName() { return species_name; }
+
 protected:
     int species_id;
+    std::string species_name;
 
-    amrex::ParticleReal charge;
+    amrex::ParticleReal m_charge;
     amrex::ParticleReal m_mass;
     PhysicalSpecies physical_species = PhysicalSpecies::unspecified;
 

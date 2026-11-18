@@ -43,7 +43,7 @@ public:
   using ParticleContainer = typename WarpXParticleContainer::ContainerLike<amrex::PolymorphicArenaAllocator>;
   using ParticleIter = typename amrex::ParIterSoA<PIdx::nattribs, 0, amrex::PolymorphicArenaAllocator>;
 
-  WarpXParticleCounter (ParticleContainer* pc);
+  explicit WarpXParticleCounter (ParticleContainer* pc);
   [[nodiscard]] unsigned long GetTotalNumParticles () const {return m_Total;}
 
   std::vector<unsigned long long> m_ParticleOffsetAtRank;
@@ -223,6 +223,7 @@ private:
       amrex::Geometry const& full_geom,
       std::string const& comp_name,
       std::string const& field_name,
+      int meshLevel,
       amrex::MultiFab const& mf,
       bool var_in_theta_mode
   ) const;

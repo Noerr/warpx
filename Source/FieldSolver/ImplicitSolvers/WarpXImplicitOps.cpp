@@ -11,6 +11,7 @@
 #include "Diagnostics/ReducedDiags/MultiReducedDiags.H"
 #include "Fields.H"
 #include "FieldSolver/FiniteDifferenceSolver/FiniteDifferenceSolver.H"
+#include "FieldSolver/ImplicitSolvers/ImplicitOptions.H"
 #include "Parallelization/GuardCellManager.H"
 #include "Particles/MultiParticleContainer.H"
 #include "Particles/ParticleBoundaryBuffer.H"
@@ -22,7 +23,6 @@
 
 #include <ablastr/profiler/ProfilerWrapper.H>
 #include <ablastr/utils/SignalHandling.H>
-#include <ablastr/warn_manager/WarnManager.H>
 
 #include <AMReX.H>
 #include <AMReX_Array.H>
@@ -79,12 +79,23 @@ WarpX::UpdateMagneticFieldAndApplyBCs( ablastr::fields::MultiLevelVectorField co
 }
 
 void
-WarpX::FinishMagneticFieldAndApplyBCs( ablastr::fields::MultiLevelVectorField const& a_Bn,
-                                       amrex::Real a_theta, amrex::Real a_time )
+WarpX::FinishElectricFieldAndApplyBCs(amrex::Real a_theta, amrex::Real a_time)
 {
     using warpx::fields::FieldType;
 
-    FinishImplicitField(m_fields.get_mr_levels_alldirs(FieldType::Bfield_fp, 0), a_Bn, a_theta);
+    ablastr::fields::MultiLevelVectorField const & En = m_fields.get_mr_levels_alldirs(FieldType::E_old, 0);
+    FinishImplicitField(m_fields.get_mr_levels_alldirs(FieldType::Efield_fp, 0), En, a_theta);
+    ApplyEfieldBoundary(0, PatchType::fine, a_time);
+    FillBoundaryE(guard_cells.ng_alloc_EB, WarpX::sync_nodal_points);
+}
+
+void
+WarpX::FinishMagneticFieldAndApplyBCs(amrex::Real a_theta, amrex::Real a_time)
+{
+    using warpx::fields::FieldType;
+
+    ablastr::fields::MultiLevelVectorField const & Bn = m_fields.get_mr_levels_alldirs(FieldType::B_old, 0);
+    FinishImplicitField(m_fields.get_mr_levels_alldirs(FieldType::Bfield_fp, 0), Bn, a_theta);
     ApplyBfieldBoundary(0, PatchType::fine, SubcyclingHalf::None, a_time);
     FillBoundaryB(guard_cells.ng_alloc_EB, WarpX::sync_nodal_points);
 }
@@ -207,77 +218,39 @@ WarpX::SaveParticlesAtImplicitStepStart ( )
 }
 
 void
-WarpX::FinishImplicitParticleUpdate ()
+WarpX::FinishImplicitParticleUpdate (amrex::Real time, amrex::Real a_dt)
 {
     using namespace amrex::literals;
 
     // The implicit advance routines use the time-centered position and
     // momentum to advance the system in time. Thus, at the end of the
     // step we need to transform the particle postion and momentum from
-    // time n+1/2 to time n+1. This is done here.
+    // time n+1/2 to time n+1. This is done here via virtual dispatch:
+    // photon particles call Evolve; all other particles extrapolate position
+    // and momentum.
 
-    for (auto const& pc : *mypc) {
+    // Explicit particle updates (e.g., photons) need the actual implicit substep duration.
+    // Preserve the per-level timestep ratios when scaling the outer timestep.
+    amrex::Real const dt_scale = a_dt/dt[0];
 
-        for (int lev = 0; lev <= finest_level; ++lev) {
-#ifdef AMREX_USE_OMP
-#pragma omp parallel
-#endif
-            {
-
-            auto particle_comps = pc->GetRealSoANames();
-
-            for (WarpXParIter pti(*pc, lev); pti.isValid(); ++pti) {
-
-                const auto getPosition = GetParticlePosition(pti);
-                const auto setPosition = SetParticlePosition(pti);
-
-                auto& attribs = pti.GetAttribs();
-                amrex::ParticleReal* const AMREX_RESTRICT ux = attribs[PIdx::ux].dataPtr();
-                amrex::ParticleReal* const AMREX_RESTRICT uy = attribs[PIdx::uy].dataPtr();
-                amrex::ParticleReal* const AMREX_RESTRICT uz = attribs[PIdx::uz].dataPtr();
-
-#if !defined(WARPX_DIM_1D_Z)
-                amrex::ParticleReal* x_n = pti.GetAttribs("x_n").dataPtr();
-#endif
-#if defined(WARPX_DIM_3D) || defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE)
-                amrex::ParticleReal* y_n = pti.GetAttribs("y_n").dataPtr();
-#endif
-#if !defined(WARPX_DIM_RCYLINDER)
-                amrex::ParticleReal* z_n = pti.GetAttribs("z_n").dataPtr();
-#endif
-                amrex::ParticleReal* ux_n = pti.GetAttribs("ux_n").dataPtr();
-                amrex::ParticleReal* uy_n = pti.GetAttribs("uy_n").dataPtr();
-                amrex::ParticleReal* uz_n = pti.GetAttribs("uz_n").dataPtr();
-
-                const long np = pti.numParticles();
-
-                amrex::ParallelFor( np, [=] AMREX_GPU_DEVICE (long ip)
-                {
-                    amrex::ParticleReal xp, yp, zp;
-                    getPosition(ip, xp, yp, zp);
-
-#if !defined(WARPX_DIM_1D_Z)
-                    xp = 2._rt*xp - x_n[ip];
-#endif
-#if defined(WARPX_DIM_3D) || defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE)
-                    yp = 2._rt*yp - y_n[ip];
-#endif
-#if !defined(WARPX_DIM_RCYLINDER)
-                    zp = 2._rt*zp - z_n[ip];
-#endif
-
-                    ux[ip] = 2._rt*ux[ip] - ux_n[ip];
-                    uy[ip] = 2._rt*uy[ip] - uy_n[ip];
-                    uz[ip] = 2._rt*uz[ip] - uz_n[ip];
-
-                    setPosition(ip, xp, yp, zp);
-                });
-
-            }
-            }
-
+    for (int lev = 0; lev <= finest_level; ++lev) {
+        for (auto const& pc : *mypc) {
+            pc->FinishImplicitParticleUpdate(m_fields, lev, time, dt[lev]*dt_scale);
         }
+    }
 
+}
+
+void
+WarpX::ResetImplicitParticleData ()
+{
+    using namespace amrex::literals;
+
+    // Reset the particle data when starting substepping.
+    for (int lev = 0; lev <= finest_level; ++lev) {
+        for (auto const& pc : *mypc) {
+            pc->ResetImplicitParticleData(lev);
+        }
     }
 
 }
@@ -334,16 +307,32 @@ WarpX::FinishImplicitField( ablastr::fields::MultiLevelVectorField const& Field_
 }
 
 void
-WarpX::DepositMassMatrices ( )
+WarpX::DepositMassMatrices (amrex::Real a_dt, ImplicitOptions const& implicit_options)
 {
     ABLASTR_PROFILE("WarpX::DepositMassMatrices()");
+
+    for (int dir = 0; dir < AMREX_SPACEDIM; ++dir) {
+        // RSPHERE only deposits the radial (xx) mass matrix.
+        bool initialized = implicit_options.ncomp_xx[dir] > 0;
+#if !defined(WARPX_DIM_RSPHERE)
+        initialized = initialized && implicit_options.ncomp_yy[dir] > 0
+                                  && implicit_options.ncomp_zz[dir] > 0;
+#endif
+        WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
+            initialized,
+            "DepositMassMatrices requires initialized mass-matrix component counts. "
+            "Call InitData before depositing mass matrices.");
+    }
+
+    amrex::Real const dt_scale = a_dt/dt[0];
 
     for (int lev = 0; lev <= finest_level; ++lev)
     {
         mypc->DepositMassMatrices(
             m_fields,
             lev,
-            dt[lev]
+            dt[lev]*dt_scale,
+            implicit_options
         );
     }
 
@@ -390,14 +379,14 @@ WarpX::ImplicitComputeRHSE (int lev, PatchType patch_type, amrex::Real a_dt, War
                                         lev,
                                         patch_type,
                                         a_Erhs_vec.getArrayVec()[lev],
-                                        m_eb_update_E[lev],
+                                        m_eb_update_E_fp[lev],
                                         a_dt );
     } else {
         m_fdtd_solver_cp[lev]->EvolveE( m_fields,
                                         lev,
                                         patch_type,
                                         a_Erhs_vec.getArrayVec()[lev],
-                                        m_eb_update_E[lev],
+                                        m_eb_update_E_cp[lev],
                                         a_dt );
     }
 

@@ -8,11 +8,14 @@ foreach(D IN LISTS WarpX_DIMS)
       PRIVATE
         # callback hooks
         callbacks.cpp
+        GIL.cpp
     )
     if(WarpX_PYTHON)
         target_sources(pyWarpX_${SD}
           PRIVATE
             # pybind11
+            Config.cpp
+            ImplicitSolver.cpp
             MultiFabRegister.cpp
             WarpX.cpp
         )

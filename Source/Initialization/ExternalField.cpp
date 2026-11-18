@@ -15,7 +15,7 @@
 
 #include <AMReX_BaseFabUtility.H>
 
-#if defined(WARPX_USE_OPENPMD) && !defined(WARPX_DIM_RCYLINDER) && !defined(WARPX_DIM_RSPHERE)
+#if defined(WARPX_USE_OPENPMD) && !defined(WARPX_DIM_RCYLINDER)
 #   include <openPMD/openPMD.hpp>
 #endif
 
@@ -71,9 +71,20 @@ ExternalFieldParams::ExternalFieldParams(const amrex::ParmParse& pp_warpx)
     // default values of E_external_grid and B_external_grid
     // are used to set the E and B field when "constant" or
     // "parser" is not explicitly used in the input.
+#if defined(WARPX_DIM_RSPHERE)
+    std::string B_ext_grid_s = "none";
+    pp_warpx.query("B_ext_grid_init_style", B_ext_grid_s);
+    std::transform(B_ext_grid_s.begin(), B_ext_grid_s.end(), B_ext_grid_s.begin(), ::tolower);
+    WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
+        B_ext_grid_s == "none",
+        "RSPHERE does not support external magnetic fields: "
+        "warpx.B_ext_grid_init_style must be none.");
+    B_ext_grid_type = ExternalFieldType::default_zero;
+#else
     std::string B_ext_grid_s;
     pp_warpx.query("B_ext_grid_init_style", B_ext_grid_s);
     B_ext_grid_type = string_to_external_field_type<EMFieldType::B>(B_ext_grid_s);
+#endif
 
     std::string E_ext_grid_s;
     pp_warpx.query("E_ext_grid_init_style", E_ext_grid_s);
@@ -86,10 +97,22 @@ ExternalFieldParams::ExternalFieldParams(const amrex::ParmParse& pp_warpx)
     // if the input string is "constant", the values for the
     // external grid must be provided in the input.
     auto v_B = std::vector<amrex::Real>(3);
+#if defined(WARPX_DIM_RSPHERE)
+    utils::parser::queryArrWithParser(pp_warpx, "B_external_grid", v_B);
+#else
     if (B_ext_grid_type == ExternalFieldType::constant) {
         utils::parser::getArrWithParser(pp_warpx, "B_external_grid", v_B);
     }
+#endif
     std::copy(v_B.begin(), v_B.end(), B_external_grid.begin());
+#if defined(WARPX_DIM_RSPHERE)
+    WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
+        B_external_grid[0] == 0. &&
+        B_external_grid[1] == 0. &&
+        B_external_grid[2] == 0.,
+        "RSPHERE does not support external magnetic fields: "
+        "warpx.B_external_grid must be 0 0 0.");
+#endif
 
     // if the input string is "constant", the values for the
     // external grid must be provided in the input.
@@ -184,8 +207,7 @@ ExternalFieldParams::ExternalFieldParams(const amrex::ParmParse& pp_warpx)
     //
     if (E_ext_grid_type == ExternalFieldType::read_from_file ||
         B_ext_grid_type == ExternalFieldType::read_from_file){
-            const std::string read_fields_from_path="./";
-            pp_warpx.query("read_fields_from_path", external_fields_path);
+            pp_warpx.get("read_fields_from_path", external_fields_path);
     }
     //___________________________________________________________________________
 }
@@ -207,20 +229,20 @@ ExternalFieldReader::ExternalFieldReader (
 
 void ExternalFieldReader::load_data (amrex::RealBox const& pbox)
 {
-#if defined(WARPX_USE_OPENPMD) && !defined(WARPX_DIM_RCYLINDER) && !defined(WARPX_DIM_RSPHERE)
+#if defined(WARPX_USE_OPENPMD) && !defined(WARPX_DIM_RCYLINDER)
     using namespace amrex;
 
     auto series = openPMD::Series(m_file, openPMD::Access::READ_ONLY);
     auto iseries = series.iterations.begin()->second;
     auto F = iseries.meshes[m_name];
 
-    bool c_order = F.getAttribute("dataOrder").get<std::string>() == "C";
+    const bool c_order = F.getAttribute("dataOrder").get<std::string>() == "C";
     amrex::ignore_unused(c_order);
 
     auto axisLabels = F.getAttribute("axisLabels").get<std::vector<std::string>>();
     auto fileGeom = F.getAttribute("geometry").get<std::string>();
 
-    bool xyz_order = true;
+    bool xyz_order = true; //NOLINT (misc-const-correctness)
 
 #if defined(WARPX_DIM_3D)
     WARPX_ALWAYS_ASSERT_WITH_MESSAGE(fileGeom == "cartesian", "3D can only read from files with cartesian geometry");
@@ -249,6 +271,13 @@ void ExternalFieldReader::load_data (amrex::RealBox const& pbox)
     } else {
         WARPX_ABORT_WITH_MESSAGE("RZ expects axisLabels {r, z} or {z, r}");
     }
+#elif defined(WARPX_DIM_RSPHERE)
+    WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
+        fileGeom == "spherical",
+        "RSPHERE requires an openPMD mesh with spherical geometry.");
+    WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
+        axisLabels.size() == 1 && axisLabels[0] == "r",
+        "RSPHERE requires exactly one mesh axis labeled 'r'.");
 #elif defined(WARPX_DIM_1D_Z)
     WARPX_ALWAYS_ASSERT_WITH_MESSAGE(fileGeom == "cartesian", "1D3V can only read from files with cartesian geometry");
     WARPX_ALWAYS_ASSERT_WITH_MESSAGE(axisLabels.at(0) == "z", "1D3V expects axisLabel {z}");
@@ -288,11 +317,11 @@ void ExternalFieldReader::load_data (amrex::RealBox const& pbox)
     WARPX_ALWAYS_ASSERT_WITH_MESSAGE(extent.size() == 3 && extent[0] == 1,
                                      "External field reading is not implemented for more than one RZ mode (see #3829)");
     if (xyz_order) {
-        m_size[0] = extent[1];
-        m_size[1] = extent[2];
+        m_size[0] = static_cast<int>(extent[1]);
+        m_size[1] = static_cast<int>(extent[2]);
     } else {
-        m_size[0] = extent[2];
-        m_size[1] = extent[1];
+        m_size[0] = static_cast<int>(extent[2]);
+        m_size[1] = static_cast<int>(extent[1]);
     }
 #else
     WARPX_ALWAYS_ASSERT_WITH_MESSAGE(extent.size() == AMREX_SPACEDIM,
@@ -390,12 +419,17 @@ void ExternalFieldReader::load_data (amrex::RealBox const& pbox)
 #endif
 
     if (has_load) {
-        m_FC_data_cpu = FC.loadChunk<double>(chunk_offset,chunk_extent);
+        const auto num_cells = std::accumulate(chunk_extent.begin(), chunk_extent.end(),
+                                               1, std::multiplies<>());
+        m_FC_data_cpu.reset(
+            reinterpret_cast<double*>(amrex::The_Pinned_Arena()->alloc(num_cells*sizeof(double))),
+            [](double *p){ amrex::The_Pinned_Arena()->free(reinterpret_cast<void*>(p)); });
+        FC.loadChunk<double>(m_FC_data_cpu, chunk_offset, chunk_extent);
     }
     series.flush();
 
     if (has_load) {
-        Box box(lo,hi);
+        const Box box(lo,hi);
 #ifdef AMREX_USE_GPU
         m_fab.resize(box, 1);
         Gpu::htod_memcpy_async(m_fab.dataPtr(), m_FC_data_cpu.get(), m_fab.nBytes());
@@ -429,7 +463,7 @@ void ExternalFieldReader::load_data (amrex::RealBox const& pbox)
 
 #else
     amrex::ignore_unused(pbox);
-    WARPX_ABORT_WITH_MESSAGE("ExternalFieldReader requires openPMD and it is not supported for 1D RCYLINDER and RSPHERE");
+    WARPX_ABORT_WITH_MESSAGE("ExternalFieldReader requires openPMD and it is not supported for 1D RCYLINDER");
 #endif
 }
 
@@ -482,7 +516,7 @@ void ExternalFieldReader::prepare (amrex::BoxArray const& grids,
             }
             bl.push_back(box);
         }
-        BoxArray ba(std::move(bl));
+        const BoxArray ba(std::move(bl));
         FabArray<BaseFab<double>> tmpmf(ba,dmap,1,0);
         tmpmf.ParallelCopy(m_mf);
         m_mf = std::move(tmpmf);
@@ -494,13 +528,13 @@ void ExternalFieldReader::prepare (amrex::BoxArray const& grids,
 void ExternalFieldReader::make_cache_box (amrex::RealBox const& pbox, int moving_dir, int moving_sign)
 {
     m_cache_domain = pbox;
-    int dir = std::abs(moving_dir);
-    amrex::Real factor = 10.0;
+    const int dir = std::abs(moving_dir);
+    const amrex::Real factor = 10.0;
     if (moving_sign > 0) {
-        amrex::Real newhi = m_cache_domain.hi(dir) + factor*m_cache_domain.length(dir);
+        const amrex::Real newhi = m_cache_domain.hi(dir) + factor*m_cache_domain.length(dir);
         m_cache_domain.setHi(dir, newhi);
     } else {
-        amrex::Real newlo = m_cache_domain.lo(dir) - factor*m_cache_domain.length(dir);
+        const amrex::Real newlo = m_cache_domain.lo(dir) - factor*m_cache_domain.length(dir);
         m_cache_domain.setLo(dir, newlo);
     }
     // Grow the box a little bit so that m_cache_domain.contains(pbox) is true.
@@ -547,19 +581,19 @@ ExternalFieldView ExternalFieldReader::getView (int li) const
     }
 }
 
-ExternalFieldView ExternalFieldReader::getView () const
+ExternalFieldView ExternalFieldReader::getView () const noexcept
 {
     return make_view(m_fab);
 }
 
-ExternalFieldView ExternalFieldReader::make_view (amrex::BaseFab<double> const& fab) const
+ExternalFieldView ExternalFieldReader::make_view (amrex::BaseFab<double> const& fab) const noexcept
 {
     ExternalFieldView view;
     view.dx = m_dx;
     view.offset = m_offset;
     view.global_size = m_size;
 
-    auto* p = fab.dataPtr();
+    const auto* p = fab.dataPtr();
     if (p) {
         auto const& b = fab.box();
         view.table = decltype(view.table)(const_cast<double*>(p),
@@ -577,3 +611,22 @@ ExternalFieldView ExternalFieldReader::make_view (amrex::BaseFab<double> const& 
     }
     return view;
 }
+
+#if defined(WARPX_USE_OPENPMD) && !defined(WARPX_DIM_RZ) && \
+    !defined(WARPX_DIM_RCYLINDER) && !defined(WARPX_DIM_RSPHERE)
+ExternalFieldVectorView::ExternalFieldVectorView (
+    ExternalFieldReader const* x_reader,
+    ExternalFieldReader const* y_reader,
+    ExternalFieldReader const* z_reader) noexcept
+{
+    if (x_reader) {
+        m_x_view = x_reader->getView();
+    }
+    if (y_reader) {
+        m_y_view = y_reader->getView();
+    }
+    if (z_reader) {
+        m_z_view = z_reader->getView();
+    }
+}
+#endif

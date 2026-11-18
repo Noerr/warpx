@@ -6,13 +6,16 @@
  */
 #include "WarpXOpenPMD.H"
 
+#include "Particles/MultiParticleContainer.H"
 #include "Particles/ParticleIO.H"
 #include "Diagnostics/ParticleDiag/ParticleDiag.H"
 #include "FieldIO.H"
 #include "Particles/Filter/FilterFunctors.H"
+#include "Utils/Algorithms/IsIn.H"
 #include "Utils/TextMsg.H"
 #include "Utils/Parser/ParserUtils.H"
 #include "Utils/WarpXAlgorithmSelection.H"
+#include "Utils/WarpXConst.H"
 #include "WarpX.H"
 #include "OpenPMDHelpFunction.H"
 
@@ -48,8 +51,10 @@
 #include <regex>
 #include <set>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 namespace detail
 {
@@ -341,11 +346,70 @@ namespace detail
         }
     }
 
+    /** \brief Check if a field name is a per-species field of the form `<prefix><species>`
+     *
+     * @param[in] field_name    name of the field, without mesh-refinement level suffix
+     * @param[in] prefix        expected prefix, e.g., "T_"
+     * @param[in] species_names names of all particle species in the simulation
+     * @return true if field_name is prefix followed by the name of a species
+     */
+    inline bool
+    isPerSpeciesField ( std::string const & field_name,
+                        std::string const & prefix,
+                        std::vector<std::string> const & species_names )
+    {
+        return field_name.starts_with(prefix) &&
+            utils::algorithms::is_in(species_names, field_name.substr(prefix.size()));
+    }
+
+    /** \brief Check if a field name is a per-direction species temperature `T<dir>_<species>`
+     *
+     * These are deposited for the hybrid-PIC solver. The direction labels are
+     * those that FullDiagnostics uses for the geometry of this build:
+     * x,y,z in Cartesian, r,t,z in RZ/RCYLINDER, r,t,p in RSPHERE.
+     *
+     * @param[in] field_name    name of the field, without mesh-refinement level suffix
+     * @param[in] species_names names of all particle species in the simulation
+     * @return true if field_name is `T<dir>_<species>`
+     */
+    inline bool
+    isPerDirectionTemperature ( std::string const & field_name,
+                                std::vector<std::string> const & species_names )
+    {
+#if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER)
+        constexpr std::string_view directions = "rtz";
+#elif defined(WARPX_DIM_RSPHERE)
+        constexpr std::string_view directions = "rtp";
+#else
+        constexpr std::string_view directions = "xyz";
+#endif
+        return std::any_of(directions.begin(), directions.end(),
+            [&](char const dir) {
+                return isPerSpeciesField(field_name, std::string{'T', dir, '_'}, species_names);
+            });
+    }
+
     /** \brief For a given field that is to be written to an openPMD file,
      * set the metadata that indicates the physical unit.
+     *
+     * Temperatures are matched by exact name (prefix plus species name), not by
+     * a "T" prefix alone, so that other fields starting with "T" are not tagged.
+     * Fields are only identified by name: a user-defined particle field named
+     * like a temperature output (e.g., `T`, written as `T_<species>`) will be
+     * tagged as a temperature, too. For `T_<species>`, this includes the
+     * unitSI of q_e/k_B, so readers that apply unitSI scale the values of such
+     * a user-defined field by about 11604.5.
+     *
+     * @param[in] mesh          openPMD mesh record of the field
+     * @param[in] mesh_comp     openPMD mesh record component of the field
+     * @param[in] field_name    name of the field, without mesh-refinement level suffix
+     * @param[in] species_names names of all particle species in the simulation
      */
     inline void
-    setOpenPMDUnit ( openPMD::Mesh mesh, const std::string& field_name )
+    setOpenPMDUnit ( openPMD::Mesh mesh,
+                     openPMD::MeshRecordComponent mesh_comp,
+                     std::string const & field_name,
+                     std::vector<std::string> const & species_names )
     {
         if (field_name[0] == 'E'){  // Electric field
             mesh.setUnitDimension({
@@ -365,11 +429,24 @@ namespace detail
                                           {openPMD::UnitDimension::L, -2},
                                           {openPMD::UnitDimension::I,  1},
                                   });
-        } else if (field_name.substr(0,3) == "rho"){ // charge density
+        } else if (field_name.starts_with("rho")){ // charge density
             mesh.setUnitDimension({
                                           {openPMD::UnitDimension::L, -3},
                                           {openPMD::UnitDimension::I,  1},
                                           {openPMD::UnitDimension::T,  1},
+                                  });
+        } else if (isPerSpeciesField(field_name, "T_", species_names)){
+            // species temperature T_<species>, stored in eV: readers multiply by unitSI to get K
+            mesh.setUnitDimension({{openPMD::UnitDimension::theta, 1}});
+            mesh_comp.setUnitSI(PhysConst::q_e_v<double> / PhysConst::kb_v<double>);
+        } else if (field_name == "Te" || isPerDirectionTemperature(field_name, species_names)){
+            // hybrid-PIC electron temperature Te and per-direction temperatures, stored in K
+            mesh.setUnitDimension({{openPMD::UnitDimension::theta, 1}});
+        } else if (field_name == "Pe"){ // hybrid-PIC electron pressure, stored in Pa
+            mesh.setUnitDimension({
+                                          {openPMD::UnitDimension::L, -1},
+                                          {openPMD::UnitDimension::M,  1},
+                                          {openPMD::UnitDimension::T, -2},
                                   });
         }
     }
@@ -448,17 +525,6 @@ void WarpXOpenPMDPlot::SetStep (int ts, const std::string& dirPrefix, int file_m
 
     m_dirPrefix = dirPrefix;
     m_file_min_digits = file_min_digits;
-
-    if( ! isBTD ) {
-        if (m_CurrentStep >= ts) {
-            // note m_Series is reset in Init(), so using m_Series->iterations.contains(ts) is only able to check the
-            // last written step in m_Series's life time, but not other earlier written steps by other m_Series
-            ablastr::warn_manager::WMRecordWarning("Diagnostics",
-                    " Warning from openPMD writer: Already written iteration:"
-                    + std::to_string(ts)
-                );
-        }
-    }
 
     m_CurrentStep = ts;
     Init(openPMD::Access::CREATE, isBTD);
@@ -608,6 +674,12 @@ for (const auto & particle_diag : particle_diags) {
     if ( particle_diag.m_plot_phi ) {
         storePhiOnParticles( tmp, WarpX::electrostatic_solver_id, !use_pinned_pc );
     }
+    if (particle_diag.m_plot_Ex || particle_diag.m_plot_Ey || particle_diag.m_plot_Ez ||
+        particle_diag.m_plot_Bx || particle_diag.m_plot_By || particle_diag.m_plot_Bz) {
+        storeFieldOnParticles(tmp, !use_pinned_pc,
+                              particle_diag.m_plot_Ex, particle_diag.m_plot_Ey, particle_diag.m_plot_Ez,
+                              particle_diag.m_plot_Bx, particle_diag.m_plot_By, particle_diag.m_plot_Bz);
+    }
 
     // names of amrex::ParticleReal and int particle attributes in SoA data
     auto const rn = tmp.GetRealSoANames();
@@ -645,8 +717,55 @@ for (const auto & particle_diag : particle_diags) {
         real_names[i] = ::detail::snakeToCamel(rn[i]);
     }
 
-    amrex::Vector<int> real_flags = particle_diag.m_plot_flags;
-    real_flags.resize(tmp.NumRealComps());
+    // The flags in `real_flags` index into `real_names` (openPMD-order),
+    // whereas `particle_diag.m_plot_flags` indexes into the WarpX SoA
+    // (PIdx-order). For Cartesian geometries (1D Z, 2D XZ, 3D) the two
+    // orderings coincide for the first PIdx::nattribs entries. For
+    // cylindrical and spherical geometries openPMD reports Cartesian
+    // (x, y, z) positions reconstructed from the SoA's (r, theta, [phi], z),
+    // so the position part of the flags has to be remapped here. Without
+    // this remap, downstream indexing (e.g. `getParticlePositionComponentLabels`
+    // and the position-reconstruction block in `SaveRealProperty`) would
+    // pick up unrelated flags such as the weighting or z flags, which can
+    // both produce wrong output and can cause out-of-bounds accesses in SoAs
+    // (the latter because the reconstruction buffer was sized by a flag that
+    // does not match the flag guarding the write).
+    amrex::Vector<int> real_flags(tmp.NumRealComps(), 0);
+#if defined(WARPX_DIM_RZ)
+    real_flags[0] = particle_diag.m_plot_flags[PIdx::r];
+    real_flags[1] = particle_diag.m_plot_flags[PIdx::theta];
+    real_flags[2] = particle_diag.m_plot_flags[PIdx::z];
+    real_flags[3] = particle_diag.m_plot_flags[PIdx::w];
+    real_flags[4] = particle_diag.m_plot_flags[PIdx::ux];
+    real_flags[5] = particle_diag.m_plot_flags[PIdx::uy];
+    real_flags[6] = particle_diag.m_plot_flags[PIdx::uz];
+#elif defined(WARPX_DIM_RCYLINDER)
+    real_flags[0] = particle_diag.m_plot_flags[PIdx::r];
+    real_flags[1] = particle_diag.m_plot_flags[PIdx::theta];
+    // note: z is unspecified (for specific values, can be assumed to be zero)
+    real_flags[2] = particle_diag.m_plot_flags[PIdx::w];
+    real_flags[3] = particle_diag.m_plot_flags[PIdx::ux];
+    real_flags[4] = particle_diag.m_plot_flags[PIdx::uy];
+    real_flags[5] = particle_diag.m_plot_flags[PIdx::uz];
+#elif defined(WARPX_DIM_RSPHERE)
+    real_flags[0] = particle_diag.m_plot_flags[PIdx::r];
+    real_flags[1] = particle_diag.m_plot_flags[PIdx::theta];
+    real_flags[2] = particle_diag.m_plot_flags[PIdx::phi];
+    // note: z can be determined from r, theta and phi
+    real_flags[3] = particle_diag.m_plot_flags[PIdx::w];
+    real_flags[4] = particle_diag.m_plot_flags[PIdx::ux];
+    real_flags[5] = particle_diag.m_plot_flags[PIdx::uy];
+    real_flags[6] = particle_diag.m_plot_flags[PIdx::uz];
+#else
+    for (int i = 0; i < static_cast<int>(PIdx::nattribs); ++i) {
+        real_flags[i] = particle_diag.m_plot_flags[i];
+    }
+    // note: For 2D Cartesian (xz), y is unspecified
+    //       (for specific values, can be assumed to be zero).
+    //       For 1D Cartesian (z), the same applies for x,y.
+#endif
+    // For extra runtime attributes (beyond PIdx::nattribs), the openPMD
+    // index coincides with the SoA index, so we forward the existing flag.
     for (size_t index = PIdx::nattribs; index < rn.size(); ++index) {
         real_flags[index] = tmp.h_redistribute_real_comp[index];
     }
@@ -676,7 +795,7 @@ for (const auto & particle_diag : particle_diags) {
 void
 WarpXOpenPMDPlot::FlushBTDToDisk()
 {
-    bool isBTD = true;
+    constexpr bool isBTD = true;
     auto hasOption = m_OpenPMDoptions.find("FlattenSteps");
     const bool flattenSteps = (m_Series->backend() == "ADIOS2") && (hasOption != std::string::npos);
 
@@ -970,6 +1089,11 @@ WarpXOpenPMDPlot::SaveRealProperty (ParticleIter& pti,
     {
         auto const real_counter = std::min(write_real_comp.size(), real_comp_names.size());
 
+        // `write_real_comp` is the `real_flags` array built by
+        // `WriteOpenPMDParticles` and forwarded here through `DumpToFile`. Its
+        // order matches the openPMD record list (`real_names`) assembled there:
+        // position_x, position_y, position_z (each added only for geometries that
+        // have it), then weighting, momenta, ...
 #if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE)
         // reconstruct Cartesian positions for cylindrical simulations
         // r,z,theta -> x,y,z
@@ -983,8 +1107,12 @@ WarpXOpenPMDPlot::SaveRealProperty (ParticleIter& pti,
             [](amrex::ParticleReal const *p) { delete[] p; }
         );
 #if !defined(WARPX_DIM_RCYLINDER)
+        // write_real_comp [2] is the z position for RZ, RSPHERE and Cartesian
+        // (RZ stores z directly, RSPHERE rebuilds it from r, theta, phi).
+        // RCYLINDER omits position_z, so its [2] is already the following
+        // weighting flag. Omit here.
         std::shared_ptr<amrex::ParticleReal> const z(
-            new amrex::ParticleReal[(write_real_comp[1] ? numParticleOnTile : 0)],
+            new amrex::ParticleReal[(write_real_comp[2] ? numParticleOnTile : 0)],
             [](amrex::ParticleReal const *p) { delete[] p; }
         );
 #endif
@@ -998,7 +1126,7 @@ WarpXOpenPMDPlot::SaveRealProperty (ParticleIter& pti,
             get_particle_position(p, xp, yp, zp);
             if (write_real_comp[0]) { x.get()[i] = xp; }
             if (write_real_comp[1]) { y.get()[i] = yp; }
-#if !defined(WARPX_DIM_RCYLINDER)
+#if !defined(WARPX_DIM_RCYLINDER)  // see above: omitted in reconstruction
             if (write_real_comp[2]) { z.get()[i] = zp; }
 #endif
         }
@@ -1008,7 +1136,7 @@ WarpXOpenPMDPlot::SaveRealProperty (ParticleIter& pti,
         if (write_real_comp[1]) {
             getComponentRecord(real_comp_names[1]).storeChunk(y, {offset}, {numParticleOnTile64});
         }
-#if !defined(WARPX_DIM_RCYLINDER)
+#if !defined(WARPX_DIM_RCYLINDER)  // see above: omitted in reconstruction
         if (write_real_comp[2]) {
             getComponentRecord(real_comp_names[2]).storeChunk(z, {offset}, {numParticleOnTile64});
         }
@@ -1022,11 +1150,14 @@ WarpXOpenPMDPlot::SaveRealProperty (ParticleIter& pti,
         int const cartesian_attributes = AMREX_SPACEDIM + 4; // position + w + velocities
         int const extra_attributes = PIdx::nattribs - cartesian_attributes; // e.g. theta and phi
         for (auto idx=idx_start; idx<real_counter; idx++) {
-            // make names and write flags to SoA real array number
+            // `idx` indexes into `real_comp_names`/`write_real_comp` (openPMD-order),
+            // `soa_r_idx` indexes into the underlying SoA (PIdx-order). For cylindrical
+            // and spherical geometries the two differ by `extra_attributes` (theta, phi)
+            // which are folded into the reconstructed Cartesian positions written above.
             int const soa_r_idx = (idx < PIdx::nattribs) ?
                          idx - extra_attributes :
                          idx;
-            if (write_real_comp[soa_r_idx]) {
+            if (write_real_comp[idx]) {
                 getComponentRecord(real_comp_names[idx]).storeChunkRaw(
                     soa.GetRealData(soa_r_idx).data(), {offset}, {numParticleOnTile64});
             }
@@ -1287,12 +1418,15 @@ WarpXOpenPMDPlot::SetupFields ( openPMD::Container< openPMD::Mesh >& meshes,
  * @param [in]: mesh          a mesh field
  * @param [in]: full_geom     geometry for the mesh
  * @param [in]: mesh_comp     a component for the mesh
+ * @param [in]: field_name    name of the mesh, including the "_lvl<N>" suffix for meshLevel > 0
+ * @param [in]: meshLevel     mesh-refinement level of the field
  */
 void
 WarpXOpenPMDPlot::SetupMeshComp (openPMD::Mesh& mesh,
                                  amrex::Geometry const& full_geom,
                                  std::string const& comp_name,
                                  std::string const& field_name,
+                                 int meshLevel,
                                  amrex::MultiFab const& mf,
                                  bool var_in_theta_mode) const
 {
@@ -1325,9 +1459,20 @@ WarpXOpenPMDPlot::SetupMeshComp (openPMD::Mesh& mesh,
     mesh.setAttribute("fieldSmoothing", "none");
     mesh_comp.resetDataset(dataset);
 
-    ::detail::setOpenPMDUnit( mesh, field_name );
+    // The physical unit does not depend on the mesh-refinement level: remove the
+    // exact "_lvl<N>" suffix that GetMeshCompNames appended, so that a species
+    // name that itself contains "_lvl" is not truncated
+    std::string unit_field_name = field_name;
+    if (meshLevel > 0) {
+        std::string const level_suffix = std::string("_lvl").append(std::to_string(meshLevel));
+        if (unit_field_name.ends_with(level_suffix)) {
+            unit_field_name.resize(unit_field_name.size() - level_suffix.size());
+        }
+    }
+    ::detail::setOpenPMDUnit( mesh, mesh_comp, unit_field_name,
+                              WarpX::GetInstance().GetPartContainer().GetSpeciesNames() );
     auto relative_cell_pos = ablastr::utils::getRelativeCellPosition(mf);     // AMReX Fortran index order
-    std::reverse( relative_cell_pos.begin(), relative_cell_pos.end() ); // now in C order
+    std::ranges::reverse(relative_cell_pos); // now in C order
     mesh_comp.setPosition( relative_cell_pos );
 }
 
@@ -1435,7 +1580,7 @@ WarpXOpenPMDPlot::WriteOpenPMDFieldsAll ( //const std::string& filename,
     // collective open
     series_iteration.open();
 
-    bool hasADIOS =  (m_Series->backend() == "ADIOS2");
+    const bool hasADIOS =  (m_Series->backend() == "ADIOS2");
 
     auto meshes = series_iteration.meshes;
     if (first_write_to_iteration) {
@@ -1481,6 +1626,7 @@ WarpXOpenPMDPlot::WriteOpenPMDFieldsAll ( //const std::string& filename,
                                         full_geom,
                                         comp_name,
                                         field_name,
+                                        lev,
                                         mf[lev],
                                         var_in_theta_mode );
                     }
@@ -1491,6 +1637,7 @@ WarpXOpenPMDPlot::WriteOpenPMDFieldsAll ( //const std::string& filename,
                                         full_geom,
                                         comp_name,
                                         field_name,
+                                        lev,
                                         mf[lev],
                                         var_in_theta_mode );
                     }

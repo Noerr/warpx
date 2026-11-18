@@ -49,13 +49,16 @@
 #include <AMReX_ParmParse.H>
 #include <AMReX_Print.H>
 #include <AMReX_REAL.H>
+#include <AMReX_RealVect.H>
 #include <AMReX_Utility.H>
 #include <AMReX_Vector.H>
 
 #include <algorithm>
+#include <cmath>
 #include <array>
 #include <memory>
 #include <ostream>
+#include <string>
 #include <vector>
 
 using namespace amrex;
@@ -124,7 +127,7 @@ WarpX::SynchronizeVelocityWithPosition () {
             FillBoundaryE_avg(guard_cells.ng_FieldGather);
             FillBoundaryB_avg(guard_cells.ng_FieldGather);
         }
-        UpdateAuxilaryData();
+        UpdateAuxiliaryData();
         FillBoundaryAux(guard_cells.ng_UpdateAux);
         for (int lev = 0; lev <= finest_level; ++lev) {
             mypc->PushP(
@@ -194,12 +197,14 @@ WarpX::Evolve (int numsteps)
 
         // Update the timestep for solvers that support adaptive timestepping
         // (electrostatic and theta-implicit EM), provided const_dt is not specified.
-        if (m_dt_update_interval.contains(step+1)) {
-            if (verbose_step) {
-                amrex::Print() << Utils::TextMsg::Info("updating timestep");
-            }
+        if (m_dt_update_interval.contains(step+1) || (step == 0 && m_max_dt.has_value())) {
             SynchronizeVelocityWithPosition();
-            UpdateDtFromParticleSpeeds();
+            ApplyDtLimiters(step);
+            if (verbose_step) {
+                std::ostringstream oss;
+                oss << "updating timestep to DT = " << std::scientific << std::setprecision(6) << dt[0];
+                amrex::Print() << Utils::TextMsg::Info(oss.str());
+            }
         }
 
         // If position and velocity are synchronized, push velocity backward one half step
@@ -209,32 +214,33 @@ WarpX::Evolve (int numsteps)
         }
 
         // If needed, deposit the initial ion charge and current densities that
-        // will be used to update the E-field in Ohm's law.
-        if (step == step_begin &&
-            electromagnetic_solver_id == ElectromagneticSolverAlgo::HybridPIC
+        // will be used to update the E-field in Ohm's law.  Evolve() can be
+        // called repeatedly by a Python co-simulation.  This initialization is
+        // once per WarpX instance, not once per Evolve() call: repeating it can
+        // re-add split external fields and, with the QDSMC electron equation,
+        // replace the evolved electron temperature by its initial closure.
+        if (electromagnetic_solver_id == ElectromagneticSolverAlgo::HybridPIC &&
+            !m_hybrid_pic_model->m_evolve_initialized
         ) {
             HybridPICInitializeRhoJandB();
+            m_hybrid_pic_model->m_evolve_initialized = true;
         }
 
         // multi-physics: field ionization
         doFieldIonization();
 
-#ifdef WARPX_QED
         // multi-physics: QED effects
+#ifdef WARPX_QED
         doQEDEvents();
-        mypc->doQEDSchwinger();
 #endif
+        mypc->doQEDSchwinger();
+
 
         // perform particle injection
         ExecutePythonCallback("particleinjection");
 
         // perform collisions and advance fields and particles by one time step
-        OneStep(cur_time, dt[0], step);
-
-        // Resample particles
-        // +1 is necessary here because value of step seen by user (first step is 1) is different than
-        // value of step in code (first step is 0)
-        mypc->doResampling(Geom(), istep[0]+1, verbose_step);
+        OneStep(cur_time, dt[0], step, verbose_step);
 
         if (evolve_scheme == EvolveScheme::Explicit) {
             applyMirrors(cur_time);
@@ -270,7 +276,21 @@ WarpX::Evolve (int numsteps)
             }
         }
 
+        mypc->ContinuousFluxInjection(cur_time, dt[0]);
+
         HandleParticlesAtBoundaries(step, cur_time, num_moved);
+
+        // Resampling requires the particles to be redistributed, which the
+        // boundary handler above does.  Running resampling and Redistribute()
+        // before the boundary handler can remove particles that ought to have
+        // been handled by the boundary conditions.
+        // +1 because the user-facing step number starts at 1, while step starts at 0.
+        mypc->doResampling(Geom(), step+1, verbose_step);
+
+        // Apply particle thermalizer (no-op until implemented)
+        if (m_particle_thermalizer.defined()) {
+            m_particle_thermalizer.applyThermalizer(*mypc);
+        }
 
         if (m_implicit_solver) {
             ExecutePythonCallback("beforecollisions");
@@ -278,40 +298,51 @@ WarpX::Evolve (int numsteps)
             ExecutePythonCallback("aftercollisions");
         }
 
-        // Field solve step for electrostatic or hybrid-PIC solvers
-        if( electrostatic_solver_id != ElectrostaticSolverAlgo::None ||
-            electromagnetic_solver_id == ElectromagneticSolverAlgo::HybridPIC )
+        // Electrostatic field solve step for electrostatic or Darwin solvers
+        if( electrostatic_solver_id != ElectrostaticSolverAlgo::None )
         {
             ExecutePythonCallback("beforeEsolve");
 
-            if (electrostatic_solver_id != ElectrostaticSolverAlgo::None) {
-                // Electrostatic solver:
-                // For each species: deposit charge and add the associated space-charge
-                // E and B field to the grid ; this is done at the end of the PIC
-                // loop (i.e. immediately after a `Redistribute` and before particle
-                // positions are next pushed) so that the particles do not deposit out of bounds
-                // and so that the fields are at the correct time in the output.
-                bool const reset_fields = true;
-                ComputeSpaceChargeField( reset_fields );
-                if (electrostatic_solver_id == ElectrostaticSolverAlgo::LabFrameElectroMagnetostatic) {
-                    // Call Magnetostatic Solver to solve for the vector potential A and compute the
-                    // B field.  Time varying A contribution to E field is neglected.
-                    // This is currently a lab frame calculation.
-                    ComputeMagnetostaticField();
-                }
-                // Since the fields were reset above, the external fields are added
-                // back on to the fine patch fields. This make it so that the net fields
-                // are the sum of the field solution and any external field.
+            // Electrostatic solver:
+            // The E-field is always reset to hold just the electrostatic component
+            bool const reset_E_field = true;
+            // The B-field is also reset unless the Darwin solver is used
+            bool const reset_B_field = (evolve_scheme != EvolveScheme::Semi_Implicit_Darwin);
+
+            // For each species: deposit charge and add the associated space-charge
+            // E and B field to the grid ; this is done at the end of the PIC
+            // loop (i.e. immediately after a `Redistribute` and before particle
+            // positions are next pushed) so that the particles do not deposit out of bounds
+            // and so that the fields are at the correct time in the output.
+            ComputeSpaceChargeField(reset_E_field, reset_B_field, verbose_step);
+            if (electrostatic_solver_id == ElectrostaticSolverAlgo::LabFrameElectroMagnetostatic) {
+                // Call Magnetostatic Solver to solve for the vector potential A and compute the
+                // B field.  Time varying A contribution to E field is neglected.
+                // This is currently a lab frame calculation.
+                ComputeMagnetostaticField();
+            }
+
+            // The external fields are added back on to the fine patch fields
+            // (which were overwritten by electrostatic / magnetostatic solvers)
+            // so that the net fields are the sum of the field solutions and any
+            // external fields.
+            // This is skipped for Darwin since in that case the "external" fields
+            // are just treated as initial conditions (as for other EM solvers).
+            if (evolve_scheme != EvolveScheme::Semi_Implicit_Darwin) {
                 for (int lev = 0; lev <= max_level; ++lev) {
                     AddExternalFields(lev);
                 }
-            } else if (electromagnetic_solver_id == ElectromagneticSolverAlgo::HybridPIC) {
-                // Hybrid-PIC case:
-                // The particles are now at p^{n+1/2} and x^{n+1}. The fields
-                // are updated according to the hybrid-PIC scheme (Ohm's law
-                // and Ampere's law).
-                HybridPICEvolveFields();
             }
+            ExecutePythonCallback("afterEsolve");
+        }
+
+        // Hybrid-PIC case
+        if (electromagnetic_solver_id == ElectromagneticSolverAlgo::HybridPIC) {
+            ExecutePythonCallback("beforeEsolve");
+            // The particles are now at p^{n+1/2} and x^{n+1}. The fields
+            // are updated according to the hybrid-PIC scheme (Ohm's law
+            // and Ampere's law).
+            HybridPICEvolveFields();
             ExecutePythonCallback("afterEsolve");
         }
 
@@ -364,6 +395,15 @@ WarpX::Evolve (int numsteps)
         if (checkStopSimulation(cur_time)) {
             break;
         }
+
+#if defined(AMREX_TINY_PROFILING) && !defined(BL_PROFILING)
+        // Collective (MPI reductions/gathers): must be called on the same steps on all ranks.
+        if (m_tiny_profiler_flush_interval.contains(step+1)) {
+            amrex::Print() << "Tiny profiler flush at step " << step+1 << "\n";
+            BL_PROFILE("WarpX::TinyProfilerFlush");
+            BL_PROFILE_TINY_FLUSH();
+        }
+#endif
     } // End loop on time steps
 
     // This if statement is needed for PICMI, which allows the Evolve routine to be
@@ -384,7 +424,8 @@ WarpX::Evolve (int numsteps)
 void WarpX::OneStep (
     amrex::Real a_cur_time,
     amrex::Real a_dt,
-    int a_step
+    int a_step,
+    bool verbose_step
 )
 {
     ABLASTR_PROFILE("WarpX::OneStep()");
@@ -392,7 +433,17 @@ void WarpX::OneStep (
     // implicit solver
     if (m_implicit_solver) {
         // advance fields and particles by one time step
-        m_implicit_solver->OneStep(a_cur_time, a_dt, a_step);
+        const int exit_status = m_implicit_solver->OneStep(a_cur_time, a_dt, a_step, verbose_step);
+        if (exit_status < 0) {
+            std::stringstream solverMsg;
+            solverMsg << "ImplicitSolver::OneStep() failed at step = " << a_step
+                      << " using dt = " << a_dt << ".\n"
+                      << "Nonlinear solver failed to converge: exit status = " << exit_status;
+            WARPX_ABORT_WITH_MESSAGE(solverMsg.str());
+        }
+        if (a_step + 1 < max_step) { // not worth it on the last step
+            m_implicit_solver->ReinitializePETScIfDue(a_step, verbose_step);
+        }
     }
     // explicit solver
     else {
@@ -509,7 +560,6 @@ WarpX::OneStep_nosub (
     // Deposit current j^{n+1/2}
     // Deposit charge density rho^{n}
 
-    ExecutePythonCallback("particlescraper");
     ExecutePythonCallback("beforedeposition");
 
     // with collisions placed in the middle of the momentum push
@@ -551,14 +601,17 @@ WarpX::OneStep_nosub (
 
     ExecutePythonCallback("afterdeposition");
 
-    // Synchronize J and rho:
-    // filter (if used), exchange guard cells, interpolate across MR levels
-    // and apply boundary conditions
-    SyncCurrentAndRho();
+    SyncCurrentAndRho(); // Filter, exchange gurd cells, and interpolate across levels
+    FinalizeRho(); // Apply boundary conditions and inverse volume scaling to rho
 
-    // At this point, J is up-to-date inside the domain, and E and B are
-    // up-to-date including enough guard cells for first step of the field
-    // solve.
+    // Vay constructs J from D in PushPSATD, which finalizes the resulting J.
+    if (current_deposition_algo != CurrentDepositionAlgo::Vay) {
+        FinalizeJ(); // Apply boundary conditions and inverse volume scaling to J
+    }
+
+    // At this point, J is up-to-date inside the domain except with Vay deposition,
+    // and E and B are up-to-date including enough guard cells for the first
+    // step of the field solve.
 
     // For extended PML: copy J from regular grid to PML, and damp J in PML
     if (do_pml && pml_has_particles) { CopyJPML(); }
@@ -662,7 +715,7 @@ void WarpX::ExplicitFillBoundaryEBUpdateAux ()
         FillBoundaryE(guard_cells.ng_alloc_EB);
         FillBoundaryB(guard_cells.ng_alloc_EB);
 
-        UpdateAuxilaryData();
+        UpdateAuxiliaryData();
         FillBoundaryAux(guard_cells.ng_UpdateAux);
         // on first step, push p by -0.5*dt
         for (int lev = 0; lev <= finest_level; ++lev)
@@ -696,48 +749,84 @@ void WarpX::ExplicitFillBoundaryEBUpdateAux ()
                 FillBoundaryE_avg(guard_cells.ng_FieldGather);
                 FillBoundaryB_avg(guard_cells.ng_FieldGather);
             }
-            // TODO Remove call to FillBoundaryAux before UpdateAuxilaryData?
+            // TODO Remove call to FillBoundaryAux before UpdateAuxiliaryData?
             if (WarpX::electromagnetic_solver_id != ElectromagneticSolverAlgo::PSATD) {
                 FillBoundaryAux(guard_cells.ng_UpdateAux);
             }
         }
-        UpdateAuxilaryData();
+        UpdateAuxiliaryData();
         FillBoundaryAux(guard_cells.ng_UpdateAux);
     }
 }
 
 void WarpX::HandleParticlesAtBoundaries (int step, amrex::Real cur_time, int num_moved)
 {
-    mypc->ContinuousFluxInjection(cur_time, dt[0]);
+    ExecutePythonCallback("particlescraper");
 
     mypc->ApplyBoundaryConditions();
     m_particle_boundary_buffer->gatherParticlesFromDomainBoundaries(*mypc, cur_time);
 
-    // Non-Maxwell solver: particles can move by an arbitrary number of cells
-    if( electromagnetic_solver_id == ElectromagneticSolverAlgo::None ||
-        electromagnetic_solver_id == ElectromagneticSolverAlgo::HybridPIC )
-    {
-        mypc->Redistribute();
-    }
-    else
-    {
-        // Electromagnetic solver: due to CFL condition, particles can
-        // only move by one or two cells per time step
-        // The implicit scheme can allow additional cell crossings, as specified by particle_max_grid_crossings.
-        if (max_level == 0) {
-            int num_redistribute_ghost = num_moved;
-            if ((m_v_galilean[0]!=0) or (m_v_galilean[1]!=0) or (m_v_galilean[2]!=0)) {
-                // Galilean algorithm ; particles can move by up to one additional cell beyond the max number
-                num_redistribute_ghost += particle_max_grid_crossings + 1;
-            } else {
-                // Standard algorithm ; particles can move by up to the max number
-                num_redistribute_ghost += particle_max_grid_crossings;
-            }
-            mypc->RedistributeLocal(num_redistribute_ghost);
+    // Without mesh refinement, use a local redistribute when particles can only
+    // have moved by a small number of cells; otherwise fall back to a global one.
+    if (finest_level == 0) {
+        // Estimate, per direction, the maximum distance a particle may have
+        // travelled during this step, expressed in number of cells.
+        // (Geom().CellSizeArray() is indexed by active dimension 0..SPACEDIM-1.)
+        const amrex::GpuArray<amrex::Real,AMREX_SPACEDIM> dx = Geom(0).CellSizeArray();
+
+        // Particles cannot travel faster than the speed of light, so c * dt / dx
+        // is a physical upper bound on the number of cells crossed per direction.
+        amrex::RealVect max_distance_relative_to_grid;
+        for (int d = 0; d < AMREX_SPACEDIM; ++d) {
+            max_distance_relative_to_grid[d] = PhysConst::c * dt[0] / dx[d];
         }
-        else {
+
+        // Moving window: particles can additionally move by the number of cells
+        // that the window was shifted, along the moving-window direction.
+        if (moving_window_dir >= 0) {
+            max_distance_relative_to_grid[moving_window_dir] += static_cast<amrex::Real>(num_moved);
+        }
+
+
+        // Galilean algorithm: account for the extra grid shift due to the moving
+        // Galilean frame. m_v_galilean is indexed by x/y/z, so map its components
+        // onto the active simulation dimensions.
+#if defined(WARPX_DIM_3D)
+        const amrex::RealVect v_galilean = {m_v_galilean[0], m_v_galilean[1], m_v_galilean[2]};
+#elif defined(WARPX_DIM_XZ) || defined(WARPX_DIM_RZ)
+        const amrex::RealVect v_galilean = {m_v_galilean[0], m_v_galilean[2]};
+#elif defined(WARPX_DIM_1D_Z)
+        const amrex::RealVect v_galilean(m_v_galilean[2]);
+#else // WARPX_DIM_RCYLINDER, WARPX_DIM_RSPHERE: no Galilean shift
+        const amrex::RealVect v_galilean = amrex::RealVect::TheZeroVector();
+#endif
+        for (int d = 0; d < AMREX_SPACEDIM; ++d) {
+            max_distance_relative_to_grid[d] += std::abs(v_galilean[d]) * dt[0] / dx[d];
+        }
+
+        // Convert to an integer number of cells (rounding up), per direction.
+        amrex::IntVect max_cells_travelled;
+        for (int d = 0; d < AMREX_SPACEDIM; ++d) {
+            max_cells_travelled[d] =
+                static_cast<int>(std::ceil(max_distance_relative_to_grid[d]));
+        }
+
+        // If, in any direction, max_cells_travelled reaches the domain size, the
+        // local search is no longer more efficient than (and may crash in lieu
+        // of) a full redistribute, so fall back in that case.
+        const amrex::IntVect domain_length = Geom(0).Domain().length();
+        bool use_local_redistribute = true;
+        for (int d = 0; d < AMREX_SPACEDIM; ++d) {
+            if (max_cells_travelled[d] >= domain_length[d]) { use_local_redistribute = false; }
+        }
+        if (use_local_redistribute) {
+            mypc->RedistributeLocal(max_cells_travelled);
+        } else {
             mypc->Redistribute();
         }
+    }
+    else {
+        mypc->Redistribute();
     }
 
     // interact the particles with EB walls (if present)
@@ -746,7 +835,15 @@ void WarpX::HandleParticlesAtBoundaries (int step, amrex::Real cur_time, int num
         mypc->ScrapeParticlesAtEB(m_fields.get_mr_levels(FieldType::distance_to_eb, finest_level));
         m_particle_boundary_buffer->gatherParticlesFromEmbeddedBoundaries(
             *mypc, m_fields.get_mr_levels(FieldType::distance_to_eb, finest_level), cur_time);
-        mypc->deleteInvalidParticles();
+        if (eb_particle_boundary == ParticleBoundaryType::Absorbing) {
+            // If particles are simply absorbed, no need for a full Redistribute.
+            // Instead: simply delete the absorbed particles
+            mypc->deleteInvalidParticles();
+        } else {
+            // For other particle boundary conditions (e.g. reflecting),
+            // particles can move to a different sub-domain, so we need a full Redistribute
+            mypc->Redistribute();
+        }
     }
 
     if (sort_intervals.contains(step+1)) {
@@ -760,7 +857,6 @@ void WarpX::HandleParticlesAtBoundaries (int step, amrex::Real cur_time, int num
 
 void WarpX::SyncCurrentAndRho ()
 {
-    using ablastr::fields::Direction;
     using warpx::fields::FieldType;
 
     if (electromagnetic_solver_id == ElectromagneticSolverAlgo::PSATD)
@@ -791,10 +887,14 @@ void WarpX::SyncCurrentAndRho ()
 
             if (current_deposition_algo == CurrentDepositionAlgo::Vay)
             {
+                // Nonperiodic physical-boundary support for Vay deposition is unestablished.
+                // With periodic domain boundaries, D needs filtering and periodic communication,
+                // but no physical-boundary finalization. Periodic domain boundaries do not
+                // require periodic_single_box_fft: local FFTs can also use a periodic domain.
                 // TODO This works only without mesh refinement
                 const int lev = 0;
                 if (use_filter) {
-                    ApplyFilterMF(m_fields.get_mr_levels_alldirs(FieldType::current_fp_vay, finest_level), lev);
+                    ApplyFilterJ(m_fields.get_mr_levels_alldirs(FieldType::current_fp_vay, finest_level), lev);
                 }
             }
         }
@@ -805,28 +905,66 @@ void WarpX::SyncCurrentAndRho ()
         SyncRho();
     }
 
-    // Reflect charge and current density over PEC boundaries, if needed.
+}
+
+void WarpX::FinalizeJ ()
+{
+    using ablastr::fields::Direction;
+    using warpx::fields::FieldType;
+
     for (int lev = 0; lev <= finest_level; ++lev)
     {
-        if (m_fields.has(FieldType::rho_fp, lev)) {
-            ApplyRhofieldBoundary(lev, m_fields.get(FieldType::rho_fp,lev), PatchType::fine);
+        if (m_fields.has_vector(FieldType::current_fp, lev)) {
+            FinalizeJOnLevel(lev,
+                m_fields.get(FieldType::current_fp, Direction{0}, lev),
+                m_fields.get(FieldType::current_fp, Direction{1}, lev),
+                m_fields.get(FieldType::current_fp, Direction{2}, lev),
+                PatchType::fine);
         }
-        ApplyJfieldBoundary(lev,
-            m_fields.get(FieldType::current_fp, Direction{0}, lev),
-            m_fields.get(FieldType::current_fp, Direction{1}, lev),
-            m_fields.get(FieldType::current_fp, Direction{2}, lev),
-            PatchType::fine);
-        if (lev > 0) {
-            if (m_fields.has(FieldType::rho_cp, lev)) {
-                ApplyRhofieldBoundary(lev, m_fields.get(FieldType::rho_cp,lev), PatchType::coarse);
-            }
-            ApplyJfieldBoundary(lev,
+        if (lev > 0 && m_fields.has_vector(FieldType::current_cp, lev)) {
+            FinalizeJOnLevel(lev,
                 m_fields.get(FieldType::current_cp, Direction{0}, lev),
                 m_fields.get(FieldType::current_cp, Direction{1}, lev),
                 m_fields.get(FieldType::current_cp, Direction{2}, lev),
                 PatchType::coarse);
         }
     }
+
+}
+
+void WarpX::FinalizeJOnLevel (int lev, amrex::MultiFab* Jx, amrex::MultiFab* Jy,
+                              amrex::MultiFab* Jz, PatchType patch_type)
+{
+    ApplyJfieldBoundary(lev, Jx, Jy, Jz, patch_type);
+#if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE)
+    const int glev = (patch_type == PatchType::fine) ? lev : lev - 1;
+    ApplyInverseVolumeScalingToCurrentDensity(Jx, Jy, Jz, glev);
+#endif
+}
+
+void WarpX::FinalizeRho ()
+{
+    using warpx::fields::FieldType;
+
+    for (int lev = 0; lev <= finest_level; ++lev)
+    {
+        if (m_fields.has(FieldType::rho_fp, lev)) {
+            FinalizeRhoOnLevel(lev, m_fields.get(FieldType::rho_fp, lev), PatchType::fine);
+        }
+        if (lev > 0 && m_fields.has(FieldType::rho_cp, lev)) {
+            FinalizeRhoOnLevel(lev, m_fields.get(FieldType::rho_cp, lev), PatchType::coarse);
+        }
+    }
+}
+
+void WarpX::FinalizeRhoOnLevel (int lev, amrex::MultiFab* rho, PatchType patch_type,
+                                int scomp, int ncomp)
+{
+    ApplyRhofieldBoundary(lev, rho, patch_type, scomp, ncomp);
+#if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE)
+    const int glev = (patch_type == PatchType::fine) ? lev : lev - 1;
+    ApplyInverseVolumeScalingToChargeDensity(rho, glev, scomp, ncomp);
+#endif
 }
 
 void
@@ -873,8 +1011,8 @@ WarpX::OneStep_JRhom (const amrex::Real cur_time)
         // Deposit rho at relative time -dt
         // (dt[0] denotes the time step on mesh refinement level 0)
         mypc->DepositCharge(rho_fp, -dt[0]);
-        // Filter, exchange boundary, and interpolate across levels
-        SyncRho();
+        SyncRho();     // Filter, exchange boundary, and interpolate across levels
+        FinalizeRho(); // Apply boundary conditions to rho, and then apply volume scaling
         // Forward FFT of rho
         PSATDForwardTransformRho(rho_fp_string, rho_cp_string, 0, rho_new);
     }
@@ -891,6 +1029,7 @@ WarpX::OneStep_JRhom (const amrex::Real cur_time)
         // into 'current_fp' and then performs both filtering, if used, and exchange
         // of guard cells.
         SyncCurrent("current_fp");
+        FinalizeJ();
         // Forward FFT of J
         PSATDForwardTransformJ("current_fp", "current_cp");
     }
@@ -925,14 +1064,17 @@ WarpX::OneStep_JRhom (const amrex::Real cur_time)
         // into 'current_fp' and then performs both filtering, if used, and exchange
         // of guard cells.
         SyncCurrent("current_fp");
+        FinalizeJ();
         // Forward FFT of J
         PSATDForwardTransformJ("current_fp", "current_cp");
 
         if (time_dependency_J == TimeDependencyJ::Quadratic)
         {
             PSATDMoveJNewToJMid();
-            mypc->DepositCurrent( m_fields.get_mr_levels_alldirs(current_string, finest_level),  dt[0], t_deposit_current + 0.5_rt*sub_dt);
+            mypc->DepositCurrent(m_fields.get_mr_levels_alldirs(current_string, finest_level),
+                                 dt[0], t_deposit_current + 0.5_rt*sub_dt);
             SyncCurrent("current_fp");
+            FinalizeJ();
             PSATDForwardTransformJ("current_fp", "current_cp");
         }
 
@@ -950,8 +1092,8 @@ WarpX::OneStep_JRhom (const amrex::Real cur_time)
 
             // Deposit rho at relative time t_deposit_charge
             mypc->DepositCharge(rho_fp, t_deposit_charge);
-            // Filter, exchange boundary, and interpolate across levels
-            SyncRho();
+            SyncRho();     // Filter, exchange boundary, and interpolate across levels
+            FinalizeRho(); // Apply boundary conditions to rho, and then apply volume scaling
             // Forward FFT of rho
             const int rho_idx = (time_dependency_rho != TimeDependencyRho::Constant) ? rho_new : rho_mid;
             PSATDForwardTransformRho(rho_fp_string, rho_cp_string, 0, rho_idx);
@@ -960,7 +1102,8 @@ WarpX::OneStep_JRhom (const amrex::Real cur_time)
             {
                 PSATDMoveRhoNewToRhoMid();
                 mypc->DepositCharge(rho_fp, t_deposit_charge + 0.5_rt*sub_dt);
-                SyncRho();
+                SyncRho();     // Filter, exchange boundary, and interpolate across levels
+                FinalizeRho(); // Apply boundary conditions to rho, and then apply volume scaling
                 PSATDForwardTransformRho(rho_fp_string, rho_cp_string, 0, rho_new);
             }
         }
@@ -1059,13 +1202,27 @@ WarpX::OneStep_sub1 (Real cur_time)
 
     // TODO: we could save some charge depositions
 
-    WARPX_ALWAYS_ASSERT_WITH_MESSAGE(finest_level == 1, "Must have exactly two levels");
+    // check that MR has exactly two levels and a refinement ratio of 2 in all directions when subcycling is used
     const int fine_lev = 1;
     const int coarse_lev = 0;
+    const amrex::IntVect& crse_to_fine_ref_ratio = this->refRatio(coarse_lev);
+    const bool ref_ratio_is_uniform_two = (crse_to_fine_ref_ratio == amrex::IntVect(2));
+    if (finest_level != 1 || !ref_ratio_is_uniform_two) {
+        std::ostringstream msg;
+        msg << "MR with subcycling algorithm requires exactly two levels of MR "
+            << "and a refinement ratio of 2 in all directions. "
+            << "Found: finest_level = " << finest_level
+            << ", refRatio(" << coarse_lev << ") = " << crse_to_fine_ref_ratio;
+        WARPX_ABORT_WITH_MESSAGE(msg.str());
+    }
 
+    using ablastr::fields::Direction;
     using warpx::fields::FieldType;
 
     bool const skip_lev0_coarse_patch = true;
+    const ablastr::fields::MultiLevelScalarField rho_buf = m_fields.has(FieldType::rho_buf, fine_lev)
+        ? m_fields.get_mr_levels(FieldType::rho_buf, finest_level, skip_lev0_coarse_patch)
+        : ablastr::fields::MultiLevelScalarField{static_cast<size_t>(finest_level + 1)};
 
     // i) Push particles and fields on the fine patch (first fine step)
     PushParticlesandDeposit(fine_lev, cur_time, SubcyclingHalf::FirstHalf);
@@ -1074,11 +1231,16 @@ WarpX::OneStep_sub1 (Real cur_time)
         m_fields.get_mr_levels_alldirs(FieldType::current_cp, finest_level, skip_lev0_coarse_patch), fine_lev);
     RestrictRhoFromFineToCoarsePatch(fine_lev);
     if (use_filter) {
-        ApplyFilterMF( m_fields.get_mr_levels_alldirs(FieldType::current_fp, finest_level), fine_lev);
+        ApplyFilterJ( m_fields.get_mr_levels_alldirs(FieldType::current_fp, finest_level), fine_lev);
     }
     SumBoundaryJ(
         m_fields.get_mr_levels_alldirs(FieldType::current_fp, finest_level),
         fine_lev, Geom(fine_lev).periodicity());
+    FinalizeJOnLevel(fine_lev,
+        m_fields.get(FieldType::current_fp, Direction{0}, fine_lev),
+        m_fields.get(FieldType::current_fp, Direction{1}, fine_lev),
+        m_fields.get(FieldType::current_fp, Direction{2}, fine_lev),
+        PatchType::fine);
 
     if (m_fields.has(FieldType::rho_fp, finest_level) &&
         m_fields.has(FieldType::rho_cp, finest_level)) {
@@ -1086,6 +1248,7 @@ WarpX::OneStep_sub1 (Real cur_time)
             m_fields.get_mr_levels(FieldType::rho_fp, finest_level),
             m_fields.get_mr_levels(FieldType::rho_cp, finest_level, skip_lev0_coarse_patch),
             fine_lev, PatchType::fine, 0, 2*ncomps);
+        FinalizeRhoOnLevel(fine_lev, m_fields.get(FieldType::rho_fp, fine_lev), PatchType::fine);
     }
 
     EvolveB(fine_lev, PatchType::fine, 0.5_rt*dt[fine_lev], SubcyclingHalf::FirstHalf, cur_time);
@@ -1118,15 +1281,28 @@ WarpX::OneStep_sub1 (Real cur_time)
         m_fields.get_mr_levels_alldirs(FieldType::current_fp, finest_level),
         m_fields.get_mr_levels_alldirs(FieldType::current_cp, finest_level, skip_lev0_coarse_patch),
         m_fields.get_mr_levels_alldirs(FieldType::current_buf, finest_level, skip_lev0_coarse_patch), coarse_lev);
+    FinalizeJOnLevel(coarse_lev,
+        m_fields.get(FieldType::current_fp, Direction{0}, coarse_lev),
+        m_fields.get(FieldType::current_fp, Direction{1}, coarse_lev),
+        m_fields.get(FieldType::current_fp, Direction{2}, coarse_lev),
+        PatchType::fine);
+    FinalizeJOnLevel(fine_lev,
+        m_fields.get(FieldType::current_cp, Direction{0}, fine_lev),
+        m_fields.get(FieldType::current_cp, Direction{1}, fine_lev),
+        m_fields.get(FieldType::current_cp, Direction{2}, fine_lev),
+        PatchType::coarse);
 
     if (m_fields.has(FieldType::rho_fp, finest_level) &&
-        m_fields.has(FieldType::rho_cp, finest_level) &&
-        m_fields.has(FieldType::rho_buf, finest_level)) {
+        m_fields.has(FieldType::rho_cp, finest_level)) {
         AddRhoFromFineLevelandSumBoundary(
             m_fields.get_mr_levels(FieldType::rho_fp, finest_level),
             m_fields.get_mr_levels(FieldType::rho_cp, finest_level, skip_lev0_coarse_patch),
-            m_fields.get_mr_levels(FieldType::rho_buf, finest_level, skip_lev0_coarse_patch),
+            rho_buf,
             coarse_lev, 0, ncomps);
+        FinalizeRhoOnLevel(coarse_lev, m_fields.get(FieldType::rho_fp, coarse_lev),
+                           PatchType::fine, 0, ncomps);
+        FinalizeRhoOnLevel(fine_lev, m_fields.get(FieldType::rho_cp, fine_lev),
+                           PatchType::coarse, 0, ncomps);
     }
 
     EvolveB(fine_lev, PatchType::coarse, dt[fine_lev], SubcyclingHalf::FirstHalf, cur_time);
@@ -1147,10 +1323,10 @@ WarpX::OneStep_sub1 (Real cur_time)
     EvolveE(coarse_lev, PatchType::fine, 0.5_rt*dt[coarse_lev], cur_time);
     FillBoundaryE(coarse_lev, PatchType::fine, guard_cells.ng_FieldGather);
 
-    // TODO Remove call to FillBoundaryAux before UpdateAuxilaryData?
+    // TODO Remove call to FillBoundaryAux before UpdateAuxiliaryData?
     FillBoundaryAux(guard_cells.ng_UpdateAux);
     // iii) Get auxiliary fields on the fine grid, at dt[fine_lev]
-    UpdateAuxilaryData();
+    UpdateAuxiliaryData();
     FillBoundaryAux(guard_cells.ng_UpdateAux);
 
     // iv) Push particles and fields on the fine patch (second fine step)
@@ -1160,16 +1336,22 @@ WarpX::OneStep_sub1 (Real cur_time)
         m_fields.get_mr_levels_alldirs(FieldType::current_cp, finest_level, skip_lev0_coarse_patch), fine_lev);
     RestrictRhoFromFineToCoarsePatch(fine_lev);
     if (use_filter) {
-        ApplyFilterMF( m_fields.get_mr_levels_alldirs(FieldType::current_fp, finest_level), fine_lev);
+        ApplyFilterJ( m_fields.get_mr_levels_alldirs(FieldType::current_fp, finest_level), fine_lev);
     }
     SumBoundaryJ( m_fields.get_mr_levels_alldirs(FieldType::current_fp, finest_level), fine_lev, Geom(fine_lev).periodicity());
+    FinalizeJOnLevel(fine_lev,
+        m_fields.get(FieldType::current_fp, Direction{0}, fine_lev),
+        m_fields.get(FieldType::current_fp, Direction{1}, fine_lev),
+        m_fields.get(FieldType::current_fp, Direction{2}, fine_lev),
+        PatchType::fine);
 
     if (m_fields.has(FieldType::rho_fp, finest_level) &&
         m_fields.has(FieldType::rho_cp, finest_level)) {
         ApplyFilterandSumBoundaryRho(
             m_fields.get_mr_levels(FieldType::rho_fp, finest_level),
             m_fields.get_mr_levels(FieldType::rho_cp, finest_level, skip_lev0_coarse_patch),
-            fine_lev, PatchType::fine, 0, ncomps);
+            fine_lev, PatchType::fine, 0, 2*ncomps);
+        FinalizeRhoOnLevel(fine_lev, m_fields.get(FieldType::rho_fp, fine_lev), PatchType::fine);
     }
 
     EvolveB(fine_lev, PatchType::fine, 0.5_rt*dt[fine_lev], SubcyclingHalf::FirstHalf, cur_time + dt[fine_lev]);
@@ -1202,15 +1384,28 @@ WarpX::OneStep_sub1 (Real cur_time)
         m_fields.get_mr_levels_alldirs(FieldType::current_cp, finest_level, skip_lev0_coarse_patch),
         m_fields.get_mr_levels_alldirs(FieldType::current_buf, finest_level, skip_lev0_coarse_patch),
         coarse_lev);
+    FinalizeJOnLevel(coarse_lev,
+        m_fields.get(FieldType::current_fp, Direction{0}, coarse_lev),
+        m_fields.get(FieldType::current_fp, Direction{1}, coarse_lev),
+        m_fields.get(FieldType::current_fp, Direction{2}, coarse_lev),
+        PatchType::fine);
+    FinalizeJOnLevel(fine_lev,
+        m_fields.get(FieldType::current_cp, Direction{0}, fine_lev),
+        m_fields.get(FieldType::current_cp, Direction{1}, fine_lev),
+        m_fields.get(FieldType::current_cp, Direction{2}, fine_lev),
+        PatchType::coarse);
 
     if (m_fields.has(FieldType::rho_fp, finest_level) &&
-        m_fields.has(FieldType::rho_cp, finest_level) &&
-        m_fields.has(FieldType::rho_buf, finest_level)) {
+        m_fields.has(FieldType::rho_cp, finest_level)) {
         AddRhoFromFineLevelandSumBoundary(
             m_fields.get_mr_levels(FieldType::rho_fp, finest_level),
             m_fields.get_mr_levels(FieldType::rho_cp, finest_level, skip_lev0_coarse_patch),
-            m_fields.get_mr_levels(FieldType::rho_buf, finest_level, skip_lev0_coarse_patch),
+            rho_buf,
             coarse_lev, ncomps, ncomps);
+        FinalizeRhoOnLevel(coarse_lev, m_fields.get(FieldType::rho_fp, coarse_lev),
+                           PatchType::fine, ncomps, ncomps);
+        FinalizeRhoOnLevel(fine_lev, m_fields.get(FieldType::rho_cp, fine_lev),
+                           PatchType::coarse, ncomps, ncomps);
     }
 
     EvolveE(fine_lev, PatchType::coarse, dt[fine_lev], cur_time + 0.5_rt * dt[fine_lev]);
@@ -1307,6 +1502,7 @@ WarpX::PushParticlesandDeposit (
     bool skip_deposition,
     PositionPushType position_push_type,
     MomentumPushType momentum_push_type,
+    amrex::Real dt_scale,
     ImplicitOptions const * implicit_options
 )
 {
@@ -1320,6 +1516,7 @@ WarpX::PushParticlesandDeposit (
             skip_deposition,
             position_push_type,
             momentum_push_type,
+            dt_scale,
             implicit_options
         );
     }
@@ -1333,6 +1530,7 @@ WarpX::PushParticlesandDeposit (
     bool skip_deposition,
     PositionPushType position_push_type,
     MomentumPushType momentum_push_type,
+    amrex::Real dt_scale,
     ImplicitOptions const * implicit_options
 )
 {
@@ -1359,7 +1557,7 @@ WarpX::PushParticlesandDeposit (
         lev,
         current_fp_string,
         cur_time,
-        dt[lev],
+        dt[lev]*dt_scale,
         subcycling_half,
         skip_deposition,
         position_push_type,
@@ -1367,43 +1565,13 @@ WarpX::PushParticlesandDeposit (
         implicit_options
     );
 
-    if (!skip_deposition && !implicit_options) {
-#if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE)
-        // This is called after all particles have deposited their current and charge.
-        ApplyInverseVolumeScalingToCurrentDensity(
-            m_fields.get(FieldType::current_fp, Direction{0}, lev),
-            m_fields.get(FieldType::current_fp, Direction{1}, lev),
-            m_fields.get(FieldType::current_fp, Direction{2}, lev),
-            lev);
-        if (m_fields.has_vector(FieldType::current_buf, lev)) {
-            ApplyInverseVolumeScalingToCurrentDensity(
-                m_fields.get(FieldType::current_buf, Direction{0}, lev),
-                m_fields.get(FieldType::current_buf, Direction{1}, lev),
-                m_fields.get(FieldType::current_buf, Direction{2}, lev),
-                lev-1);
-        }
-        if (m_fields.has(FieldType::rho_fp, lev)) {
-            ApplyInverseVolumeScalingToChargeDensity(m_fields.get(FieldType::rho_fp, lev), lev);
-            if (m_fields.has(FieldType::rho_buf, lev)) {
-                ApplyInverseVolumeScalingToChargeDensity(m_fields.get(FieldType::rho_buf, lev), lev-1);
-            }
-        }
-// #else
-        // I left this comment here as a reminder that currently the
-        // boundary handling for cartesian grids are not matching the RZ handling
-        // (done in the ApplyInverseScalingToChargeDensity function). The
-        // Cartesian grid code had to be moved from here to after the application
-        // of the filter to avoid incorrect results (moved to `SyncCurrentAndRho()`).
-        // Might this be related to issue #1943?
-#endif
-        if (do_fluid_species) {
-            myfl->Evolve(m_fields,
-                         lev,
-                         current_fp_string,
-                         cur_time,
-                         skip_deposition
-            );
-        }
+    if (do_fluid_species && !implicit_options && !skip_deposition) {
+        myfl->Evolve(m_fields,
+                     lev,
+                     current_fp_string,
+                     cur_time,
+                     skip_deposition
+        );
     }
 }
 

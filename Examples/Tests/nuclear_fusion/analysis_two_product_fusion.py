@@ -12,6 +12,9 @@ import numpy as np
 import scipy.constants as scc
 import yt
 
+sys.path.append("../../../Tools/Parser/")
+from input_file_parser import input_has_value, parse_input_file
+
 ## This script performs various checks for the fusion module. The simulation
 ## that we check is made of 2 different tests, each with different reactant and product species.
 ##
@@ -52,18 +55,31 @@ barn_to_square_meter = 1.0e-28
 ## Checks whether this is the 2D or the 3D test
 with open("./warpx_used_inputs", "r") as f:
     warpx_used_inputs = f.read()
-if re.search("geometry.dims = RZ", warpx_used_inputs):
-    is_RZ = True
-else:
-    is_RZ = False
+input_dict = parse_input_file("./warpx_used_inputs")
+is_RZ = input_has_value(input_dict, "geometry.dims", "RZ")
 
-## Check which kind of test we are doing: D+T or D+D
+## Check which kind of test we are doing: D+He3, D+D->T+p, D+T or D+D->n+He3
 # Define reactants and products
-if re.search("tritium", warpx_used_inputs):
+if re.search("DHeF1", warpx_used_inputs):
+    # D + He3 -> He4 + p test
+    reaction_type = "DHe3"
+    reactant_species = ["deuterium", "helium3"]
+    product_species = ["helium4", "proton"]
+    collision_names = ["DHeF1", "DHeF2"]
+    ntests = 2
+elif re.search("DDPTF1", warpx_used_inputs):
+    # D + D -> T + p test
+    reaction_type = "DDPT"
+    reactant_species = ["deuterium", "hydrogen2"]
+    product_species = ["tritium", "proton"]
+    collision_names = ["DDPTF1"]
+    ntests = 1
+elif re.search("tritium", warpx_used_inputs):
     # If tritium appears in the file, than this is the D+T test
     reaction_type = "DT"
     reactant_species = ["deuterium", "tritium"]
     product_species = ["helium4", "neutron"]
+    collision_names = ["DTF1", "DTF2"]
     ntests = 2
     E_fusion = 17.58929696 * MeV_to_Joule
 else:
@@ -71,6 +87,7 @@ else:
     reaction_type = "DD"
     reactant_species = ["deuterium", "hydrogen2"]
     product_species = ["helium3", "neutron"]
+    collision_names = ["DDNHeF1"]
     ntests = 1
     E_fusion = 3.26891111e6 * MeV_to_Joule
 
@@ -81,6 +98,30 @@ mass = {
     "helium3": 3.016029 * scc.m_u - 2 * scc.m_e,
     "helium4": 4.00260325413 * scc.m_u - 2 * scc.m_e,
     "neutron": 1.0013784193052508 * scc.m_p,
+    "proton": scc.m_p,
+}
+if reaction_type in ["DHe3", "DDPT"]:
+    E_fusion = (
+        sum(mass[s] for s in reactant_species) - sum(mass[s] for s in product_species)
+    ) * scc.c**2
+
+## Number of macroparticles created per product species and per fusion event.
+## When each product has the same charge as one of the reactants (D+He3 -> He4+p,
+## D+D -> T+p), a single macroparticle is created for each product, at the position of
+## the reactant with the same charge. Otherwise (D+T -> He4+n, D+D -> He3+n), two
+## macroparticles with half of the weight are created for each product, one at the
+## position of each reactant. Both choices conserve charge locally.
+products_per_fusion_event = 1 if reaction_type in ["DHe3", "DDPT"] else 2
+
+## Charge number of each species
+charge_number = {
+    "deuterium": 1,
+    "hydrogen2": 1,
+    "tritium": 1,
+    "helium3": 2,
+    "helium4": 2,
+    "proton": 1,
+    "neutron": 0,
 }
 m_reduced = np.prod([mass[s] for s in reactant_species]) / np.sum(
     [mass[s] for s in reactant_species]
@@ -93,11 +134,13 @@ size_z = 16
 if is_RZ:
     dV_slice = np.pi * size_x**2
     yt_z_string = "particle_position_y"
+    position_coordinates = ["x", "y"]
     nppcell_1 = 10000 * 8
     nppcell_2 = 900 * 8
 else:
     dV_slice = size_x * size_y
     yt_z_string = "particle_position_z"
+    position_coordinates = ["x", "y", "z"]
     nppcell_1 = 10000
     nppcell_2 = 900
 # Volume of a slice corresponding to a single cell in the z direction. In tests 1 and 2, all the
@@ -120,6 +163,13 @@ def add_existing_species_to_dict(yt_ad, data_dict, species_name, prefix, suffix)
     data_dict[prefix + "_id_" + suffix] = yt_ad[species_name, "particle_id"].v
     data_dict[prefix + "_cpu_" + suffix] = yt_ad[species_name, "particle_cpu"].v
     data_dict[prefix + "_z_" + suffix] = yt_ad[species_name, yt_z_string].v
+    data_dict[prefix + "_pos_" + suffix] = np.stack(
+        [
+            yt_ad[species_name, "particle_position_" + coord].v
+            for coord in position_coordinates
+        ],
+        axis=-1,
+    )
 
 
 def add_empty_species_to_dict(data_dict, species_name, prefix, suffix):
@@ -130,6 +180,7 @@ def add_empty_species_to_dict(data_dict, species_name, prefix, suffix):
     data_dict[prefix + "_id_" + suffix] = np.empty(0)
     data_dict[prefix + "_cpu_" + suffix] = np.empty(0)
     data_dict[prefix + "_z_" + suffix] = np.empty(0)
+    data_dict[prefix + "_pos_" + suffix] = np.empty((0, len(position_coordinates)))
 
 
 def add_species_to_dict(yt_ad, data_dict, species_name, prefix, suffix):
@@ -247,11 +298,43 @@ def check_id(data):
         assert complex_id.shape == np.unique(complex_id).shape
 
 
+def as_rows(pos):
+    ## View each row (one particle position) as a single element, so that whole positions
+    ## can be compared with vectorized numpy functions
+    pos = np.ascontiguousarray(pos)
+    return pos.view(np.dtype((np.void, pos.dtype.itemsize * pos.shape[1]))).ravel()
+
+
+def check_product_positions(data):
+    ## The reactants are not pushed, so the product macroparticles must be located exactly
+    ## at the position of one of the reactant macroparticles that collided.
+    reactant_positions = [
+        as_rows(data[species_name + "_pos_start"]) for species_name in reactant_species
+    ]
+    for product_name in product_species:
+        positions = as_rows(data[product_name + "_pos_end"])
+        at_reactant = [np.isin(positions, reactant_positions[r]) for r in range(2)]
+        # Each product is at the position of a reactant
+        assert np.all(at_reactant[0] | at_reactant[1])
+        if products_per_fusion_event == 1:
+            # Each product is created at the position of the reactant that has the same
+            # charge, which ensures local charge conservation with a single macroparticle
+            at_same_charge_reactant = np.zeros(len(positions), dtype=bool)
+            for r in range(2):
+                if charge_number[product_name] == charge_number[reactant_species[r]]:
+                    at_same_charge_reactant |= at_reactant[r]
+            assert np.all(at_same_charge_reactant)
+        else:
+            # One product is created at the position of each reactant
+            assert np.count_nonzero(at_reactant[0]) == np.count_nonzero(at_reactant[1])
+
+
 def generic_check(data):
     check_particle_number_conservation(data)
     check_energy_conservation(data)
     check_momentum_conservation(data)
     check_id(data)
+    check_product_positions(data)
 
 
 def check_isotropy(data, relative_tolerance):
@@ -292,6 +375,9 @@ def cross_section(E_keV):
     ## in H.-S. Bosch and G.M. Hale 1992 Nucl. Fusion 32 611
     joule_to_keV = 1.0e-3 / scc.e
     B_G = scc.pi * scc.alpha * np.sqrt(2.0 * m_reduced * scc.c**2 * joule_to_keV)
+    if reaction_type == "DHe3":
+        # One of the reactants (helium3) has Z=2
+        B_G *= 2.0
     if reaction_type == "DT":
         A1 = 6.927e4
         A2 = 7.454e8
@@ -302,6 +388,26 @@ def cross_section(E_keV):
         B2 = -9.95e-1
         B3 = 6.981e-5
         B4 = 1.728e-4
+    elif reaction_type == "DDPT":
+        A1 = 5.5576e4
+        A2 = 2.1054e2
+        A3 = -3.2638e-2
+        A4 = 1.4987e-6
+        A5 = 1.8181e-10
+        B1 = 0
+        B2 = 0
+        B3 = 0
+        B4 = 0
+    elif reaction_type == "DHe3":
+        A1 = 5.7501e6
+        A2 = 2.5226e3
+        A3 = 4.5566e1
+        A4 = 0
+        A5 = 0
+        B1 = -3.1995e-3
+        B2 = -8.5530e-6
+        B3 = 5.9014e-8
+        B4 = 0
     elif reaction_type == "DD":
         A1 = 5.3701e4
         A2 = 3.3027e2
@@ -387,8 +493,10 @@ def check_macroparticle_number(
     ## equal to the parameter fusion_probability_target_value
     fusion_probability_per_pair = fusion_probability_target_value
     expected_fusion_number = numcells * num_pair_per_cell * fusion_probability_per_pair
-    expected_macroparticle_number = 2 * expected_fusion_number
-    std_macroparticle_number = 2 * np.sqrt(expected_fusion_number)
+    expected_macroparticle_number = products_per_fusion_event * expected_fusion_number
+    std_macroparticle_number = products_per_fusion_event * np.sqrt(
+        expected_fusion_number
+    )
     actual_macroparticle_number = data[product_species[0] + "_w_end"].shape[0]
     # 5 sigma test that has an intrinsic probability to fail of 1 over ~2 millions
     assert is_close(
@@ -397,6 +505,19 @@ def check_macroparticle_number(
         rtol=0.0,
         atol=5.0 * std_macroparticle_number,
     )
+
+    if "particle_production" in data:
+        w_sum = data[product_species[0] + "_w_end"].sum()
+        n_sum = data["particle_production"].sum()
+        tolerance = 0.02
+        print(
+            f"Check particle production diagnostic for collision {data['collision_name']}:"
+        )
+        print(f"from particles  = {w_sum}")
+        print(f"from diagnostic = {n_sum}")
+        print(f"error = {np.abs(w_sum - n_sum) / w_sum}")
+        print(f"tolerance = {tolerance}")
+        assert is_close(w_sum, n_sum, rtol=tolerance)
 
     ## used in subsequent function
     return expected_fusion_number
@@ -543,6 +664,13 @@ def main():
 
         # General checks that are performed for all tests
         generic_check(data)
+
+        product_production_name = f"{collision_names[i - 1]}_particle_production"
+        if ("boxlib", product_production_name) in ds_end.field_list:
+            data["collision_name"] = collision_names[i - 1]
+            data["particle_production"] = field_data_end[
+                "boxlib", product_production_name
+            ].to_ndarray()
 
         # Checks that are specific to test number i
         eval("specific_check" + str(i) + "(data, dt)")

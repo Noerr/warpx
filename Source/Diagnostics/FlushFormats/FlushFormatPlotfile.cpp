@@ -3,8 +3,8 @@
 #include "Fields.H"
 #include "Diagnostics/MultiDiagnostics.H"
 #include "Diagnostics/ParticleDiag/ParticleDiag.H"
+#include "FieldSolver/FiniteDifferenceSolver/HybridPICModel/HybridPICModel.H"
 #include "Particles/Filter/FilterFunctors.H"
-#include "Particles/WarpXParticleContainer.H"
 #include "Particles/ParticleIO.H"
 #include "Particles/WarpXParticleContainer.H"
 #include "Utils/Interpolate.H"
@@ -247,7 +247,8 @@ FlushFormatPlotfile::WriteJobInfo(const std::string& dir) const
 void
 FlushFormatPlotfile::WriteWarpXHeader(
     const std::string& name,
-    amrex::Vector<amrex::Geometry>& geom) const
+    amrex::Vector<amrex::Geometry>& geom,
+    bool const is_checkpoint) const
 {
     auto & warpx = WarpX::GetInstance();
     if (ParallelDescriptor::IOProcessor())
@@ -347,6 +348,13 @@ FlushFormatPlotfile::WriteWarpXHeader(
                     HeaderFile << diag.get_snapshot_full_flag(i_buffer) << "\n";
                 }
             }
+        }
+
+        // Keep the plotfile header compatible with readers such as yt, which
+        // interpret trailing multi-value lines as numeric species metadata.
+        if (auto const* hybrid = warpx.get_pointer_HybridPICModel(); is_checkpoint && hybrid) {
+            // This learned count is distinct from the AMR nsubsteps above.
+            HeaderFile << "hybrid_pic_substeps " << hybrid->m_substeps << '\n';
         }
     }
 }
@@ -450,8 +458,18 @@ FlushFormatPlotfile::WriteParticles(const std::string& dir,
             }, true);
             particlesConvertUnits(ConvertDirection::SI_to_WarpX, pc, mass);
         } else {
-            tmp.copyParticles(*pinned_pc, true);
-            particlesConvertUnits(ConvertDirection::WarpX_to_SI, &tmp, mass);
+            particlesConvertUnits(ConvertDirection::WarpX_to_SI, pinned_pc, mass);
+            using SrcData = WarpXParticleContainer::ParticleTileType::ConstParticleTileDataType;
+            tmp.copyParticles(*pinned_pc,
+                              [random_filter,uniform_filter,parser_filter,geometry_filter]
+                              AMREX_GPU_HOST_DEVICE
+                              (const SrcData& src, int ip, const amrex::RandomEngine& engine)
+            {
+                const SuperParticleType& p = src.getSuperParticle(ip);
+                return random_filter(p, engine) * uniform_filter(p, engine)
+                    * parser_filter(p, engine) * geometry_filter(p, engine);
+            }, true);
+            particlesConvertUnits(ConvertDirection::SI_to_WarpX, pinned_pc, mass);
         }
 
         // real_names contains a list of all particle attributes.
@@ -626,6 +644,15 @@ FlushFormatPlotfile::WriteAllRawFields(
                     default_level_prefix, "By_fp", lev, plot_raw_fields_guards );
         WriteRawMF( *warpx.m_fields.get(FieldType::Bfield_fp, Direction{2}, lev), dm, raw_pltname,
                     default_level_prefix, "Bz_fp", lev, plot_raw_fields_guards );
+        if (warpx.m_fields.has_vector(FieldType::E_old, lev))
+        {
+            WriteRawMF( *warpx.m_fields.get(FieldType::E_old, Direction{0}, lev), dm, raw_pltname,
+                        default_level_prefix, "Ex_old", lev, plot_raw_fields_guards );
+            WriteRawMF( *warpx.m_fields.get(FieldType::E_old, Direction{1}, lev), dm, raw_pltname,
+                        default_level_prefix, "Ey_old", lev, plot_raw_fields_guards );
+            WriteRawMF( *warpx.m_fields.get(FieldType::E_old, Direction{2}, lev), dm, raw_pltname,
+                        default_level_prefix, "Ez_old", lev, plot_raw_fields_guards );
+        }
         if (warpx.m_fields.has(FieldType::F_fp, lev))
         {
             WriteRawMF( *warpx.m_fields.get(FieldType::F_fp, lev), dm, raw_pltname,

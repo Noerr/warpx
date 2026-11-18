@@ -15,6 +15,7 @@
 #include <ablastr/utils/Communication.H>
 
 #include <AMReX.H>
+#include <AMReX_MFParallelFor.H>
 #include <AMReX_REAL.H>
 
 using namespace amrex::literals;
@@ -63,7 +64,7 @@ VarianceAccumulationBuffer::reset ()
 }
 
 amrex::MultiFab*
-VarianceAccumulationBuffer::get(std::string arr, ablastr::fields::Direction dir, int lev)
+VarianceAccumulationBuffer::get(const std::string& arr, ablastr::fields::Direction dir, int lev)
 {
     auto &warpx = WarpX::GetInstance();
     return warpx.m_fields.get("variance_buffer_" + arr + "_" + m_species_name, dir, lev);
@@ -88,8 +89,15 @@ VarianceAccumulationBuffer::ConvertVarianceToTemperatureAndFilter (
         auto const& periodicity = warpx.Geom(lev).periodicity();
 
         for (int idir = 0; idir < 3; ++idir) {
-            // Multiplies internal cells to convert variance to temperature
-            var_vf[lev][Direction{idir}]->mult(normalization_factor, 0, 1);
+            // The deposited variance is defined in valid and ghost cells.
+            // Convert all of that support before filtering: FillBoundary does
+            // not replace nonperiodic physical ghosts, and the filter reads them.
+            auto& temperature = *var_vf[lev][Direction{idir}];
+            auto const temperature_arrays = temperature.arrays();
+            amrex::ParallelFor(temperature, temperature.nGrowVect(),
+                [=] AMREX_GPU_DEVICE (int box, int i, int j, int k) noexcept {
+                    temperature_arrays[box](i,j,k) *= normalization_factor;
+                });
 
             amrex::Gpu::streamSynchronize();
 

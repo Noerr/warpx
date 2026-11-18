@@ -10,7 +10,9 @@
 
 #include "Particles/Collision/BinaryCollision/TwoProductUtil.H"
 #include "Particles/WarpXParticleContainer.H"
+#include "Utils/WarpXAlgorithmSelection.H"
 #include "Utils/ParticleUtils.H"
+#include "Utils/ScatteringUtils.H"
 #include "Utils/WarpXConst.H"
 
 #include <AMReX_DenseBins.H>
@@ -44,11 +46,16 @@ namespace {
      * @param[in] idx2_in index of second colliding macroparticle
      * @param[in] idx1_out_start index of first product macroparticle
      * @param[in] idx2_out_start index of second product macroparticle
+     * @param[in] num_copies number of macroparticles created for each product (1 or 2,
+     *            stored contiguously starting at idx1_out_start / idx2_out_start)
      * @param[in] m1_in mass of first colliding species
      * @param[in] m2_in mass of second colliding species
      * @param[in] m1_out mass of first product species
      * @param[in] m2_out mass of second product species
      * @param[in] E_fusion energy released in the fusion reaction
+     * @param[in] scattering_angle_model the scattering angle distribution to use
+     * @param[in] anisotropic_coefficients table of energy-dependent anisotropic coefficients
+     * @param[out] energy_range_status per-event status: -1 below, 0 within, 1 above
      * @param[in] engine the random engine
      */
     AMREX_GPU_HOST_DEVICE AMREX_INLINE
@@ -57,9 +64,13 @@ namespace {
                             SoaData_type& soa1_out, SoaData_type& soa2_out,
                             const index_type& idx1_in, const index_type& idx2_in,
                             const index_type& idx1_out_start, const index_type& idx2_out_start,
+                            int const num_copies,
                             const amrex::ParticleReal& m1_in, const amrex::ParticleReal& m2_in,
                             const amrex::ParticleReal& m1_out, const amrex::ParticleReal& m2_out,
                             const amrex::ParticleReal& E_fusion,
+                            ScatteringAngleModel const scattering_angle_model,
+                            ScatteringUtils::AnisotropicCoefficientTable const& anisotropic_coefficients,
+                            int* const energy_range_status,
                             const amrex::RandomEngine& engine)
     {
         using namespace amrex::literals;
@@ -77,23 +88,22 @@ namespace {
             ux1_out, uy1_out, uz1_out, m1_out,
             ux2_out, uy2_out, uz2_out, m2_out,
             E_fusion,
-            /*isotropic_scattering=*/true,
+            scattering_angle_model,
+            anisotropic_coefficients,
+            energy_range_status,
             engine);
 
-        // Fill momentum of product species (note that we actually
-        // create 4 products, 2 at the position of each incident particle)
-        soa1_out.m_rdata[PIdx::ux][idx1_out_start] = ux1_out;
-        soa1_out.m_rdata[PIdx::uy][idx1_out_start] = uy1_out;
-        soa1_out.m_rdata[PIdx::uz][idx1_out_start] = uz1_out;
-        soa1_out.m_rdata[PIdx::ux][idx1_out_start + 1] = ux1_out;
-        soa1_out.m_rdata[PIdx::uy][idx1_out_start + 1] = uy1_out;
-        soa1_out.m_rdata[PIdx::uz][idx1_out_start + 1] = uz1_out;
-        soa2_out.m_rdata[PIdx::ux][idx2_out_start] = ux2_out;
-        soa2_out.m_rdata[PIdx::uy][idx2_out_start] = uy2_out;
-        soa2_out.m_rdata[PIdx::uz][idx2_out_start] = uz2_out;
-        soa2_out.m_rdata[PIdx::ux][idx2_out_start + 1] = ux2_out;
-        soa2_out.m_rdata[PIdx::uy][idx2_out_start + 1] = uy2_out;
-        soa2_out.m_rdata[PIdx::uz][idx2_out_start + 1] = uz2_out;
+        // Fill momentum of product species (depending on the reaction, we create either
+        // 1 macroparticle per product, or 2 macroparticles per product, one at the position
+        // of each incident particle)
+        for (int n = 0; n < num_copies; ++n) {
+            soa1_out.m_rdata[PIdx::ux][idx1_out_start + n] = ux1_out;
+            soa1_out.m_rdata[PIdx::uy][idx1_out_start + n] = uy1_out;
+            soa1_out.m_rdata[PIdx::uz][idx1_out_start + n] = uz1_out;
+            soa2_out.m_rdata[PIdx::ux][idx2_out_start + n] = ux2_out;
+            soa2_out.m_rdata[PIdx::uy][idx2_out_start + n] = uy2_out;
+            soa2_out.m_rdata[PIdx::uz][idx2_out_start + n] = uz2_out;
+        }
     }
 }
 
