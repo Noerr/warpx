@@ -67,6 +67,7 @@ void HybridPICModel::ReadParameters ()
 
     utils::parser::queryWithParser(pp_hybrid, "n_floor", m_n_floor);
     utils::parser::queryWithParser(pp_hybrid, "soft_floor", m_soft_floor);
+    pp_hybrid.query("hall_divide_at_nodes", m_hall_divide_at_nodes);
 
     // convert electron temperature from eV to J
     m_elec_temp *= PhysConst::q_e;

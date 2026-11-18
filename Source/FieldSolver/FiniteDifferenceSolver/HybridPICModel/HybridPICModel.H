@@ -210,6 +210,10 @@ public:
      *      part J_i x B stored separately in Pass 1 (6*ncomps nodal scratch). */
     int m_soft_floor = 0;
 
+    /** Multimode RZ Ohm kernel: divide the Hall numerators by rho at the nodes before averaging to
+     *  the Yee points (skew across density gradients). Default false = original ordering. */
+    bool m_hall_divide_at_nodes = false;
+
     /** Plasma resistivity */
     std::string m_eta_expression = "0.0";
     std::unique_ptr<amrex::Parser> m_resistivity_parser;

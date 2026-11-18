@@ -1031,6 +1031,12 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
     const bool include_hyper_resistivity_term = hybrid_model->m_include_hyper_resistivity_term;
     const bool holmstrom_vacuum_region = hybrid_model->m_holmstrom_vacuum_region;
     const int soft_floor = hybrid_model->m_soft_floor;
+    // hall_divide_at_nodes: divide the Hall numerators (J - J_i) x B and J_i x B by the nodal rho
+    // in Pass 1 (theta grid, before forward_az_ft) and average the quotient to the Yee points in
+    // Pass 2. The default (false) averages the numerator and divides by the averaged rho, which
+    // is not skew across a density gradient and drives a grid-scale whistler instability where
+    // B/(mu0 n e) is largest (the PEC wall of a Bennett pinch). grad p_e keeps the Yee-point rho.
+    const bool hall_div_nodes = hybrid_model->m_hall_divide_at_nodes;
 
     // Index type required for interpolating fields from their respective
     // staggering to the Er, Etheta, Ez locations
@@ -1080,6 +1086,7 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
         Array4<Real const> const& Br      = Bfield[0]->const_array(mfi);
         Array4<Real const> const& Btheta  = Bfield[1]->const_array(mfi);
         Array4<Real const> const& Bz      = Bfield[2]->const_array(mfi);
+        Array4<Real const> const& rho_n   = rhofield.const_array(mfi);
 
         amrex::ParallelFor(mfi.tilebox(),
         [=] AMREX_GPU_DEVICE (int i, int j, int /*k*/) {
@@ -1158,6 +1165,37 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
                 enEi_r_th[k] = Jit_th[k] * Bz_th[k] - Jiz_th[k] * Bt_th[k];
                 enEi_t_th[k] = Jiz_th[k] * Br_th[k] - Jir_th[k] * Bz_th[k];
                 enEi_z_th[k] = Jir_th[k] * Bt_th[k] - Jit_th[k] * Br_th[k];
+            }
+
+            if (hall_div_nodes) {
+                // Nodal rho on the same theta grid; same floor / taper logic as Pass 2.
+                Real rho_nm[MAX_PSEUDO_SPECTRAL_NMODES * 2];
+                Real rho_nth[MAX_PSEUDO_SPECTRAL_NTHETA];
+                for (int c = 0; c < ncomps; ++c) { rho_nm[c] = rho_n(i, j, 0, c); }
+                if (i == 0) { apply_axis_bc_scalar(nmodes, rho_nm); }
+                inverse_az_ft(nmodes, n_theta, rho_nm, rho_nth);
+                for (int k = 0; k < n_theta; ++k) {
+                    const Real rk = rho_nth[k];
+                    Real inv_rho;
+                    if (soft_floor == 1) {
+                        inv_rho = rk / (rk*rk + rho_floor*rho_floor);
+                    } else if (soft_floor == 0 && rk < rho_floor && holmstrom_vacuum_region) {
+                        inv_rho = 0._rt;
+                    } else {
+                        inv_rho = 1._rt / amrex::max(rk, rho_floor);
+                    }
+                    if (soft_floor == 3) {
+                        // store the full Hall E: -(J_i x B)/rho + (J x B)/rho * S; Pass 2 then reads enE only
+                        const Real S = rk*rk / (rk*rk + rho_floor*rho_floor);
+                        enE_r_th[k] = -enEi_r_th[k]*inv_rho + (enE_r_th[k] + enEi_r_th[k])*inv_rho*S;
+                        enE_t_th[k] = -enEi_t_th[k]*inv_rho + (enE_t_th[k] + enEi_t_th[k])*inv_rho*S;
+                        enE_z_th[k] = -enEi_z_th[k]*inv_rho + (enE_z_th[k] + enEi_z_th[k])*inv_rho*S;
+                        enEi_r_th[k] = 0._rt; enEi_t_th[k] = 0._rt; enEi_z_th[k] = 0._rt;
+                    } else {
+                        enE_r_th[k] *= inv_rho; enE_t_th[k] *= inv_rho; enE_z_th[k] *= inv_rho;
+                        enEi_r_th[k] *= inv_rho; enEi_t_th[k] *= inv_rho; enEi_z_th[k] *= inv_rho;
+                    }
+                }
             }
 
             // Forward FT back to modes and store.
@@ -1335,10 +1373,14 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
                         // tapered by S(rho); J x B = (J-J_i)x B + J_i x B = enE + enEi.
                         const Real S = rho_th[k]*rho_th[k]
                                      / (rho_th[k]*rho_th[k] + rho_floor*rho_floor);
-                        Er_th[k] = -enEi_r_th[k]*inv_rho
-                                 + (enE_r_th[k] + enEi_r_th[k] - grad_Pe_k)*inv_rho*S;
+                        Er_th[k] = hall_div_nodes
+                                 ? enE_r_th[k] - grad_Pe_k*inv_rho*S
+                                 : -enEi_r_th[k]*inv_rho
+                                   + (enE_r_th[k] + enEi_r_th[k] - grad_Pe_k)*inv_rho*S;
                     } else {
-                        Er_th[k] = (enE_r_th[k] - grad_Pe_k) * inv_rho;
+                        Er_th[k] = hall_div_nodes
+                                 ? enE_r_th[k] - grad_Pe_k*inv_rho
+                                 : (enE_r_th[k] - grad_Pe_k) * inv_rho;
                     }
 
                     if (solve_for_Faraday) {
@@ -1481,10 +1523,14 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
                     if (soft_floor == 3) {
                         const Real S = rho_th[k]*rho_th[k]
                                      / (rho_th[k]*rho_th[k] + rho_floor*rho_floor);
-                        Et_th[k] = -enEi_t_th[k]*inv_rho
-                                 + (enE_t_th[k] + enEi_t_th[k] - grad_Pe_k)*inv_rho*S;
+                        Et_th[k] = hall_div_nodes
+                                 ? enE_t_th[k] - grad_Pe_k*inv_rho*S
+                                 : -enEi_t_th[k]*inv_rho
+                                   + (enE_t_th[k] + enEi_t_th[k] - grad_Pe_k)*inv_rho*S;
                     } else {
-                        Et_th[k] = (enE_t_th[k] - grad_Pe_k) * inv_rho;
+                        Et_th[k] = hall_div_nodes
+                                 ? enE_t_th[k] - grad_Pe_k*inv_rho
+                                 : (enE_t_th[k] - grad_Pe_k) * inv_rho;
                     }
 
                     if (solve_for_Faraday) {
@@ -1612,10 +1658,14 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
                     if (soft_floor == 3) {
                         const Real S = rho_th[k]*rho_th[k]
                                      / (rho_th[k]*rho_th[k] + rho_floor*rho_floor);
-                        Ez_th[k] = -enEi_z_th[k]*inv_rho
-                                 + (enE_z_th[k] + enEi_z_th[k] - grad_Pe_k)*inv_rho*S;
+                        Ez_th[k] = hall_div_nodes
+                                 ? enE_z_th[k] - grad_Pe_k*inv_rho*S
+                                 : -enEi_z_th[k]*inv_rho
+                                   + (enE_z_th[k] + enEi_z_th[k] - grad_Pe_k)*inv_rho*S;
                     } else {
-                        Ez_th[k] = (enE_z_th[k] - grad_Pe_k) * inv_rho;
+                        Ez_th[k] = hall_div_nodes
+                                 ? enE_z_th[k] - grad_Pe_k*inv_rho
+                                 : (enE_z_th[k] - grad_Pe_k) * inv_rho;
                     }
 
                     if (solve_for_Faraday) {
