@@ -5,8 +5,8 @@ AMReX fork used by this branch
 
 This branch does **not** build against ``AMReX-Codes/amrex``. It pulls AMReX
 from ``https://github.com/Noerr/amrex.git``, branch
-``noerr/restart-1x-read-26.08``, which is the upstream ``26.08`` tag plus
-seven commits.
+``noerr/restart-1x-read-26.11``, which is the upstream ``26.11`` tag plus
+eight commits (carried forward unchanged from ``noerr/restart-1x-read-26.08``).
 
 They address three *different* defects. The first two both surface during
 checkpoint **restart** and were conflated during the investigation; the third
@@ -419,7 +419,7 @@ stock builds can be produced from identical WarpX source::
     # stock AMReX, same WarpX tree
     cmake -S . -B build_stock \
         -DWarpX_amrex_repo=https://github.com/AMReX-Codes/amrex.git \
-        -DWarpX_amrex_branch=26.08
+        -DWarpX_amrex_branch=26.11
 
 Two things to establish, in order:
 
@@ -438,7 +438,7 @@ Two committed values select the fork. To go back to stock AMReX:
 
 * ``cmake/dependencies/AMReX.cmake`` — set ``WarpX_amrex_repo`` back to
   ``https://github.com/AMReX-Codes/amrex.git``
-* ``dependencies.json`` — set ``commit_amrex`` back to ``26.08``
+* ``dependencies.json`` — set ``commit_amrex`` back to ``26.11``
 
 Both can also be overridden at configure time without editing the tree, as
 shown above, which is the quickest way to A/B the patch.
@@ -457,11 +457,12 @@ fetched tree::
     git remote add upstream https://github.com/AMReX-Codes/amrex.git
     git fetch upstream --tags
     git checkout -b noerr/restart-1x-read-<new> <new-tag>
-    git cherry-pick noerr/restart-1x-read-26.08
+    git cherry-pick -x <old-tag>..origin/noerr/restart-1x-read-<old>   # the whole stack, not just the tip
     git push origin noerr/restart-1x-read-<new>
 
 then update ``commit_amrex`` here to the new branch name.
 
+The ``26.08`` stack is preserved as ``noerr/restart-1x-read-26.08`` on the fork.
 The same patch on the ``26.04`` tag is preserved as
 ``noerr/restart-1x-read-26.04`` on the fork. It is archival only — the
 ``WarpX_26.04+patched`` branch deliberately still builds against stock AMReX,
