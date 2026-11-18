@@ -475,6 +475,7 @@ void HybridPICModel::FillElectronPressureMF (
             // EOS is linear and the round-trip recovers Pe_m = T_e/q_e * rho_m
             // up to roundoff; at nmodes == 1 the FT pair is the identity and
             // the body reduces to the original scalar Pe(rho) call.
+#if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER)
             amrex::Real rho_m[MAX_PSEUDO_SPECTRAL_NMODES * 2];
             amrex::Real Pe_m [MAX_PSEUDO_SPECTRAL_NMODES * 2];
             amrex::Real rho_th[MAX_PSEUDO_SPECTRAL_NTHETA];
@@ -501,6 +502,13 @@ void HybridPICModel::FillElectronPressureMF (
             for (int c = 0; c < ncomps; ++c) {
                 Pe(i, j, k, c) = Pe_m[c];
             }
+#else
+            // Cartesian: single component, pointwise EOS (the azimuthal FT helpers
+            // are RZ-only).
+            amrex::ignore_unused(nmodes, ncomps, n_theta);
+            Pe(i, j, k) = ElectronPressure::get_pressure(
+                n0_ref, elec_temp, gamma, rho(i, j, k));
+#endif
         });
     }
 }
