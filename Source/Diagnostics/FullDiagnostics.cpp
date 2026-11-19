@@ -745,7 +745,8 @@ FullDiagnostics::AddRZModesToDiags (int lev)
     for (int dim=0; dim<3; dim++){
         // 3 components, r theta z
         m_all_field_functors[lev].push_back(std::make_unique<JFunctor>(
-            dim, lev, m_crse_ratio, false, deposit_current, ncomp_multimodefab));
+            dim, lev, m_crse_ratio, false, deposit_current,
+            /*species_index=*/-1, ncomp_multimodefab));
         deposit_current = false;
         AddRZModesToOutputNames(std::string("J") + coord[dim], ncomp_multimodefab);
     }
