@@ -25,7 +25,7 @@ JFunctor::JFunctor (const int dir, int lev,
                    amrex::IntVect crse_ratio,
                    bool convertRZmodes2cartesian,
                    bool deposit_current,
-                   int species_index, int ncomp)
+                   int ncomp, int species_index)
     : ComputeDiagFunctor(ncomp, crse_ratio), m_dir(dir), m_lev(lev),
       m_convertRZmodes2cartesian(convertRZmodes2cartesian),
       m_deposit_current(deposit_current),
