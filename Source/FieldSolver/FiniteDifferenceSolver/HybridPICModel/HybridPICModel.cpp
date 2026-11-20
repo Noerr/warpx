@@ -10,6 +10,7 @@
  */
 
 #include "HybridPICModel.H"
+#include "HybridPICAzimuthalFT.H"
 
 #include <ablastr/coarsen/sample.H>
 #include <ablastr/utils/Communication.H>
@@ -66,6 +67,7 @@ void HybridPICModel::ReadParameters ()
     pp_hybrid.query("max_substep_attempts", m_max_substep_attempts);
 
     utils::parser::queryWithParser(pp_hybrid, "holmstrom_vacuum_region", m_holmstrom_vacuum_region);
+    utils::parser::queryWithParser(pp_hybrid, "hall_divide_at_nodes", m_hall_divide_at_nodes);
 
     // edge | node | cell (see VacuumSeamSwitchMode); an unknown value aborts
     // naming the accepted values.
@@ -401,12 +403,6 @@ void HybridPICModel::AllocateLevelMFs (
             Bx_nodal_flag, By_nodal_flag, Bz_nodal_flag
         );
     }
-
-#ifdef WARPX_DIM_RZ
-    WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
-        (ncomps == 1),
-        "Ohm's law solver only support m = 0 azimuthal mode at present.");
-#endif
 }
 
 void HybridPICModel::InitData (const ablastr::fields::MultiFabRegister& fields)
@@ -566,6 +562,29 @@ void HybridPICModel::InitData (const ablastr::fields::MultiFabRegister& fields)
     m_eta_h = m_hyper_resistivity_parser->compile<2>();
     const std::set<std::string> hyper_resistivity_symbols = m_hyper_resistivity_parser->symbols();
     m_hyper_resistivity_has_B_dependence += hyper_resistivity_symbols.count("B");
+
+#if defined(WARPX_DIM_RZ)
+    if (WarpX::n_rz_azimuthal_modes > 1) {
+        // Features of the hybrid solver that the multimode Ohm's law does not
+        // (yet) treat for m >= 1.
+        WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
+            WarpX::n_rz_azimuthal_modes <= MAX_PSEUDO_SPECTRAL_NMODES,
+            "hybrid_pic_model: n_rz_azimuthal_modes exceeds MAX_PSEUDO_SPECTRAL_NMODES "
+            "(HybridPICAzimuthalFT.H).");
+        WARPX_ALWAYS_ASSERT_WITH_MESSAGE(!m_add_external_fields,
+            "hybrid_pic_model: external fields are not supported with n_rz_azimuthal_modes > 1.");
+        WARPX_ALWAYS_ASSERT_WITH_MESSAGE(!m_solve_electron_energy_equation,
+            "hybrid_pic_model: solve_electron_energy_equation is not supported with "
+            "n_rz_azimuthal_modes > 1.");
+        WARPX_ALWAYS_ASSERT_WITH_MESSAGE(!m_has_per_species_eta && !m_has_resistive_drag,
+            "hybrid_pic_model: per-species resistivity and resistive drag are not supported "
+            "with n_rz_azimuthal_modes > 1.");
+        WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
+            !(m_include_hyper_resistivity_term && m_hyper_resistivity_has_B_dependence),
+            "hybrid_pic_model: a B-dependent plasma_hyper_resistivity is not supported with "
+            "n_rz_azimuthal_modes > 1.");
+    }
+#endif
 
     if (m_has_external_current) {
         m_J_external_parser[0] = std::make_unique<amrex::Parser>(
@@ -1250,6 +1269,12 @@ void HybridPICModel::FillElectronPressureMF (
     const auto rho_floor =
         floor_density ? PhysConst::q_e * m_n_floor : amrex::Real(0.0);
 
+#if defined(WARPX_DIM_RZ)
+    const int nmodes = WarpX::n_rz_azimuthal_modes;
+    const int ncomps = 2*nmodes - 1;
+    const int n_theta = HybridPICAzimuthalNTheta(nmodes);
+#endif
+
     // Loop through the grids, and over the tiles within each grid
 #ifdef AMREX_USE_OMP
 #pragma omp parallel if (amrex::Gpu::notInLaunchRegion())
@@ -1268,6 +1293,34 @@ void HybridPICModel::FillElectronPressureMF (
         // so the seed has to leave T_e's ghosts valid itself.
         // Out-of-domain ghosts are handled at the density floor.
         tilebox.grow(Pe_field.nGrowVect());
+
+#if defined(WARPX_DIM_RZ)
+        if (nmodes > 1) {
+            // The closure is nonlinear in rho (for gamma != 1, and through the
+            // floor), so each azimuthal mode of P_e and T_e couples all modes of
+            // rho: evaluate it on an azimuthal sample grid and transform back.
+            ParallelFor(tilebox, [=] AMREX_GPU_DEVICE (int i, int j, int k) {
+                Real rho_m[2*MAX_PSEUDO_SPECTRAL_NMODES];
+                Real rho_th[MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real Pe_th[MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real Te_th[MAX_PSEUDO_SPECTRAL_NTHETA];
+                Real out_m[2*MAX_PSEUDO_SPECTRAL_NMODES];
+                for (int c = 0; c < ncomps; ++c) { rho_m[c] = rho(i, j, k, c); }
+                inverse_az_ft(nmodes, n_theta, rho_m, rho_th);
+                for (int t = 0; t < n_theta; ++t) {
+                    const Real ne = std::max(rho_th[t], rho_floor) / PhysConst::q_e;
+                    const Real Te_joule = elec_temp * std::pow(ne/n0_ref, gamma_minus_1);
+                    Pe_th[t] = ne * Te_joule;
+                    Te_th[t] = Te_joule / PhysConst::kb;
+                }
+                forward_az_ft(nmodes, n_theta, Pe_th, out_m);
+                for (int c = 0; c < ncomps; ++c) { Pe(i, j, k, c) = out_m[c]; }
+                forward_az_ft(nmodes, n_theta, Te_th, out_m);
+                for (int c = 0; c < ncomps; ++c) { Te(i, j, k, c) = out_m[c]; }
+            });
+            continue;
+        }
+#endif
 
         ParallelFor(tilebox, [=] AMREX_GPU_DEVICE (int i, int j, int k) {
             // Polytropic closure: T_e = T0 (n_e/n0)^(gamma-1), in the units of

@@ -399,6 +399,51 @@ void WarpX::HybridPICDepositRhoAndJ ()
     FinalizeRho();
     FinalizeJ();
 
+#if defined(WARPX_DIM_RZ)
+    // Multimode: impose the on-axis regularity of the deposited rho and J_i
+    // used by the Ohm's-law solve. Scalars and z components have vanishing
+    // m >= 1 modes at r = 0, which the deposition (divided by the small axis
+    // volume) does not reproduce. The transverse m = 1 current is finite on
+    // the axis with J_theta,1 = -i J_r,1; J_r is cell-centered in r and is
+    // extrapolated linearly to r = 0 from its two innermost cells.
+    if (n_rz_azimuthal_modes > 1) {
+        for (int lev = 0; lev <= finest_level; ++lev) {
+            amrex::MultiFab& rho = *m_fields.get(FieldType::rho_fp, lev);
+            amrex::MultiFab& Jr = *m_fields.get(FieldType::current_fp, Direction{0}, lev);
+            amrex::MultiFab& Jt = *m_fields.get(FieldType::current_fp, Direction{1}, lev);
+            amrex::MultiFab& Jz = *m_fields.get(FieldType::current_fp, Direction{2}, lev);
+            const int nc = rho.nComp();
+#ifdef AMREX_USE_OMP
+#pragma omp parallel if (amrex::Gpu::notInLaunchRegion())
+#endif
+            for (amrex::MFIter mfi(rho, TilingIfNotGPU()); mfi.isValid(); ++mfi) {
+                amrex::Box axis_box = mfi.tilebox();
+                if (axis_box.smallEnd(0) > 0) { continue; }
+                axis_box.setRange(0, 0, 1);
+                amrex::Array4<amrex::Real> const& rho_arr = rho.array(mfi);
+                amrex::Array4<amrex::Real> const& Jr_arr = Jr.array(mfi);
+                amrex::Array4<amrex::Real> const& Jt_arr = Jt.array(mfi);
+                amrex::Array4<amrex::Real> const& Jz_arr = Jz.array(mfi);
+                const amrex::Box rho_box = amrex::convert(axis_box, rho.ixType());
+                amrex::ParallelFor(rho_box, [=] AMREX_GPU_DEVICE (int i, int j, int k) {
+                    for (int n = 1; n < nc; ++n) { rho_arr(i, j, k, n) = 0._rt; }
+                });
+                const amrex::Box jz_box = amrex::convert(axis_box, Jz.ixType());
+                amrex::ParallelFor(jz_box, [=] AMREX_GPU_DEVICE (int i, int j, int k) {
+                    for (int n = 1; n < nc; ++n) { Jz_arr(i, j, k, n) = 0._rt; }
+                });
+                const amrex::Box jt_box = amrex::convert(axis_box, Jt.ixType());
+                amrex::ParallelFor(jt_box, [=] AMREX_GPU_DEVICE (int i, int j, int k) {
+                    const amrex::Real Jr1_re = 1.5_rt*Jr_arr(i, j, k, 1) - 0.5_rt*Jr_arr(i+1, j, k, 1);
+                    const amrex::Real Jr1_im = 1.5_rt*Jr_arr(i, j, k, 2) - 0.5_rt*Jr_arr(i+1, j, k, 2);
+                    Jt_arr(i, j, k, 1) =  Jr1_im;
+                    Jt_arr(i, j, k, 2) = -Jr1_re;
+                });
+            }
+        }
+    }
+#endif
+
     // SyncCurrent does not include a call to FillBoundary, but it is needed
     // for the hybrid-PIC solver since current values are interpolated to
     // a nodal grid

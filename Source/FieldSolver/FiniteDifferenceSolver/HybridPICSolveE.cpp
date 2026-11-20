@@ -20,6 +20,7 @@
 #   include "FiniteDifferenceAlgorithms/CartesianYeeAlgorithm.H"
 #   include "FiniteDifferenceAlgorithms/CartesianNodalAlgorithm.H"
 #endif
+#include "HybridPICModel/HybridPICAzimuthalFT.H"
 #include "HybridPICModel/HybridPICModel.H"
 #include "Utils/TextMsg.H"
 #include "WarpX.H"
@@ -470,10 +471,17 @@ void FiniteDifferenceSolver::HybridPICSolveE (
     if (m_fdtd_algo == ElectromagneticSolverAlgo::HybridPIC) {
 #if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER)
 
-        HybridPICSolveECylindrical <CylindricalYeeAlgorithm> (
-            Efield, Jfield, Jifield, Bfield, rhofield, Pefield,
-            eb_update_E, lev, hybrid_model, solve_for_Faraday
-        );
+        if (m_nmodes > 1) {
+            HybridPICSolveECylindricalMultiMode <CylindricalYeeAlgorithm> (
+                Efield, Jfield, Jifield, Bfield, rhofield, Pefield,
+                eb_update_E, lev, hybrid_model, solve_for_Faraday
+            );
+        } else {
+            HybridPICSolveECylindrical <CylindricalYeeAlgorithm> (
+                Efield, Jfield, Jifield, Bfield, rhofield, Pefield,
+                eb_update_E, lev, hybrid_model, solve_for_Faraday
+            );
+        }
 
 #elif defined(WARPX_DIM_RSPHERE)
 
@@ -984,6 +992,453 @@ void FiniteDifferenceSolver::HybridPICSolveECylindrical (
                 }
             }
         );
+
+        if (cost && WarpX::load_balance_costs_update_algo == LoadBalanceCostsUpdateAlgo::Timers)
+        {
+            amrex::Gpu::synchronize();
+            wt = static_cast<Real>(amrex::second()) - wt;
+            amrex::HostDevice::Atomic::Add( &(*cost)[mfi.index()], wt);
+        }
+    }
+}
+
+template<typename T_Algo>
+void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
+    ablastr::fields::VectorField const& Efield,
+    ablastr::fields::VectorField const& Jfield,
+    ablastr::fields::VectorField const& Jifield,
+    ablastr::fields::VectorField const& Bfield,
+    amrex::MultiFab const& rhofield,
+    amrex::MultiFab const& Pefield,
+    std::array< std::unique_ptr<amrex::iMultiFab>,3 > const& eb_update_E,
+    int lev, HybridPICModel const* hybrid_model,
+    const bool solve_for_Faraday )
+{
+    // Ohm's law for n_rz_azimuthal_modes > 1. The structure follows
+    // HybridPICSolveECylindrical (nodal (J - J_i) x B, then the Yee-grid E),
+    // but every product, the division by rho and the resistivity parsers are
+    // evaluated on n_theta azimuthal samples: the modal inputs are transformed
+    // to the samples, combined pointwise, and transformed back to the modes.
+    // Linear operators (derivatives, Laplacians, stagger interpolation) act
+    // on each mode directly. Unsupported options are rejected in
+    // HybridPICModel::InitData.
+
+    const int nmodes = m_nmodes;
+    const int ncomps = 2 * nmodes - 1;
+    const int n_theta = HybridPICAzimuthalNTheta(nmodes);
+
+    // for the profiler
+    amrex::LayoutData<amrex::Real>* cost = WarpX::getCosts(lev);
+
+    using namespace ablastr::coarsen::sample;
+
+    // get hybrid model parameters
+    const auto eta = hybrid_model->m_eta;
+    const auto eta_h = hybrid_model->m_eta_h;
+    const auto rho_floor = hybrid_model->m_n_floor * PhysConst::q_e;
+    const auto resistivity_has_J_dependence = hybrid_model->m_resistivity_has_J_dependence;
+    const bool include_hyper_resistivity_term = hybrid_model->m_include_hyper_resistivity_term;
+    const bool holmstrom_vacuum_region = hybrid_model->m_holmstrom_vacuum_region;
+    const bool hall_div_nodes = hybrid_model->m_hall_divide_at_nodes;
+
+    // Same term selection as HybridPICSolveECylindrical (the energy equation
+    // and the resistive drag are not available in multimode).
+    const bool include_resistivity = solve_for_Faraday;
+    const bool include_grad_pe = !solve_for_Faraday;
+
+    auto & warpx = WarpX::GetInstance();
+    const amrex::Real t_new = warpx.gett_new(lev);
+
+    amrex::GpuArray<int, 3> const& Er_stag     = hybrid_model->Ex_IndexType;
+    amrex::GpuArray<int, 3> const& Etheta_stag = hybrid_model->Ey_IndexType;
+    amrex::GpuArray<int, 3> const& Ez_stag     = hybrid_model->Ez_IndexType;
+    amrex::GpuArray<int, 3> const& Jr_stag     = hybrid_model->Jx_IndexType;
+    amrex::GpuArray<int, 3> const& Jtheta_stag = hybrid_model->Jy_IndexType;
+    amrex::GpuArray<int, 3> const& Jz_stag     = hybrid_model->Jz_IndexType;
+    amrex::GpuArray<int, 3> const& Br_stag     = hybrid_model->Bx_IndexType;
+    amrex::GpuArray<int, 3> const& Btheta_stag = hybrid_model->By_IndexType;
+    amrex::GpuArray<int, 3> const& Bz_stag     = hybrid_model->Bz_IndexType;
+
+    amrex::GpuArray<int, 3> const& nodal   = {1, 1, 1};
+    amrex::GpuArray<int, 3> const& coarsen = {1, 1, 1};
+
+    Real const dr = m_dr;
+    Real const rmin = m_rmin;
+
+    // Nodal (J - J_i) x B, or (J - J_i) x B / rho with hall_divide_at_nodes:
+    // component d*ncomps + c holds direction d (r, theta, z), mode component c.
+    auto const& ba = convert(rhofield.boxArray(), IntVect::TheNodeVector());
+    MultiFab enE_nodal_mf(ba, rhofield.DistributionMap(), 3 * ncomps, IntVect::TheZeroVector());
+
+    // Pass 1: nodal Hall numerator
+#ifdef AMREX_USE_OMP
+#pragma omp parallel if (amrex::Gpu::notInLaunchRegion())
+#endif
+    for ( MFIter mfi(enE_nodal_mf, TilingIfNotGPU()); mfi.isValid(); ++mfi ) {
+        if (cost && WarpX::load_balance_costs_update_algo == LoadBalanceCostsUpdateAlgo::Timers)
+        {
+            amrex::Gpu::synchronize();
+        }
+        Real wt = static_cast<Real>(amrex::second());
+
+        Array4<Real> const& enE_nodal = enE_nodal_mf.array(mfi);
+        Array4<Real const> const& Jr = Jfield[0]->const_array(mfi);
+        Array4<Real const> const& Jtheta = Jfield[1]->const_array(mfi);
+        Array4<Real const> const& Jz = Jfield[2]->const_array(mfi);
+        Array4<Real const> const& Jir = Jifield[0]->const_array(mfi);
+        Array4<Real const> const& Jit = Jifield[1]->const_array(mfi);
+        Array4<Real const> const& Jiz = Jifield[2]->const_array(mfi);
+        Array4<Real const> const& Br = Bfield[0]->const_array(mfi);
+        Array4<Real const> const& Btheta = Bfield[1]->const_array(mfi);
+        Array4<Real const> const& Bz = Bfield[2]->const_array(mfi);
+        Array4<Real const> const& rho = rhofield.const_array(mfi);
+
+        amrex::ParallelFor(mfi.tilebox(), [=] AMREX_GPU_DEVICE (int i, int j, int /*k*/){
+
+            constexpr int NM = 2*MAX_PSEUDO_SPECTRAL_NMODES;
+            constexpr int NT = MAX_PSEUDO_SPECTRAL_NTHETA;
+            Real Br_m[NM], Bt_m[NM], Bz_m[NM];
+            Real dJr_m[NM], dJt_m[NM], dJz_m[NM];
+            for (int c = 0; c < ncomps; ++c) {
+                Br_m[c] = Interp(Br, Br_stag, nodal, coarsen, i, j, 0, c);
+                Bt_m[c] = Interp(Btheta, Btheta_stag, nodal, coarsen, i, j, 0, c);
+                Bz_m[c] = Interp(Bz, Bz_stag, nodal, coarsen, i, j, 0, c);
+                // J - J_i is linear in the modes
+                dJr_m[c] = Interp(Jr, Jr_stag, nodal, coarsen, i, j, 0, c)
+                         - Interp(Jir, Jr_stag, nodal, coarsen, i, j, 0, c);
+                dJt_m[c] = Interp(Jtheta, Jtheta_stag, nodal, coarsen, i, j, 0, c)
+                         - Interp(Jit, Jtheta_stag, nodal, coarsen, i, j, 0, c);
+                dJz_m[c] = Interp(Jz, Jz_stag, nodal, coarsen, i, j, 0, c)
+                         - Interp(Jiz, Jz_stag, nodal, coarsen, i, j, 0, c);
+            }
+
+            const bool on_axis = (i == 0);
+            if (on_axis) {
+                apply_axis_bc_vector_rt(nmodes, Br_m, Bt_m);
+                apply_axis_bc_vector_rt(nmodes, dJr_m, dJt_m);
+                apply_axis_bc_scalar(nmodes, Bz_m);
+                apply_axis_bc_scalar(nmodes, dJz_m);
+            }
+
+            Real Br_th[NT], Bt_th[NT], Bz_th[NT], dJr_th[NT], dJt_th[NT], dJz_th[NT];
+            inverse_az_ft(nmodes, n_theta, Br_m, Br_th);
+            inverse_az_ft(nmodes, n_theta, Bt_m, Bt_th);
+            inverse_az_ft(nmodes, n_theta, Bz_m, Bz_th);
+            inverse_az_ft(nmodes, n_theta, dJr_m, dJr_th);
+            inverse_az_ft(nmodes, n_theta, dJt_m, dJt_th);
+            inverse_az_ft(nmodes, n_theta, dJz_m, dJz_th);
+
+            Real rho_th[NT];
+            if (hall_div_nodes) {
+                Real rho_m[NM];
+                for (int c = 0; c < ncomps; ++c) { rho_m[c] = rho(i, j, 0, c); }
+                if (on_axis) { apply_axis_bc_scalar(nmodes, rho_m); }
+                inverse_az_ft(nmodes, n_theta, rho_m, rho_th);
+            }
+
+            Real er_th[NT], et_th[NT], ez_th[NT];
+            for (int t = 0; t < n_theta; ++t) {
+                er_th[t] = dJt_th[t] * Bz_th[t] - dJz_th[t] * Bt_th[t];
+                et_th[t] = dJz_th[t] * Br_th[t] - dJr_th[t] * Bz_th[t];
+                ez_th[t] = dJr_th[t] * Bt_th[t] - dJt_th[t] * Br_th[t];
+                if (hall_div_nodes) {
+                    const Real inv_rho = (rho_th[t] < rho_floor && holmstrom_vacuum_region) ?
+                        0._rt : 1._rt / std::max(rho_th[t], rho_floor);
+                    er_th[t] *= inv_rho;
+                    et_th[t] *= inv_rho;
+                    ez_th[t] *= inv_rho;
+                }
+            }
+
+            Real out_m[NM];
+            forward_az_ft(nmodes, n_theta, er_th, out_m);
+            for (int c = 0; c < ncomps; ++c) { enE_nodal(i, j, 0, c) = out_m[c]; }
+            forward_az_ft(nmodes, n_theta, et_th, out_m);
+            for (int c = 0; c < ncomps; ++c) { enE_nodal(i, j, 0, ncomps + c) = out_m[c]; }
+            forward_az_ft(nmodes, n_theta, ez_th, out_m);
+            for (int c = 0; c < ncomps; ++c) { enE_nodal(i, j, 0, 2*ncomps + c) = out_m[c]; }
+        });
+
+        if (cost && WarpX::load_balance_costs_update_algo == LoadBalanceCostsUpdateAlgo::Timers)
+        {
+            amrex::Gpu::synchronize();
+            wt = static_cast<Real>(amrex::second()) - wt;
+            amrex::HostDevice::Atomic::Add( &(*cost)[mfi.index()], wt);
+        }
+    }
+
+    // Pass 2: E on the Yee grid
+#ifdef AMREX_USE_OMP
+#pragma omp parallel if (amrex::Gpu::notInLaunchRegion())
+#endif
+    for ( MFIter mfi(*Efield[0], TilingIfNotGPU()); mfi.isValid(); ++mfi ) {
+        if (cost && WarpX::load_balance_costs_update_algo == LoadBalanceCostsUpdateAlgo::Timers)
+        {
+            amrex::Gpu::synchronize();
+        }
+        Real wt = static_cast<Real>(amrex::second());
+
+        Array4<Real> const& Er = Efield[0]->array(mfi);
+        Array4<Real> const& Etheta = Efield[1]->array(mfi);
+        Array4<Real> const& Ez = Efield[2]->array(mfi);
+        Array4<Real const> const& Jr = Jfield[0]->const_array(mfi);
+        Array4<Real const> const& Jtheta = Jfield[1]->const_array(mfi);
+        Array4<Real const> const& Jz = Jfield[2]->const_array(mfi);
+        Array4<Real const> const& enE = enE_nodal_mf.const_array(mfi);
+        Array4<Real const> const& rho = rhofield.const_array(mfi);
+        Array4<Real const> const& Pe = Pefield.const_array(mfi);
+
+        amrex::Array4<int> update_Er_arr, update_Etheta_arr, update_Ez_arr;
+        if (EB::enabled()) {
+            update_Er_arr = eb_update_E[0]->array(mfi);
+            update_Etheta_arr = eb_update_E[1]->array(mfi);
+            update_Ez_arr = eb_update_E[2]->array(mfi);
+        }
+
+        Real const * const AMREX_RESTRICT coefs_r = m_stencil_coefs_r.dataPtr();
+        int const n_coefs_r = static_cast<int>(m_stencil_coefs_r.size());
+        Real const * const AMREX_RESTRICT coefs_z = m_stencil_coefs_z.dataPtr();
+        int const n_coefs_z = static_cast<int>(m_stencil_coefs_z.size());
+
+        Box const& ter = mfi.tilebox(Efield[0]->ixType().toIntVect());
+        Box const& tet = mfi.tilebox(Efield[1]->ixType().toIntVect());
+        Box const& tez = mfi.tilebox(Efield[2]->ixType().toIntVect());
+
+        // Pointwise E on the azimuthal samples, shared by the three components:
+        //   E = (enE - grad Pe) / rho                (Hall + pressure)
+        //   E = enE - grad Pe / rho                  (hall_divide_at_nodes)
+        // plus eta J - eta_h nabla^2 J in the Faraday solves.
+        auto const pointwise_E = [=] AMREX_GPU_DEVICE (
+            Real const* enE_th, Real const* gP_th, Real const* rho_th,
+            Real const* Jr_th, Real const* Jt_th, Real const* Jz_th,
+            Real const* Jc_th, Real const* lapJ_th, Real* E_th)
+        {
+            for (int t = 0; t < n_theta; ++t) {
+                if (rho_th[t] < rho_floor && holmstrom_vacuum_region) {
+                    E_th[t] = 0._rt;
+                    continue;
+                }
+                const Real inv_rho = 1._rt / std::max(rho_th[t], rho_floor);
+                const Real grad_Pe = include_grad_pe ? gP_th[t] : 0._rt;
+                E_th[t] = hall_div_nodes ? enE_th[t] - grad_Pe * inv_rho
+                                         : (enE_th[t] - grad_Pe) * inv_rho;
+                if (include_resistivity) {
+                    Real jtot = 0._rt;
+                    if (resistivity_has_J_dependence) {
+                        jtot = std::sqrt(Jr_th[t]*Jr_th[t] + Jt_th[t]*Jt_th[t] + Jz_th[t]*Jz_th[t]);
+                    }
+                    E_th[t] += eta(rho_th[t], jtot, t_new) * Jc_th[t];
+                    if (include_hyper_resistivity_term) {
+                        // B-dependent eta_h is rejected in InitData
+                        E_th[t] -= eta_h(rho_th[t], 0._rt) * lapJ_th[t];
+                    }
+                }
+            }
+        };
+
+        amrex::ParallelFor(ter, tet, tez,
+
+            // Er calculation
+            [=] AMREX_GPU_DEVICE (int i, int j, int /*k*/){
+
+                if (update_Er_arr && update_Er_arr(i, j, 0) == 0) { return; }
+
+                constexpr int NM = 2*MAX_PSEUDO_SPECTRAL_NMODES;
+                constexpr int NT = MAX_PSEUDO_SPECTRAL_NTHETA;
+
+                // r on cell-centered point (Er is cell-centered in r)
+                const Real r = rmin + (i + 0.5_rt)*dr;
+                const Real one_over_r2 = 1._rt/(r*r);
+
+                Real enE_m[NM], rho_m[NM], gP_m[NM], Jr_m[NM], Jt_m[NM], Jz_m[NM], lapJ_m[NM];
+                for (int c = 0; c < ncomps; ++c) {
+                    enE_m[c] = Interp(enE, nodal, Er_stag, coarsen, i, j, 0, c);
+                    rho_m[c] = Interp(rho, nodal, Er_stag, coarsen, i, j, 0, c);
+                    gP_m[c] = T_Algo::UpwardDr(Pe, coefs_r, n_coefs_r, i, j, 0, c);
+                    Jr_m[c] = Jr(i, j, 0, c);
+                    Jt_m[c] = Interp(Jtheta, Jtheta_stag, Er_stag, coarsen, i, j, 0, c);
+                    Jz_m[c] = Interp(Jz, Jz_stag, Er_stag, coarsen, i, j, 0, c);
+                    lapJ_m[c] = 0._rt;
+                }
+
+                if (include_hyper_resistivity_term && include_resistivity) {
+                    // (nabla^2 J)_r = nabla^2 J_r - J_r/r^2 - (2/r^2) dJ_theta/dtheta,
+                    // with d/dtheta: (Re, Im)_m -> (m Im, -m Re)_m
+                    for (int c = 0; c < ncomps; ++c) {
+                        const int m = (c + 1) / 2;
+                        lapJ_m[c] = T_Algo::Dr_rDr_over_r(Jr, r, dr, coefs_r, n_coefs_r, i, j, 0, c)
+                            + T_Algo::Dzz(Jr, coefs_z, n_coefs_z, i, j, 0, c)
+                            - static_cast<Real>(m*m + 1) * one_over_r2 * Jr_m[c];
+                    }
+                    for (int m = 1; m < nmodes; ++m) {
+                        const Real cc = 2._rt * static_cast<Real>(m) * one_over_r2;
+                        lapJ_m[2*m - 1] -= cc * Jt_m[2*m];
+                        lapJ_m[2*m    ] += cc * Jt_m[2*m - 1];
+                    }
+                }
+
+                Real enE_th[NT], rho_th[NT], gP_th[NT], Jr_th[NT], Jt_th[NT], Jz_th[NT];
+                Real lapJ_th[NT], E_th[NT];
+                inverse_az_ft(nmodes, n_theta, enE_m, enE_th);
+                inverse_az_ft(nmodes, n_theta, rho_m, rho_th);
+                inverse_az_ft(nmodes, n_theta, gP_m, gP_th);
+                inverse_az_ft(nmodes, n_theta, Jr_m, Jr_th);
+                inverse_az_ft(nmodes, n_theta, Jt_m, Jt_th);
+                inverse_az_ft(nmodes, n_theta, Jz_m, Jz_th);
+                inverse_az_ft(nmodes, n_theta, lapJ_m, lapJ_th);
+
+                pointwise_E(enE_th, gP_th, rho_th, Jr_th, Jt_th, Jz_th, Jr_th, lapJ_th, E_th);
+
+                Real E_m[NM];
+                forward_az_ft(nmodes, n_theta, E_th, E_m);
+                for (int c = 0; c < ncomps; ++c) { Er(i, j, 0, c) = E_m[c]; }
+            },
+
+            // Etheta calculation
+            [=] AMREX_GPU_DEVICE (int i, int j, int /*k*/){
+
+                if (update_Etheta_arr && update_Etheta_arr(i, j, 0) == 0) { return; }
+
+                // r on a nodal grid (Etheta is nodal in r)
+                Real const r = rmin + i*dr;
+                // On axis: E_theta,0 = 0 and E_theta,m>=2 = 0; E_theta,1 is set
+                // from E_r,1 after this loop.
+                if (r < 0.5_rt*dr) {
+                    for (int c = 0; c < ncomps; ++c) { Etheta(i, j, 0, c) = 0._rt; }
+                    return;
+                }
+
+                constexpr int NM = 2*MAX_PSEUDO_SPECTRAL_NMODES;
+                constexpr int NT = MAX_PSEUDO_SPECTRAL_NTHETA;
+                const Real one_over_r2 = 1._rt/(r*r);
+
+                Real enE_m[NM], rho_m[NM], gP_m[NM], Jr_m[NM], Jt_m[NM], Jz_m[NM], lapJ_m[NM];
+                for (int c = 0; c < ncomps; ++c) {
+                    enE_m[c] = Interp(enE, nodal, Etheta_stag, coarsen, i, j, 0, ncomps + c);
+                    rho_m[c] = Interp(rho, nodal, Etheta_stag, coarsen, i, j, 0, c);
+                    Jr_m[c] = Interp(Jr, Jr_stag, Etheta_stag, coarsen, i, j, 0, c);
+                    Jt_m[c] = Jtheta(i, j, 0, c);
+                    Jz_m[c] = Interp(Jz, Jz_stag, Etheta_stag, coarsen, i, j, 0, c);
+                    lapJ_m[c] = 0._rt;
+                }
+                // (grad Pe)_theta = (1/r) dPe/dtheta
+                gP_m[0] = 0._rt;
+                for (int m = 1; m < nmodes; ++m) {
+                    const Real Pe_re = Interp(Pe, nodal, Etheta_stag, coarsen, i, j, 0, 2*m - 1);
+                    const Real Pe_im = Interp(Pe, nodal, Etheta_stag, coarsen, i, j, 0, 2*m);
+                    gP_m[2*m - 1] =  static_cast<Real>(m) * Pe_im / r;
+                    gP_m[2*m    ] = -static_cast<Real>(m) * Pe_re / r;
+                }
+
+                if (include_hyper_resistivity_term && include_resistivity) {
+                    // (nabla^2 J)_theta = nabla^2 J_theta - J_theta/r^2 + (2/r^2) dJ_r/dtheta
+                    for (int c = 0; c < ncomps; ++c) {
+                        const int m = (c + 1) / 2;
+                        lapJ_m[c] = T_Algo::Dr_rDr_over_r(Jtheta, r, dr, coefs_r, n_coefs_r, i, j, 0, c)
+                            + T_Algo::Dzz(Jtheta, coefs_z, n_coefs_z, i, j, 0, c)
+                            - static_cast<Real>(m*m + 1) * one_over_r2 * Jt_m[c];
+                    }
+                    for (int m = 1; m < nmodes; ++m) {
+                        const Real cc = 2._rt * static_cast<Real>(m) * one_over_r2;
+                        lapJ_m[2*m - 1] += cc * Jr_m[2*m];
+                        lapJ_m[2*m    ] -= cc * Jr_m[2*m - 1];
+                    }
+                }
+
+                Real enE_th[NT], rho_th[NT], gP_th[NT], Jr_th[NT], Jt_th[NT], Jz_th[NT];
+                Real lapJ_th[NT], E_th[NT];
+                inverse_az_ft(nmodes, n_theta, enE_m, enE_th);
+                inverse_az_ft(nmodes, n_theta, rho_m, rho_th);
+                inverse_az_ft(nmodes, n_theta, gP_m, gP_th);
+                inverse_az_ft(nmodes, n_theta, Jr_m, Jr_th);
+                inverse_az_ft(nmodes, n_theta, Jt_m, Jt_th);
+                inverse_az_ft(nmodes, n_theta, Jz_m, Jz_th);
+                inverse_az_ft(nmodes, n_theta, lapJ_m, lapJ_th);
+
+                pointwise_E(enE_th, gP_th, rho_th, Jr_th, Jt_th, Jz_th, Jt_th, lapJ_th, E_th);
+
+                Real E_m[NM];
+                forward_az_ft(nmodes, n_theta, E_th, E_m);
+                for (int c = 0; c < ncomps; ++c) { Etheta(i, j, 0, c) = E_m[c]; }
+            },
+
+            // Ez calculation
+            [=] AMREX_GPU_DEVICE (int i, int j, int /*k*/){
+
+                if (update_Ez_arr && update_Ez_arr(i, j, 0) == 0) { return; }
+
+                constexpr int NM = 2*MAX_PSEUDO_SPECTRAL_NMODES;
+                constexpr int NT = MAX_PSEUDO_SPECTRAL_NTHETA;
+
+                // r on nodal point (Ez is nodal in r)
+                const Real r = rmin + i*dr;
+                const bool on_axis = (i == 0);
+
+                Real enE_m[NM], rho_m[NM], gP_m[NM], Jr_m[NM], Jt_m[NM], Jz_m[NM], lapJ_m[NM];
+                for (int c = 0; c < ncomps; ++c) {
+                    enE_m[c] = Interp(enE, nodal, Ez_stag, coarsen, i, j, 0, 2*ncomps + c);
+                    rho_m[c] = Interp(rho, nodal, Ez_stag, coarsen, i, j, 0, c);
+                    gP_m[c] = T_Algo::UpwardDz(Pe, coefs_z, n_coefs_z, i, j, 0, c);
+                    Jr_m[c] = Interp(Jr, Jr_stag, Ez_stag, coarsen, i, j, 0, c);
+                    Jt_m[c] = Interp(Jtheta, Jtheta_stag, Ez_stag, coarsen, i, j, 0, c);
+                    Jz_m[c] = Jz(i, j, 0, c);
+                    lapJ_m[c] = 0._rt;
+                }
+                if (on_axis) {
+                    // z components and scalars: the m >= 1 modes vanish on the axis
+                    apply_axis_bc_scalar(nmodes, enE_m);
+                    apply_axis_bc_scalar(nmodes, rho_m);
+                    apply_axis_bc_scalar(nmodes, gP_m);
+                    apply_axis_bc_scalar(nmodes, Jz_m);
+                }
+
+                if (include_hyper_resistivity_term && include_resistivity) {
+                    for (int c = 0; c < ncomps; ++c) {
+                        const int m = (c + 1) / 2;
+                        Real lap = T_Algo::Dzz(Jz, coefs_z, n_coefs_z, i, j, 0, c);
+                        if (on_axis) {
+                            // regular form of the m = 0 radial Laplacian on the axis
+                            lap += T_Algo::Drr(Jz, coefs_r, n_coefs_r, i, j, 0, c);
+                        } else {
+                            lap += T_Algo::Dr_rDr_over_r(Jz, r, dr, coefs_r, n_coefs_r, i, j, 0, c)
+                                - static_cast<Real>(m*m) / (r*r) * Jz_m[c];
+                        }
+                        lapJ_m[c] = lap;
+                    }
+                }
+
+                Real enE_th[NT], rho_th[NT], gP_th[NT], Jr_th[NT], Jt_th[NT], Jz_th[NT];
+                Real lapJ_th[NT], E_th[NT];
+                inverse_az_ft(nmodes, n_theta, enE_m, enE_th);
+                inverse_az_ft(nmodes, n_theta, rho_m, rho_th);
+                inverse_az_ft(nmodes, n_theta, gP_m, gP_th);
+                inverse_az_ft(nmodes, n_theta, Jr_m, Jr_th);
+                inverse_az_ft(nmodes, n_theta, Jt_m, Jt_th);
+                inverse_az_ft(nmodes, n_theta, Jz_m, Jz_th);
+                inverse_az_ft(nmodes, n_theta, lapJ_m, lapJ_th);
+
+                pointwise_E(enE_th, gP_th, rho_th, Jr_th, Jt_th, Jz_th, Jz_th, lapJ_th, E_th);
+
+                Real E_m[NM];
+                forward_az_ft(nmodes, n_theta, E_th, E_m);
+                for (int c = 0; c < ncomps; ++c) { Ez(i, j, 0, c) = E_m[c]; }
+            }
+        );
+
+        // On the axis, E_theta,1 = -i E_r,1 (finite transverse field, see
+        // apply_axis_bc_vector_rt). E_r is cell-centered in r: extrapolate its
+        // m = 1 mode linearly to r = 0 from r = dr/2 and r = 3 dr/2. This runs
+        // after the loop above so that E_r is final on this tile.
+        if (rmin == 0._rt && nmodes > 1 && tet.smallEnd(0) == 0) {
+            amrex::Box tet_axis = tet;
+            tet_axis.setRange(0, 0, 1);
+            amrex::ParallelFor(tet_axis, [=] AMREX_GPU_DEVICE (int i, int j, int /*k*/){
+                const Real Er1_re = 1.5_rt*Er(i, j, 0, 1) - 0.5_rt*Er(i+1, j, 0, 1);
+                const Real Er1_im = 1.5_rt*Er(i, j, 0, 2) - 0.5_rt*Er(i+1, j, 0, 2);
+                Etheta(i, j, 0, 1) =  Er1_im;
+                Etheta(i, j, 0, 2) = -Er1_re;
+            });
+        }
 
         if (cost && WarpX::load_balance_costs_update_algo == LoadBalanceCostsUpdateAlgo::Timers)
         {

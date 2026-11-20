@@ -358,6 +358,25 @@ class FiniteDifferenceSolver
             int lev, HybridPICModel const* hybrid_model,
             bool solve_for_Faraday );
 
+        /**
+         * \brief Ohm's-law E-solve in RZ for n_rz_azimuthal_modes > 1.
+         *
+         * Same inputs and outputs as HybridPICSolveECylindrical. The products,
+         * the division by rho and the resistivity parsers are evaluated on a grid
+         * of azimuthal samples and transformed back to the azimuthal modes.
+         */
+        template<typename T_Algo>
+        void HybridPICSolveECylindricalMultiMode (
+            ablastr::fields::VectorField const& Efield,
+            ablastr::fields::VectorField const& Jfield,
+            ablastr::fields::VectorField const& Jifield,
+            ablastr::fields::VectorField const& Bfield,
+            amrex::MultiFab const& rhofield,
+            amrex::MultiFab const& Pefield,
+            std::array< std::unique_ptr<amrex::iMultiFab>,3> const& eb_update_E,
+            int lev, HybridPICModel const* hybrid_model,
+            bool solve_for_Faraday );
+
         template<typename T_Algo>
         void CalculateCurrentAmpereCylindrical (
             ablastr::fields::VectorField& Jfield,

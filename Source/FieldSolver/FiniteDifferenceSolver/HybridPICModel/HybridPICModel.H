@@ -550,6 +550,12 @@ public:
     /** Plasma density floor - if n < n_floor it will be set to n_floor */
     amrex::Real m_n_floor = 1.0;
 
+    /** Multimode RZ Ohm's law only: divide the Hall numerators (J - J_i) x B
+     *  by rho at the nodes (on the azimuthal sample grid) before averaging them
+     *  to the Yee points, instead of averaging the numerator and dividing by
+     *  the averaged rho. */
+    bool m_hall_divide_at_nodes = false;
+
     /** Plasma resistivity */
     std::string m_eta_expression = "0.0";
     std::unique_ptr<amrex::Parser> m_resistivity_parser;
