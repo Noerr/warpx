@@ -2301,15 +2301,18 @@ void HybridPICModel::BfieldEvolve (
     // We also store the initial B-field from the start of this integration step
     // (i.e., a static copy) in case we need to fully reset the Bfield (needed
     // for RK4).
+    // All field components are carried (2*n_rz_azimuthal_modes-1 in RZ): the
+    // running copy is in components [0, nc) and the static copy in [nc, 2*nc).
+    int const nc = Bfield[lev][0]->nComp();
     std::array< MultiFab, 3 > B_old;
     for (int ii = 0; ii < 3; ii++)
     {
         B_old[ii] = MultiFab(
-            Bfield[lev][ii]->boxArray(), Bfield[lev][ii]->DistributionMap(), 2, ng
+            Bfield[lev][ii]->boxArray(), Bfield[lev][ii]->DistributionMap(), 2*nc, ng
         );
-        MultiFab::Copy(B_old[ii], *Bfield[lev][ii], 0, 0, 1, ng);
-        // the values at index 1 will be kept static through the integration steps
-        MultiFab::Copy(B_old[ii], *Bfield[lev][ii], 0, 1, 1, ng);
+        MultiFab::Copy(B_old[ii], *Bfield[lev][ii], 0, 0, nc, ng);
+        // the values at components [nc, 2*nc) will be kept static through the integration steps
+        MultiFab::Copy(B_old[ii], *Bfield[lev][ii], 0, nc, nc, ng);
     }
 
     amrex::Real dt_sub = dt_half / (m_substeps / 2._rt);
@@ -2361,7 +2364,7 @@ void HybridPICModel::BfieldEvolve (
                 n_accepted = 0;
                 // reset B_old to original one
                 for (int ii = 0; ii < 3; ii++) {
-                    MultiFab::Copy(B_old[ii], B_old[ii], 1, 0, 1, ng);
+                    MultiFab::Copy(B_old[ii], B_old[ii], nc, 0, nc, ng);
                 }
                 use_rkf45 = true;
             }
@@ -2373,13 +2376,13 @@ void HybridPICModel::BfieldEvolve (
             ++n_accepted;
             // update B_old to the current Bfield
             for (int ii = 0; ii < 3; ii++) {
-                MultiFab::Copy(B_old[ii], *Bfield[lev][ii], 0, 0, 1, ng);
+                MultiFab::Copy(B_old[ii], *Bfield[lev][ii], 0, 0, nc, ng);
             }
             dt_sub *= std::min(m_substep_max_growth, step_change_factor);
         } else {
             // reset Bfield to B_old before trying the integration again
             for (int ii = 0; ii < 3; ii++) {
-                MultiFab::Copy(*Bfield[lev][ii], B_old[ii], 0, 0, 1, ng);
+                MultiFab::Copy(*Bfield[lev][ii], B_old[ii], 0, 0, nc, ng);
             }
             dt_sub *= std::max(0.1_rt, step_change_factor);
         }
@@ -2440,12 +2443,14 @@ void HybridPICModel::BfieldEvolveRK4 (
     IntVect ng, std::optional<bool> nodal_sync )
 {
     // Create multifabs for each direction to store the Runge-Kutta intermediate terms.
-    // Each multifab has 2 components for the different terms that need to be stored.
+    // Each multifab has 2 terms per field component (nc components in total:
+    // 2*n_rz_azimuthal_modes-1 in RZ, 1 otherwise), stored as [0, nc) and [nc, 2*nc).
+    int const nc = Bfield[lev][0]->nComp();
     std::array< MultiFab, 3 > K;
     for (int ii = 0; ii < 3; ii++)
     {
         K[ii] = MultiFab(
-            Bfield[lev][ii]->boxArray(), Bfield[lev][ii]->DistributionMap(), 2,
+            Bfield[lev][ii]->boxArray(), Bfield[lev][ii]->DistributionMap(), 2*nc,
             Bfield[lev][ii]->nGrowVect()
         );
     }
@@ -2461,9 +2466,9 @@ void HybridPICModel::BfieldEvolveRK4 (
     // B_new = B_old + 0.5 * dt * [-curl x E(B_old)] = B_old + 0.5 * dt * K0.
     for (int ii = 0; ii < 3; ii++)
     {
-        // Extract 0.5 * dt * K0 for each direction into index 0 of K.
+        // Extract 0.5 * dt * K0 for each direction into components [0, nc) of K.
         MultiFab::LinComb(
-            K[ii], 1._rt, *Bfield[lev][ii], 0, -1._rt, B_old[ii], 0, 0, 1, ng
+            K[ii], 1._rt, *Bfield[lev][ii], 0, -1._rt, B_old[ii], 0, 0, nc, ng
         );
     }
 
@@ -2505,20 +2510,26 @@ void HybridPICModel::BfieldEvolveRK4 (
         amrex::ParallelFor(tjx, tjy, tjz,
             // x calculation
             [=] AMREX_GPU_DEVICE (int i, int j, int k){
-                Bx(i, j, k) -= Kx(i, j, k, 0);
-                Kx(i, j, k, 1) = Bx(i, j, k) - Bx_old(i, j, k);
+                for (int c = 0; c < nc; ++c) {
+                    Bx(i, j, k, c) -= Kx(i, j, k, 0*nc + c);
+                    Kx(i, j, k, 1*nc + c) = Bx(i, j, k, c) - Bx_old(i, j, k, c);
+                }
             },
 
             // y calculation
             [=] AMREX_GPU_DEVICE (int i, int j, int k){
-                By(i, j, k) -= Ky(i, j, k, 0);
-                Ky(i, j, k, 1) = By(i, j, k) - By_old(i, j, k);
+                for (int c = 0; c < nc; ++c) {
+                    By(i, j, k, c) -= Ky(i, j, k, 0*nc + c);
+                    Ky(i, j, k, 1*nc + c) = By(i, j, k, c) - By_old(i, j, k, c);
+                }
             },
 
             // z calculation
             [=] AMREX_GPU_DEVICE (int i, int j, int k){
-                Bz(i, j, k) -= Kz(i, j, k, 0);
-                Kz(i, j, k, 1) = Bz(i, j, k) - Bz_old(i, j, k);
+                for (int c = 0; c < nc; ++c) {
+                    Bz(i, j, k, c) -= Kz(i, j, k, 0*nc + c);
+                    Kz(i, j, k, 1*nc + c) = Bz(i, j, k, c) - Bz_old(i, j, k, c);
+                }
             }
         );
     }
@@ -2536,7 +2547,7 @@ void HybridPICModel::BfieldEvolveRK4 (
     {
         // Subtract 0.5 * dt * K1 from the Bfield for each direction to get
         // B_new = B_old + dt * K2.
-        MultiFab::Subtract(*Bfield[lev][ii], K[ii], 1, 0, 1, ng);
+        MultiFab::Subtract(*Bfield[lev][ii], K[ii], nc, 0, nc, ng);
     }
 
     // Step 4:
@@ -2581,20 +2592,26 @@ void HybridPICModel::BfieldEvolveRK4 (
         amrex::ParallelFor(tjx, tjy, tjz,
             // Bx calculation
             [=] AMREX_GPU_DEVICE (int i, int j, int k){
-                Kx(i, j, k, 0) += Bx(i, j, k) - Bx_old(i, j, k) + 2.0_rt * Kx(i, j, k, 1);
-                Bx(i, j, k) = Bx_old(i, j, k) + Kx(i, j, k, 0) / 3.0_rt;
+                for (int c = 0; c < nc; ++c) {
+                    Kx(i, j, k, 0*nc + c) += Bx(i, j, k, c) - Bx_old(i, j, k, c) + 2.0_rt * Kx(i, j, k, 1*nc + c);
+                    Bx(i, j, k, c) = Bx_old(i, j, k, c) + Kx(i, j, k, 0*nc + c) / 3.0_rt;
+                }
             },
 
             // By calculation
             [=] AMREX_GPU_DEVICE (int i, int j, int k){
-                Ky(i, j, k, 0) += By(i, j, k) - By_old(i, j, k) + 2.0_rt * Ky(i, j, k, 1);
-                By(i, j, k) = By_old(i, j, k) + Ky(i, j, k, 0) / 3.0_rt;
+                for (int c = 0; c < nc; ++c) {
+                    Ky(i, j, k, 0*nc + c) += By(i, j, k, c) - By_old(i, j, k, c) + 2.0_rt * Ky(i, j, k, 1*nc + c);
+                    By(i, j, k, c) = By_old(i, j, k, c) + Ky(i, j, k, 0*nc + c) / 3.0_rt;
+                }
             },
 
             // Bz calculation
             [=] AMREX_GPU_DEVICE (int i, int j, int k){
-                Kz(i, j, k, 0) += Bz(i, j, k) - Bz_old(i, j, k) + 2.0_rt * Kz(i, j, k, 1);
-                Bz(i, j, k) = Bz_old(i, j, k) + Kz(i, j, k, 0) / 3.0_rt;
+                for (int c = 0; c < nc; ++c) {
+                    Kz(i, j, k, 0*nc + c) += Bz(i, j, k, c) - Bz_old(i, j, k, c) + 2.0_rt * Kz(i, j, k, 1*nc + c);
+                    Bz(i, j, k, c) = Bz_old(i, j, k, c) + Kz(i, j, k, 0*nc + c) / 3.0_rt;
+                }
             }
         );
     }
@@ -2628,16 +2645,19 @@ amrex::Real HybridPICModel::BfieldEvolveRKF45 (
     // K: 5 components per field direction stored as:
     //   comp 0 = h*k1, comp 1 = h*k2 (overwritten with h*k6 after stage 6),
     //   comp 2 = h*k3, comp 3 = h*k4, comp 4 = h*k5
+    // Each stage holds all nc field components: stage s, component c is
+    // stored at s*nc + c.
+    int const nc = Bfield[lev][0]->nComp();
     std::array<MultiFab, 3> K;
     std::array<MultiFab, 3> err_scratch;
     for (int ii = 0; ii < 3; ii++)
     {
         K[ii] = MultiFab(
-            Bfield[lev][ii]->boxArray(), Bfield[lev][ii]->DistributionMap(), 5,
+            Bfield[lev][ii]->boxArray(), Bfield[lev][ii]->DistributionMap(), 5*nc,
             Bfield[lev][ii]->nGrowVect()
         );
         err_scratch[ii] = MultiFab(
-            Bfield[lev][ii]->boxArray(), Bfield[lev][ii]->DistributionMap(), 1,
+            Bfield[lev][ii]->boxArray(), Bfield[lev][ii]->DistributionMap(), nc,
             amrex::IntVect(0)
         );
     }
@@ -2663,19 +2683,25 @@ amrex::Real HybridPICModel::BfieldEvolveRKF45 (
         Box const& tjz = mfi.tilebox(Bfield[lev][2]->ixType().toIntVect(), ng);
         amrex::ParallelFor(tjx, tjy, tjz,
             [=] AMREX_GPU_DEVICE (int i, int j, int k){
-                amrex::Real const k1 = Bx(i, j, k) - Bx_old(i, j, k);
-                Kx(i, j, k, 0) = k1;
-                Bx(i, j, k) = Bx_old(i, j, k) + a21*k1;
+                for (int c = 0; c < nc; ++c) {
+                    amrex::Real const k1 = Bx(i, j, k, c) - Bx_old(i, j, k, c);
+                    Kx(i, j, k, 0*nc + c) = k1;
+                    Bx(i, j, k, c) = Bx_old(i, j, k, c) + a21*k1;
+                }
             },
             [=] AMREX_GPU_DEVICE (int i, int j, int k){
-                amrex::Real const k1 = By(i, j, k) - By_old(i, j, k);
-                Ky(i, j, k, 0) = k1;
-                By(i, j, k) = By_old(i, j, k) + a21*k1;
+                for (int c = 0; c < nc; ++c) {
+                    amrex::Real const k1 = By(i, j, k, c) - By_old(i, j, k, c);
+                    Ky(i, j, k, 0*nc + c) = k1;
+                    By(i, j, k, c) = By_old(i, j, k, c) + a21*k1;
+                }
             },
             [=] AMREX_GPU_DEVICE (int i, int j, int k){
-                amrex::Real const k1 = Bz(i, j, k) - Bz_old(i, j, k);
-                Kz(i, j, k, 0) = k1;
-                Bz(i, j, k) = Bz_old(i, j, k) + a21*k1;
+                for (int c = 0; c < nc; ++c) {
+                    amrex::Real const k1 = Bz(i, j, k, c) - Bz_old(i, j, k, c);
+                    Kz(i, j, k, 0*nc + c) = k1;
+                    Bz(i, j, k, c) = Bz_old(i, j, k, c) + a21*k1;
+                }
             }
         );
     }
@@ -2702,22 +2728,28 @@ amrex::Real HybridPICModel::BfieldEvolveRKF45 (
         Box const& tjz = mfi.tilebox(Bfield[lev][2]->ixType().toIntVect(), ng);
         amrex::ParallelFor(tjx, tjy, tjz,
             [=] AMREX_GPU_DEVICE (int i, int j, int k){
-                amrex::Real const k1 = Kx(i, j, k, 0);
-                amrex::Real const k2 = Bx(i, j, k) - Bx_old(i, j, k) - a21*k1;
-                Kx(i, j, k, 1) = k2;
-                Bx(i, j, k) = Bx_old(i, j, k) + a31*k1 + a32*k2;
+                for (int c = 0; c < nc; ++c) {
+                    amrex::Real const k1 = Kx(i, j, k, 0*nc + c);
+                    amrex::Real const k2 = Bx(i, j, k, c) - Bx_old(i, j, k, c) - a21*k1;
+                    Kx(i, j, k, 1*nc + c) = k2;
+                    Bx(i, j, k, c) = Bx_old(i, j, k, c) + a31*k1 + a32*k2;
+                }
             },
             [=] AMREX_GPU_DEVICE (int i, int j, int k){
-                amrex::Real const k1 = Ky(i, j, k, 0);
-                amrex::Real const k2 = By(i, j, k) - By_old(i, j, k) - a21*k1;
-                Ky(i, j, k, 1) = k2;
-                By(i, j, k) = By_old(i, j, k) + a31*k1 + a32*k2;
+                for (int c = 0; c < nc; ++c) {
+                    amrex::Real const k1 = Ky(i, j, k, 0*nc + c);
+                    amrex::Real const k2 = By(i, j, k, c) - By_old(i, j, k, c) - a21*k1;
+                    Ky(i, j, k, 1*nc + c) = k2;
+                    By(i, j, k, c) = By_old(i, j, k, c) + a31*k1 + a32*k2;
+                }
             },
             [=] AMREX_GPU_DEVICE (int i, int j, int k){
-                amrex::Real const k1 = Kz(i, j, k, 0);
-                amrex::Real const k2 = Bz(i, j, k) - Bz_old(i, j, k) - a21*k1;
-                Kz(i, j, k, 1) = k2;
-                Bz(i, j, k) = Bz_old(i, j, k) + a31*k1 + a32*k2;
+                for (int c = 0; c < nc; ++c) {
+                    amrex::Real const k1 = Kz(i, j, k, 0*nc + c);
+                    amrex::Real const k2 = Bz(i, j, k, c) - Bz_old(i, j, k, c) - a21*k1;
+                    Kz(i, j, k, 1*nc + c) = k2;
+                    Bz(i, j, k, c) = Bz_old(i, j, k, c) + a31*k1 + a32*k2;
+                }
             }
         );
     }
@@ -2743,25 +2775,31 @@ amrex::Real HybridPICModel::BfieldEvolveRKF45 (
         Box const& tjz = mfi.tilebox(Bfield[lev][2]->ixType().toIntVect(), ng);
         amrex::ParallelFor(tjx, tjy, tjz,
             [=] AMREX_GPU_DEVICE (int i, int j, int k){
-                amrex::Real const k1 = Kx(i, j, k, 0);
-                amrex::Real const k2 = Kx(i, j, k, 1);
-                amrex::Real const k3 = Bx(i, j, k) - Bx_old(i, j, k) - a31*k1 - a32*k2;
-                Kx(i, j, k, 2) = k3;
-                Bx(i, j, k) = Bx_old(i, j, k) + a41*k1 + a42*k2 + a43*k3;
+                for (int c = 0; c < nc; ++c) {
+                    amrex::Real const k1 = Kx(i, j, k, 0*nc + c);
+                    amrex::Real const k2 = Kx(i, j, k, 1*nc + c);
+                    amrex::Real const k3 = Bx(i, j, k, c) - Bx_old(i, j, k, c) - a31*k1 - a32*k2;
+                    Kx(i, j, k, 2*nc + c) = k3;
+                    Bx(i, j, k, c) = Bx_old(i, j, k, c) + a41*k1 + a42*k2 + a43*k3;
+                }
             },
             [=] AMREX_GPU_DEVICE (int i, int j, int k){
-                amrex::Real const k1 = Ky(i, j, k, 0);
-                amrex::Real const k2 = Ky(i, j, k, 1);
-                amrex::Real const k3 = By(i, j, k) - By_old(i, j, k) - a31*k1 - a32*k2;
-                Ky(i, j, k, 2) = k3;
-                By(i, j, k) = By_old(i, j, k) + a41*k1 + a42*k2 + a43*k3;
+                for (int c = 0; c < nc; ++c) {
+                    amrex::Real const k1 = Ky(i, j, k, 0*nc + c);
+                    amrex::Real const k2 = Ky(i, j, k, 1*nc + c);
+                    amrex::Real const k3 = By(i, j, k, c) - By_old(i, j, k, c) - a31*k1 - a32*k2;
+                    Ky(i, j, k, 2*nc + c) = k3;
+                    By(i, j, k, c) = By_old(i, j, k, c) + a41*k1 + a42*k2 + a43*k3;
+                }
             },
             [=] AMREX_GPU_DEVICE (int i, int j, int k){
-                amrex::Real const k1 = Kz(i, j, k, 0);
-                amrex::Real const k2 = Kz(i, j, k, 1);
-                amrex::Real const k3 = Bz(i, j, k) - Bz_old(i, j, k) - a31*k1 - a32*k2;
-                Kz(i, j, k, 2) = k3;
-                Bz(i, j, k) = Bz_old(i, j, k) + a41*k1 + a42*k2 + a43*k3;
+                for (int c = 0; c < nc; ++c) {
+                    amrex::Real const k1 = Kz(i, j, k, 0*nc + c);
+                    amrex::Real const k2 = Kz(i, j, k, 1*nc + c);
+                    amrex::Real const k3 = Bz(i, j, k, c) - Bz_old(i, j, k, c) - a31*k1 - a32*k2;
+                    Kz(i, j, k, 2*nc + c) = k3;
+                    Bz(i, j, k, c) = Bz_old(i, j, k, c) + a41*k1 + a42*k2 + a43*k3;
+                }
             }
         );
     }
@@ -2787,31 +2825,37 @@ amrex::Real HybridPICModel::BfieldEvolveRKF45 (
         Box const& tjz = mfi.tilebox(Bfield[lev][2]->ixType().toIntVect(), ng);
         amrex::ParallelFor(tjx, tjy, tjz,
             [=] AMREX_GPU_DEVICE (int i, int j, int k){
-                amrex::Real const k1 = Kx(i, j, k, 0);
-                amrex::Real const k2 = Kx(i, j, k, 1);
-                amrex::Real const k3 = Kx(i, j, k, 2);
-                amrex::Real const k4 = Bx(i, j, k) - Bx_old(i, j, k)
-                                        - a41*k1 - a42*k2 - a43*k3;
-                Kx(i, j, k, 3) = k4;
-                Bx(i, j, k) = Bx_old(i, j, k) + a51*k1 + a52*k2 + a53*k3 + a54*k4;
+                for (int c = 0; c < nc; ++c) {
+                    amrex::Real const k1 = Kx(i, j, k, 0*nc + c);
+                    amrex::Real const k2 = Kx(i, j, k, 1*nc + c);
+                    amrex::Real const k3 = Kx(i, j, k, 2*nc + c);
+                    amrex::Real const k4 = Bx(i, j, k, c) - Bx_old(i, j, k, c)
+                                            - a41*k1 - a42*k2 - a43*k3;
+                    Kx(i, j, k, 3*nc + c) = k4;
+                    Bx(i, j, k, c) = Bx_old(i, j, k, c) + a51*k1 + a52*k2 + a53*k3 + a54*k4;
+                }
             },
             [=] AMREX_GPU_DEVICE (int i, int j, int k){
-                amrex::Real const k1 = Ky(i, j, k, 0);
-                amrex::Real const k2 = Ky(i, j, k, 1);
-                amrex::Real const k3 = Ky(i, j, k, 2);
-                amrex::Real const k4 = By(i, j, k) - By_old(i, j, k)
-                                        - a41*k1 - a42*k2 - a43*k3;
-                Ky(i, j, k, 3) = k4;
-                By(i, j, k) = By_old(i, j, k) + a51*k1 + a52*k2 + a53*k3 + a54*k4;
+                for (int c = 0; c < nc; ++c) {
+                    amrex::Real const k1 = Ky(i, j, k, 0*nc + c);
+                    amrex::Real const k2 = Ky(i, j, k, 1*nc + c);
+                    amrex::Real const k3 = Ky(i, j, k, 2*nc + c);
+                    amrex::Real const k4 = By(i, j, k, c) - By_old(i, j, k, c)
+                                            - a41*k1 - a42*k2 - a43*k3;
+                    Ky(i, j, k, 3*nc + c) = k4;
+                    By(i, j, k, c) = By_old(i, j, k, c) + a51*k1 + a52*k2 + a53*k3 + a54*k4;
+                }
             },
             [=] AMREX_GPU_DEVICE (int i, int j, int k){
-                amrex::Real const k1 = Kz(i, j, k, 0);
-                amrex::Real const k2 = Kz(i, j, k, 1);
-                amrex::Real const k3 = Kz(i, j, k, 2);
-                amrex::Real const k4 = Bz(i, j, k) - Bz_old(i, j, k)
-                                        - a41*k1 - a42*k2 - a43*k3;
-                Kz(i, j, k, 3) = k4;
-                Bz(i, j, k) = Bz_old(i, j, k) + a51*k1 + a52*k2 + a53*k3 + a54*k4;
+                for (int c = 0; c < nc; ++c) {
+                    amrex::Real const k1 = Kz(i, j, k, 0*nc + c);
+                    amrex::Real const k2 = Kz(i, j, k, 1*nc + c);
+                    amrex::Real const k3 = Kz(i, j, k, 2*nc + c);
+                    amrex::Real const k4 = Bz(i, j, k, c) - Bz_old(i, j, k, c)
+                                            - a41*k1 - a42*k2 - a43*k3;
+                    Kz(i, j, k, 3*nc + c) = k4;
+                    Bz(i, j, k, c) = Bz_old(i, j, k, c) + a51*k1 + a52*k2 + a53*k3 + a54*k4;
+                }
             }
         );
     }
@@ -2837,37 +2881,43 @@ amrex::Real HybridPICModel::BfieldEvolveRKF45 (
         Box const& tjz = mfi.tilebox(Bfield[lev][2]->ixType().toIntVect(), ng);
         amrex::ParallelFor(tjx, tjy, tjz,
             [=] AMREX_GPU_DEVICE (int i, int j, int k){
-                amrex::Real const k1 = Kx(i, j, k, 0);
-                amrex::Real const k2 = Kx(i, j, k, 1);
-                amrex::Real const k3 = Kx(i, j, k, 2);
-                amrex::Real const k4 = Kx(i, j, k, 3);
-                amrex::Real const k5 = Bx(i, j, k) - Bx_old(i, j, k)
-                                        - a51*k1 - a52*k2 - a53*k3 - a54*k4;
-                Kx(i, j, k, 4) = k5;
-                Bx(i, j, k) = Bx_old(i, j, k)
-                            + a61*k1 + a62*k2 + a63*k3 + a64*k4 + a65*k5;
+                for (int c = 0; c < nc; ++c) {
+                    amrex::Real const k1 = Kx(i, j, k, 0*nc + c);
+                    amrex::Real const k2 = Kx(i, j, k, 1*nc + c);
+                    amrex::Real const k3 = Kx(i, j, k, 2*nc + c);
+                    amrex::Real const k4 = Kx(i, j, k, 3*nc + c);
+                    amrex::Real const k5 = Bx(i, j, k, c) - Bx_old(i, j, k, c)
+                                            - a51*k1 - a52*k2 - a53*k3 - a54*k4;
+                    Kx(i, j, k, 4*nc + c) = k5;
+                    Bx(i, j, k, c) = Bx_old(i, j, k, c)
+                                + a61*k1 + a62*k2 + a63*k3 + a64*k4 + a65*k5;
+                }
             },
             [=] AMREX_GPU_DEVICE (int i, int j, int k){
-                amrex::Real const k1 = Ky(i, j, k, 0);
-                amrex::Real const k2 = Ky(i, j, k, 1);
-                amrex::Real const k3 = Ky(i, j, k, 2);
-                amrex::Real const k4 = Ky(i, j, k, 3);
-                amrex::Real const k5 = By(i, j, k) - By_old(i, j, k)
-                                        - a51*k1 - a52*k2 - a53*k3 - a54*k4;
-                Ky(i, j, k, 4) = k5;
-                By(i, j, k) = By_old(i, j, k)
-                            + a61*k1 + a62*k2 + a63*k3 + a64*k4 + a65*k5;
+                for (int c = 0; c < nc; ++c) {
+                    amrex::Real const k1 = Ky(i, j, k, 0*nc + c);
+                    amrex::Real const k2 = Ky(i, j, k, 1*nc + c);
+                    amrex::Real const k3 = Ky(i, j, k, 2*nc + c);
+                    amrex::Real const k4 = Ky(i, j, k, 3*nc + c);
+                    amrex::Real const k5 = By(i, j, k, c) - By_old(i, j, k, c)
+                                            - a51*k1 - a52*k2 - a53*k3 - a54*k4;
+                    Ky(i, j, k, 4*nc + c) = k5;
+                    By(i, j, k, c) = By_old(i, j, k, c)
+                                + a61*k1 + a62*k2 + a63*k3 + a64*k4 + a65*k5;
+                }
             },
             [=] AMREX_GPU_DEVICE (int i, int j, int k){
-                amrex::Real const k1 = Kz(i, j, k, 0);
-                amrex::Real const k2 = Kz(i, j, k, 1);
-                amrex::Real const k3 = Kz(i, j, k, 2);
-                amrex::Real const k4 = Kz(i, j, k, 3);
-                amrex::Real const k5 = Bz(i, j, k) - Bz_old(i, j, k)
-                                        - a51*k1 - a52*k2 - a53*k3 - a54*k4;
-                Kz(i, j, k, 4) = k5;
-                Bz(i, j, k) = Bz_old(i, j, k)
-                            + a61*k1 + a62*k2 + a63*k3 + a64*k4 + a65*k5;
+                for (int c = 0; c < nc; ++c) {
+                    amrex::Real const k1 = Kz(i, j, k, 0*nc + c);
+                    amrex::Real const k2 = Kz(i, j, k, 1*nc + c);
+                    amrex::Real const k3 = Kz(i, j, k, 2*nc + c);
+                    amrex::Real const k4 = Kz(i, j, k, 3*nc + c);
+                    amrex::Real const k5 = Bz(i, j, k, c) - Bz_old(i, j, k, c)
+                                            - a51*k1 - a52*k2 - a53*k3 - a54*k4;
+                    Kz(i, j, k, 4*nc + c) = k5;
+                    Bz(i, j, k, c) = Bz_old(i, j, k, c)
+                                + a61*k1 + a62*k2 + a63*k3 + a64*k4 + a65*k5;
+                }
             }
         );
     }
@@ -2903,45 +2953,51 @@ amrex::Real HybridPICModel::BfieldEvolveRKF45 (
         Box const& tjz_ng = mfi.tilebox(Bfield[lev][2]->ixType().toIntVect(), ng);
         amrex::ParallelFor(tjx_ng, tjy_ng, tjz_ng,
             [=] AMREX_GPU_DEVICE (int i, int j, int k){
-                amrex::Real const k1 = Kx(i, j, k, 0);
-                amrex::Real const k2 = Kx(i, j, k, 1);
-                amrex::Real const k3 = Kx(i, j, k, 2);
-                amrex::Real const k4 = Kx(i, j, k, 3);
-                amrex::Real const k5 = Kx(i, j, k, 4);
-                amrex::Real const k6 = Bx(i, j, k) - Bx_old(i, j, k)
-                                        - a61*k1 - a62*k2 - a63*k3 - a64*k4 - a65*k5;
-                Kx(i, j, k, 1) = k6;
-                Bx(i, j, k) = Bx_old(i, j, k) + b1*k1 + b3*k3 + b4*k4 + b5*k5;
-                if (tjx.contains(amrex::IntVect(AMREX_D_DECL(i, j, k)))) {
-                    error_x(i, j, k) = e1*k1 + e3*k3 + e4*k4 + e5*k5 + e6*k6;
+                for (int c = 0; c < nc; ++c) {
+                    amrex::Real const k1 = Kx(i, j, k, 0*nc + c);
+                    amrex::Real const k2 = Kx(i, j, k, 1*nc + c);
+                    amrex::Real const k3 = Kx(i, j, k, 2*nc + c);
+                    amrex::Real const k4 = Kx(i, j, k, 3*nc + c);
+                    amrex::Real const k5 = Kx(i, j, k, 4*nc + c);
+                    amrex::Real const k6 = Bx(i, j, k, c) - Bx_old(i, j, k, c)
+                                            - a61*k1 - a62*k2 - a63*k3 - a64*k4 - a65*k5;
+                    Kx(i, j, k, 1*nc + c) = k6;
+                    Bx(i, j, k, c) = Bx_old(i, j, k, c) + b1*k1 + b3*k3 + b4*k4 + b5*k5;
+                    if (tjx.contains(amrex::IntVect(AMREX_D_DECL(i, j, k)))) {
+                        error_x(i, j, k, c) = e1*k1 + e3*k3 + e4*k4 + e5*k5 + e6*k6;
+                    }
                 }
             },
             [=] AMREX_GPU_DEVICE (int i, int j, int k){
-                amrex::Real const k1 = Ky(i, j, k, 0);
-                amrex::Real const k2 = Ky(i, j, k, 1);
-                amrex::Real const k3 = Ky(i, j, k, 2);
-                amrex::Real const k4 = Ky(i, j, k, 3);
-                amrex::Real const k5 = Ky(i, j, k, 4);
-                amrex::Real const k6 = By(i, j, k) - By_old(i, j, k)
-                                        - a61*k1 - a62*k2 - a63*k3 - a64*k4 - a65*k5;
-                Ky(i, j, k, 1) = k6;
-                By(i, j, k) = By_old(i, j, k) + b1*k1 + b3*k3 + b4*k4 + b5*k5;
-                if (tjy.contains(amrex::IntVect(AMREX_D_DECL(i, j, k)))) {
-                    error_y(i, j, k) = e1*k1 + e3*k3 + e4*k4 + e5*k5 + e6*k6;
+                for (int c = 0; c < nc; ++c) {
+                    amrex::Real const k1 = Ky(i, j, k, 0*nc + c);
+                    amrex::Real const k2 = Ky(i, j, k, 1*nc + c);
+                    amrex::Real const k3 = Ky(i, j, k, 2*nc + c);
+                    amrex::Real const k4 = Ky(i, j, k, 3*nc + c);
+                    amrex::Real const k5 = Ky(i, j, k, 4*nc + c);
+                    amrex::Real const k6 = By(i, j, k, c) - By_old(i, j, k, c)
+                                            - a61*k1 - a62*k2 - a63*k3 - a64*k4 - a65*k5;
+                    Ky(i, j, k, 1*nc + c) = k6;
+                    By(i, j, k, c) = By_old(i, j, k, c) + b1*k1 + b3*k3 + b4*k4 + b5*k5;
+                    if (tjy.contains(amrex::IntVect(AMREX_D_DECL(i, j, k)))) {
+                        error_y(i, j, k, c) = e1*k1 + e3*k3 + e4*k4 + e5*k5 + e6*k6;
+                    }
                 }
             },
             [=] AMREX_GPU_DEVICE (int i, int j, int k){
-                amrex::Real const k1 = Kz(i, j, k, 0);
-                amrex::Real const k2 = Kz(i, j, k, 1);
-                amrex::Real const k3 = Kz(i, j, k, 2);
-                amrex::Real const k4 = Kz(i, j, k, 3);
-                amrex::Real const k5 = Kz(i, j, k, 4);
-                amrex::Real const k6 = Bz(i, j, k) - Bz_old(i, j, k)
-                                        - a61*k1 - a62*k2 - a63*k3 - a64*k4 - a65*k5;
-                Kz(i, j, k, 1) = k6;
-                Bz(i, j, k) = Bz_old(i, j, k) + b1*k1 + b3*k3 + b4*k4 + b5*k5;
-                if (tjz.contains(amrex::IntVect(AMREX_D_DECL(i, j, k)))) {
-                    error_z(i, j, k) = e1*k1 + e3*k3 + e4*k4 + e5*k5 + e6*k6;
+                for (int c = 0; c < nc; ++c) {
+                    amrex::Real const k1 = Kz(i, j, k, 0*nc + c);
+                    amrex::Real const k2 = Kz(i, j, k, 1*nc + c);
+                    amrex::Real const k3 = Kz(i, j, k, 2*nc + c);
+                    amrex::Real const k4 = Kz(i, j, k, 3*nc + c);
+                    amrex::Real const k5 = Kz(i, j, k, 4*nc + c);
+                    amrex::Real const k6 = Bz(i, j, k, c) - Bz_old(i, j, k, c)
+                                            - a61*k1 - a62*k2 - a63*k3 - a64*k4 - a65*k5;
+                    Kz(i, j, k, 1*nc + c) = k6;
+                    Bz(i, j, k, c) = Bz_old(i, j, k, c) + b1*k1 + b3*k3 + b4*k4 + b5*k5;
+                    if (tjz.contains(amrex::IntVect(AMREX_D_DECL(i, j, k)))) {
+                        error_z(i, j, k, c) = e1*k1 + e3*k3 + e4*k4 + e5*k5 + e6*k6;
+                    }
                 }
             }
         );
@@ -2952,8 +3008,10 @@ amrex::Real HybridPICModel::BfieldEvolveRKF45 (
     amrex::Real err_norm = 0._rt;
     amrex::Real B4_norm  = 0._rt;
     for (int ii = 0; ii < 3; ii++) {
-        err_norm = std::max(err_norm, err_scratch[ii].norm0(/*comp=*/0, /*nghost=*/0, /*local=*/true));
-        B4_norm  = std::max(B4_norm,  Bfield[lev][ii]->norm0(/*comp=*/0, /*nghost=*/0, /*local=*/true));
+        for (int c = 0; c < nc; ++c) {
+            err_norm = std::max(err_norm, err_scratch[ii].norm0(c, /*nghost=*/0, /*local=*/true));
+            B4_norm  = std::max(B4_norm,  Bfield[lev][ii]->norm0(c, /*nghost=*/0, /*local=*/true));
+        }
     }
     amrex::ParallelDescriptor::ReduceRealMax({err_norm, B4_norm});
     return err_norm / (m_substep_atol + m_substep_rtol * B4_norm);
