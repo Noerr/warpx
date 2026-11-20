@@ -443,8 +443,7 @@ FullDiagnostics::InitializeFieldFunctorsRZopenPMD (int lev)
                 }
             } else if ( m_varnames_fields[comp] == "j"+field_names[idir] ){
                 m_all_field_functors[lev][comp] = std::make_unique<JFunctor>(idir, lev, m_crse_ratio,
-                                                            false, deposit_current,
-                                                            /*species_index=*/-1, ncomp);
+                                                            false, deposit_current, ncomp);
                 deposit_current = false;
                 if (update_varnames) {
                     AddRZModesToOutputNames(std::string("j"+field_names[idir]), ncomp);
@@ -457,7 +456,7 @@ FullDiagnostics::InitializeFieldFunctorsRZopenPMD (int lev)
                 const int sp_idx = m_J_per_species_index[i_J_species];
                 m_all_field_functors[lev][comp] = std::make_unique<JFunctor>(idir, lev, m_crse_ratio,
                                                             false, /*deposit_current=*/false,
-                                                            sp_idx, ncomp);
+                                                            ncomp, /*species_index=*/sp_idx);
                 if (update_varnames) {
                     AddRZModesToOutputNames(std::string("j"+field_names[idir]+"_")
                                             + m_all_species_names[sp_idx], ncomp);
@@ -734,8 +733,7 @@ FullDiagnostics::AddRZModesToDiags (int lev)
     for (int dim=0; dim<3; dim++){
         // 3 components, r theta z
         m_all_field_functors[lev].push_back(std::make_unique<JFunctor>(
-            dim, lev, m_crse_ratio, false, deposit_current,
-            /*species_index=*/-1, ncomp_multimodefab));
+            dim, lev, m_crse_ratio, false, deposit_current, ncomp_multimodefab));
         deposit_current = false;
         AddRZModesToOutputNames(std::string("J") + coord[dim], ncomp_multimodefab);
     }
@@ -986,8 +984,7 @@ FullDiagnostics::InitializeFieldFunctors (int lev)
             } else if ( m_varnames_fields[comp] == "B"+field_names[idir] ){
                 m_all_field_functors[lev][comp] = std::make_unique<CellCenterFunctor>(warpx.m_fields.get(FieldType::Bfield_aux, Direction{idir}, lev), lev, m_crse_ratio);
             } else if ( m_varnames_fields[comp] == "j"+field_names[idir] ){
-                m_all_field_functors[lev][comp] = std::make_unique<JFunctor>(idir, lev, m_crse_ratio, true, deposit_current,
-                                                                             /*species_index=*/-1);
+                m_all_field_functors[lev][comp] = std::make_unique<JFunctor>(idir, lev, m_crse_ratio, true, deposit_current);
                 deposit_current = false;
             } else if ( m_varnames_fields[comp].starts_with("j"+field_names[idir]+"_")
                         && m_varnames_fields[comp] != "j"+field_names[idir]+"_displacement" ){
@@ -996,7 +993,8 @@ FullDiagnostics::InitializeFieldFunctors (int lev)
                 // local MultiFabs.
                 const int sp_idx = m_J_per_species_index[i_J_species];
                 m_all_field_functors[lev][comp] = std::make_unique<JFunctor>(idir, lev, m_crse_ratio, true,
-                                                                             /*deposit_current=*/false, sp_idx);
+                                                                             /*deposit_current=*/false,
+                                                                             /*ncomp=*/1, /*species_index=*/sp_idx);
                 ++i_J_species;
             } else if ( m_varnames_fields[comp] == "j"+field_names[idir]+"_displacement" ) {
                     m_all_field_functors[lev][comp] = std::make_unique<JdispFunctor>(idir, lev, m_crse_ratio, true);
