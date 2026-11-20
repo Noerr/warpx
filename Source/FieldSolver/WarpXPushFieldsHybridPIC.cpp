@@ -466,6 +466,20 @@ void WarpX::HybridPICDepositRhoAndJ ()
             );
         }
     }
+
+#if defined(WARPX_DIM_RZ)
+    // The multimode Ohm's-law solve interpolates the cell-centered J_r (and the
+    // other components) to the axis nodes through the guard cells below the
+    // axis: fill those by parity reflection, mode by mode.
+    if (n_rz_azimuthal_modes > 1 && Geom(0).ProbLo(0) == 0._rt) {
+        for (int lev = 0; lev <= finest_level; ++lev) {
+            ApplyFieldBoundaryOnAxis(
+                m_fields.get(FieldType::current_fp, Direction{0}, lev),
+                m_fields.get(FieldType::current_fp, Direction{1}, lev),
+                m_fields.get(FieldType::current_fp, Direction{2}, lev), lev);
+        }
+    }
+#endif
 }
 
 void WarpX::HybridPICInitializeRhoJandB ()
