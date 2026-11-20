@@ -9,6 +9,7 @@
 
 #include "Utils/WarpXConst.H"
 
+#include <AMReX_Array.H>
 #include <AMReX_Extension.H>
 #include <AMReX_GpuQualifiers.H>
 #include <AMReX_REAL.H>
@@ -41,18 +42,39 @@ constexpr int HybridPICAzimuthalNTheta (int nmodes) { return 3 * nmodes; }
 
 constexpr int MAX_PSEUDO_SPECTRAL_NTHETA = HybridPICAzimuthalNTheta(MAX_PSEUDO_SPECTRAL_NMODES);
 
+/** cos(m theta_k) and sin(m theta_k) for the n_theta samples and the stored
+ *  modes, tabulated once on the host and captured by value in the kernels. */
+struct AzimuthalFTTable
+{
+    int nmodes = 1;
+    int n_theta = 1;
+    amrex::GpuArray<amrex::Real, MAX_PSEUDO_SPECTRAL_NMODES*MAX_PSEUDO_SPECTRAL_NTHETA> cos_mt{};
+    amrex::GpuArray<amrex::Real, MAX_PSEUDO_SPECTRAL_NMODES*MAX_PSEUDO_SPECTRAL_NTHETA> sin_mt{};
+
+    explicit AzimuthalFTTable (int a_nmodes)
+        : nmodes{a_nmodes}, n_theta{HybridPICAzimuthalNTheta(a_nmodes)}
+    {
+        for (int m = 0; m < nmodes; ++m) {
+            for (int k = 0; k < n_theta; ++k) {
+                const amrex::Real theta = (amrex::Real{2} * MathConst::pi * k) / n_theta;
+                cos_mt[m*n_theta + k] = std::cos(m * theta);
+                sin_mt[m*n_theta + k] = std::sin(m * theta);
+            }
+        }
+    }
+};
+
 /** Modes -> n_theta azimuthal samples. */
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
-void inverse_az_ft (int nmodes, int n_theta,
+void inverse_az_ft (AzimuthalFTTable const& tab,
                     amrex::Real const* AMREX_RESTRICT A_modes,
                     amrex::Real* AMREX_RESTRICT A_theta)
 {
-    for (int k = 0; k < n_theta; ++k) {
-        const amrex::Real theta_k = (amrex::Real{2} * MathConst::pi * k) / n_theta;
+    for (int k = 0; k < tab.n_theta; ++k) {
         amrex::Real val = A_modes[0];
-        for (int m = 1; m < nmodes; ++m) {
-            val += A_modes[2*m - 1] * std::cos(m * theta_k)
-                 + A_modes[2*m    ] * std::sin(m * theta_k);
+        for (int m = 1; m < tab.nmodes; ++m) {
+            val += A_modes[2*m - 1] * tab.cos_mt[m*tab.n_theta + k]
+                 + A_modes[2*m    ] * tab.sin_mt[m*tab.n_theta + k];
         }
         A_theta[k] = val;
     }
@@ -61,20 +83,20 @@ void inverse_az_ft (int nmodes, int n_theta,
 /** n_theta azimuthal samples -> the nmodes stored modes; higher harmonics of
  *  the samples are discarded. */
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
-void forward_az_ft (int nmodes, int n_theta,
+void forward_az_ft (AzimuthalFTTable const& tab,
                     amrex::Real const* AMREX_RESTRICT A_theta,
                     amrex::Real* AMREX_RESTRICT A_modes)
 {
+    const int n_theta = tab.n_theta;
     amrex::Real a0 = amrex::Real{0};
     for (int k = 0; k < n_theta; ++k) { a0 += A_theta[k]; }
     A_modes[0] = a0 / n_theta;
-    for (int m = 1; m < nmodes; ++m) {
+    for (int m = 1; m < tab.nmodes; ++m) {
         amrex::Real ar = amrex::Real{0};
         amrex::Real ai = amrex::Real{0};
         for (int k = 0; k < n_theta; ++k) {
-            const amrex::Real theta_k = (amrex::Real{2} * MathConst::pi * k) / n_theta;
-            ar += A_theta[k] * std::cos(m * theta_k);
-            ai += A_theta[k] * std::sin(m * theta_k);
+            ar += A_theta[k] * tab.cos_mt[m*n_theta + k];
+            ai += A_theta[k] * tab.sin_mt[m*n_theta + k];
         }
         A_modes[2*m - 1] = (amrex::Real{2} * ar) / n_theta;
         A_modes[2*m    ] = (amrex::Real{2} * ai) / n_theta;

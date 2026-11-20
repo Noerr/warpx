@@ -1026,6 +1026,7 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
     const int nmodes = m_nmodes;
     const int ncomps = 2 * nmodes - 1;
     const int n_theta = HybridPICAzimuthalNTheta(nmodes);
+    const AzimuthalFTTable az_tab(nmodes);
 
     // for the profiler
     amrex::LayoutData<amrex::Real>* cost = WarpX::getCosts(lev);
@@ -1062,8 +1063,10 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
     amrex::GpuArray<int, 3> const& nodal   = {1, 1, 1};
     amrex::GpuArray<int, 3> const& coarsen = {1, 1, 1};
 
+    // The axis conditions apply only when the domain starts at r = 0.
     Real const dr = m_dr;
     Real const rmin = m_rmin;
+    const bool domain_has_axis = (rmin == 0._rt);
 
     // Nodal (J - J_i) x B, or (J - J_i) x B / rho with hall_divide_at_nodes:
     // component d*ncomps + c holds direction d (r, theta, z), mode component c.
@@ -1112,7 +1115,7 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
                          - Interp(Jiz, Jz_stag, nodal, coarsen, i, j, 0, c);
             }
 
-            const bool on_axis = (i == 0);
+            const bool on_axis = domain_has_axis && (i == 0);
             if (on_axis) {
                 apply_axis_bc_vector_rt(nmodes, Br_m, Bt_m);
                 apply_axis_bc_vector_rt(nmodes, dJr_m, dJt_m);
@@ -1121,19 +1124,19 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
             }
 
             Real Br_th[NT], Bt_th[NT], Bz_th[NT], dJr_th[NT], dJt_th[NT], dJz_th[NT];
-            inverse_az_ft(nmodes, n_theta, Br_m, Br_th);
-            inverse_az_ft(nmodes, n_theta, Bt_m, Bt_th);
-            inverse_az_ft(nmodes, n_theta, Bz_m, Bz_th);
-            inverse_az_ft(nmodes, n_theta, dJr_m, dJr_th);
-            inverse_az_ft(nmodes, n_theta, dJt_m, dJt_th);
-            inverse_az_ft(nmodes, n_theta, dJz_m, dJz_th);
+            inverse_az_ft(az_tab, Br_m, Br_th);
+            inverse_az_ft(az_tab, Bt_m, Bt_th);
+            inverse_az_ft(az_tab, Bz_m, Bz_th);
+            inverse_az_ft(az_tab, dJr_m, dJr_th);
+            inverse_az_ft(az_tab, dJt_m, dJt_th);
+            inverse_az_ft(az_tab, dJz_m, dJz_th);
 
             Real rho_th[NT];
             if (hall_div_nodes) {
                 Real rho_m[NM];
                 for (int c = 0; c < ncomps; ++c) { rho_m[c] = rho(i, j, 0, c); }
                 if (on_axis) { apply_axis_bc_scalar(nmodes, rho_m); }
-                inverse_az_ft(nmodes, n_theta, rho_m, rho_th);
+                inverse_az_ft(az_tab, rho_m, rho_th);
             }
 
             Real er_th[NT], et_th[NT], ez_th[NT];
@@ -1151,11 +1154,11 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
             }
 
             Real out_m[NM];
-            forward_az_ft(nmodes, n_theta, er_th, out_m);
+            forward_az_ft(az_tab, er_th, out_m);
             for (int c = 0; c < ncomps; ++c) { enE_nodal(i, j, 0, c) = out_m[c]; }
-            forward_az_ft(nmodes, n_theta, et_th, out_m);
+            forward_az_ft(az_tab, et_th, out_m);
             for (int c = 0; c < ncomps; ++c) { enE_nodal(i, j, 0, ncomps + c) = out_m[c]; }
-            forward_az_ft(nmodes, n_theta, ez_th, out_m);
+            forward_az_ft(az_tab, ez_th, out_m);
             for (int c = 0; c < ncomps; ++c) { enE_nodal(i, j, 0, 2*ncomps + c) = out_m[c]; }
         });
 
@@ -1216,12 +1219,12 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
             for (int t = 0; t < n_theta; ++t) {
                 if (rho_th[t] < rho_floor && holmstrom_vacuum_region) {
                     E_th[t] = 0._rt;
-                    continue;
+                } else {
+                    const Real inv_rho = 1._rt / std::max(rho_th[t], rho_floor);
+                    const Real grad_Pe = include_grad_pe ? gP_th[t] : 0._rt;
+                    E_th[t] = hall_div_nodes ? enE_th[t] - grad_Pe * inv_rho
+                                             : (enE_th[t] - grad_Pe) * inv_rho;
                 }
-                const Real inv_rho = 1._rt / std::max(rho_th[t], rho_floor);
-                const Real grad_Pe = include_grad_pe ? gP_th[t] : 0._rt;
-                E_th[t] = hall_div_nodes ? enE_th[t] - grad_Pe * inv_rho
-                                         : (enE_th[t] - grad_Pe) * inv_rho;
                 if (include_resistivity) {
                     Real jtot = 0._rt;
                     if (resistivity_has_J_dependence) {
@@ -1279,18 +1282,18 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
 
                 Real enE_th[NT], rho_th[NT], gP_th[NT], Jr_th[NT], Jt_th[NT], Jz_th[NT];
                 Real lapJ_th[NT], E_th[NT];
-                inverse_az_ft(nmodes, n_theta, enE_m, enE_th);
-                inverse_az_ft(nmodes, n_theta, rho_m, rho_th);
-                inverse_az_ft(nmodes, n_theta, gP_m, gP_th);
-                inverse_az_ft(nmodes, n_theta, Jr_m, Jr_th);
-                inverse_az_ft(nmodes, n_theta, Jt_m, Jt_th);
-                inverse_az_ft(nmodes, n_theta, Jz_m, Jz_th);
-                inverse_az_ft(nmodes, n_theta, lapJ_m, lapJ_th);
+                inverse_az_ft(az_tab, enE_m, enE_th);
+                inverse_az_ft(az_tab, rho_m, rho_th);
+                inverse_az_ft(az_tab, gP_m, gP_th);
+                inverse_az_ft(az_tab, Jr_m, Jr_th);
+                inverse_az_ft(az_tab, Jt_m, Jt_th);
+                inverse_az_ft(az_tab, Jz_m, Jz_th);
+                inverse_az_ft(az_tab, lapJ_m, lapJ_th);
 
                 pointwise_E(enE_th, gP_th, rho_th, Jr_th, Jt_th, Jz_th, Jr_th, lapJ_th, E_th);
 
                 Real E_m[NM];
-                forward_az_ft(nmodes, n_theta, E_th, E_m);
+                forward_az_ft(az_tab, E_th, E_m);
                 for (int c = 0; c < ncomps; ++c) { Er(i, j, 0, c) = E_m[c]; }
             },
 
@@ -1347,18 +1350,18 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
 
                 Real enE_th[NT], rho_th[NT], gP_th[NT], Jr_th[NT], Jt_th[NT], Jz_th[NT];
                 Real lapJ_th[NT], E_th[NT];
-                inverse_az_ft(nmodes, n_theta, enE_m, enE_th);
-                inverse_az_ft(nmodes, n_theta, rho_m, rho_th);
-                inverse_az_ft(nmodes, n_theta, gP_m, gP_th);
-                inverse_az_ft(nmodes, n_theta, Jr_m, Jr_th);
-                inverse_az_ft(nmodes, n_theta, Jt_m, Jt_th);
-                inverse_az_ft(nmodes, n_theta, Jz_m, Jz_th);
-                inverse_az_ft(nmodes, n_theta, lapJ_m, lapJ_th);
+                inverse_az_ft(az_tab, enE_m, enE_th);
+                inverse_az_ft(az_tab, rho_m, rho_th);
+                inverse_az_ft(az_tab, gP_m, gP_th);
+                inverse_az_ft(az_tab, Jr_m, Jr_th);
+                inverse_az_ft(az_tab, Jt_m, Jt_th);
+                inverse_az_ft(az_tab, Jz_m, Jz_th);
+                inverse_az_ft(az_tab, lapJ_m, lapJ_th);
 
                 pointwise_E(enE_th, gP_th, rho_th, Jr_th, Jt_th, Jz_th, Jt_th, lapJ_th, E_th);
 
                 Real E_m[NM];
-                forward_az_ft(nmodes, n_theta, E_th, E_m);
+                forward_az_ft(az_tab, E_th, E_m);
                 for (int c = 0; c < ncomps; ++c) { Etheta(i, j, 0, c) = E_m[c]; }
             },
 
@@ -1372,7 +1375,7 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
 
                 // r on nodal point (Ez is nodal in r)
                 const Real r = rmin + i*dr;
-                const bool on_axis = (i == 0);
+                const bool on_axis = domain_has_axis && (i == 0);
 
                 Real enE_m[NM], rho_m[NM], gP_m[NM], Jr_m[NM], Jt_m[NM], Jz_m[NM], lapJ_m[NM];
                 for (int c = 0; c < ncomps; ++c) {
@@ -1405,22 +1408,24 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
                         }
                         lapJ_m[c] = lap;
                     }
+                    if (on_axis) { apply_axis_bc_scalar(nmodes, lapJ_m); }
                 }
 
                 Real enE_th[NT], rho_th[NT], gP_th[NT], Jr_th[NT], Jt_th[NT], Jz_th[NT];
                 Real lapJ_th[NT], E_th[NT];
-                inverse_az_ft(nmodes, n_theta, enE_m, enE_th);
-                inverse_az_ft(nmodes, n_theta, rho_m, rho_th);
-                inverse_az_ft(nmodes, n_theta, gP_m, gP_th);
-                inverse_az_ft(nmodes, n_theta, Jr_m, Jr_th);
-                inverse_az_ft(nmodes, n_theta, Jt_m, Jt_th);
-                inverse_az_ft(nmodes, n_theta, Jz_m, Jz_th);
-                inverse_az_ft(nmodes, n_theta, lapJ_m, lapJ_th);
+                inverse_az_ft(az_tab, enE_m, enE_th);
+                inverse_az_ft(az_tab, rho_m, rho_th);
+                inverse_az_ft(az_tab, gP_m, gP_th);
+                inverse_az_ft(az_tab, Jr_m, Jr_th);
+                inverse_az_ft(az_tab, Jt_m, Jt_th);
+                inverse_az_ft(az_tab, Jz_m, Jz_th);
+                inverse_az_ft(az_tab, lapJ_m, lapJ_th);
 
                 pointwise_E(enE_th, gP_th, rho_th, Jr_th, Jt_th, Jz_th, Jz_th, lapJ_th, E_th);
 
                 Real E_m[NM];
-                forward_az_ft(nmodes, n_theta, E_th, E_m);
+                forward_az_ft(az_tab, E_th, E_m);
+                if (on_axis) { apply_axis_bc_scalar(nmodes, E_m); }
                 for (int c = 0; c < ncomps; ++c) { Ez(i, j, 0, c) = E_m[c]; }
             }
         );
@@ -1429,10 +1434,11 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
         // apply_axis_bc_vector_rt). E_r is cell-centered in r: extrapolate its
         // m = 1 mode linearly to r = 0 from r = dr/2 and r = 3 dr/2. This runs
         // after the loop above so that E_r is final on this tile.
-        if (rmin == 0._rt && nmodes > 1 && tet.smallEnd(0) == 0) {
+        if (domain_has_axis && nmodes > 1 && tet.smallEnd(0) == 0) {
             amrex::Box tet_axis = tet;
             tet_axis.setRange(0, 0, 1);
             amrex::ParallelFor(tet_axis, [=] AMREX_GPU_DEVICE (int i, int j, int /*k*/){
+                if (update_Etheta_arr && update_Etheta_arr(i, j, 0) == 0) { return; }
                 const Real Er1_re = 1.5_rt*Er(i, j, 0, 1) - 0.5_rt*Er(i+1, j, 0, 1);
                 const Real Er1_im = 1.5_rt*Er(i, j, 0, 2) - 0.5_rt*Er(i+1, j, 0, 2);
                 Etheta(i, j, 0, 1) =  Er1_im;

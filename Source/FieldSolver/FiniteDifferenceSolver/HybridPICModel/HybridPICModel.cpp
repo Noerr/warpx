@@ -1273,6 +1273,7 @@ void HybridPICModel::FillElectronPressureMF (
     const int nmodes = WarpX::n_rz_azimuthal_modes;
     const int ncomps = 2*nmodes - 1;
     const int n_theta = HybridPICAzimuthalNTheta(nmodes);
+    const AzimuthalFTTable az_tab(nmodes);
 #endif
 
     // Loop through the grids, and over the tiles within each grid
@@ -1306,16 +1307,16 @@ void HybridPICModel::FillElectronPressureMF (
                 Real Te_th[MAX_PSEUDO_SPECTRAL_NTHETA];
                 Real out_m[2*MAX_PSEUDO_SPECTRAL_NMODES];
                 for (int c = 0; c < ncomps; ++c) { rho_m[c] = rho(i, j, k, c); }
-                inverse_az_ft(nmodes, n_theta, rho_m, rho_th);
+                inverse_az_ft(az_tab, rho_m, rho_th);
                 for (int t = 0; t < n_theta; ++t) {
                     const Real ne = std::max(rho_th[t], rho_floor) / PhysConst::q_e;
                     const Real Te_joule = elec_temp * std::pow(ne/n0_ref, gamma_minus_1);
                     Pe_th[t] = ne * Te_joule;
                     Te_th[t] = Te_joule / PhysConst::kb;
                 }
-                forward_az_ft(nmodes, n_theta, Pe_th, out_m);
+                forward_az_ft(az_tab, Pe_th, out_m);
                 for (int c = 0; c < ncomps; ++c) { Pe(i, j, k, c) = out_m[c]; }
-                forward_az_ft(nmodes, n_theta, Te_th, out_m);
+                forward_az_ft(az_tab, Te_th, out_m);
                 for (int c = 0; c < ncomps; ++c) { Te(i, j, k, c) = out_m[c]; }
             });
             continue;

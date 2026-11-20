@@ -406,7 +406,7 @@ void WarpX::HybridPICDepositRhoAndJ ()
     // volume) does not reproduce. The transverse m = 1 current is finite on
     // the axis with J_theta,1 = -i J_r,1; J_r is cell-centered in r and is
     // extrapolated linearly to r = 0 from its two innermost cells.
-    if (n_rz_azimuthal_modes > 1) {
+    if (n_rz_azimuthal_modes > 1 && Geom(0).ProbLo(0) == 0._rt) {
         for (int lev = 0; lev <= finest_level; ++lev) {
             amrex::MultiFab& rho = *m_fields.get(FieldType::rho_fp, lev);
             amrex::MultiFab& Jr = *m_fields.get(FieldType::current_fp, Direction{0}, lev);
@@ -438,6 +438,7 @@ void WarpX::HybridPICDepositRhoAndJ ()
                     const amrex::Real Jr1_im = 1.5_rt*Jr_arr(i, j, k, 2) - 0.5_rt*Jr_arr(i+1, j, k, 2);
                     Jt_arr(i, j, k, 1) =  Jr1_im;
                     Jt_arr(i, j, k, 2) = -Jr1_re;
+                    for (int n = 3; n < nc; ++n) { Jt_arr(i, j, k, n) = 0._rt; }
                 });
             }
         }
