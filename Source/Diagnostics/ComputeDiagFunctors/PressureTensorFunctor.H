@@ -5,15 +5,20 @@
 
 #include <AMReX_BaseFwd.H>
 
+#include <string>
+#include <vector>
+
 /**
  * \brief Functor to calculate per-cell pressure tensor from particle data.
  *
  * Computes the 6 independent components of the symmetric pressure tensor
  * P_ij = n * mass * <(u_i - <u_i>)(u_j - <u_j>)>  [Pa]
- * where u = gamma*v is the 4-velocity, n is the number density,
- * and the average is weighted over macro-particles in each cell.
+ * where u = gamma*v, n is the number density, and the average is weighted
+ * over the macroparticles in each cell (nearest-grid-point assignment).
+ * In RZ, RCYLINDER and RSPHERE, u is expressed in the local curvilinear basis.
  *
- * Output components (in order): Pxx, Pxy, Pxz, Pyy, Pyz, Pzz
+ * Output components (in order): xx, xy, xz, yy, yz, zz, with the direction
+ * labels of the geometry (see ComponentNames()).
  */
 class PressureTensorFunctor final : public ComputeDiagFunctor
 {
@@ -34,6 +39,14 @@ public:
      *            data is stored
      */
     void operator()(amrex::MultiFab& mf_dst, int dcomp, int /*i_buffer=0*/) const override;
+
+    /** \brief Names of the 6 output components, in output order, without the species suffix
+     *
+     * Pxx, Pxy, Pxz, Pyy, Pyz, Pzz in Cartesian geometries,
+     * Prr, Prt, Prz, Ptt, Ptz, Pzz in RZ and RCYLINDER, and
+     * Prr, Prt, Prp, Ptt, Ptp, Ppp in RSPHERE.
+     */
+    static std::vector<std::string> ComponentNames ();
 private:
     int m_lev; /**< level on which mf_src is defined */
     int m_ispec; /**< index of species to average over */

@@ -13,6 +13,9 @@
 #include <AMReX_MultiFab.H>
 #include <AMReX_REAL.H>
 
+#include <string>
+#include <vector>
+
 PressureTensorFunctor::PressureTensorFunctor (const int lev,
         const amrex::IntVect crse_ratio, const int ispec, const int ncomp)
     : ComputeDiagFunctor(ncomp, crse_ratio), m_lev(lev), m_ispec(ispec)
@@ -37,4 +40,23 @@ PressureTensorFunctor::operator() (amrex::MultiFab& mf_dst, const int dcomp, con
 
     // Coarsen and interpolate all 6 components from ptensor to the output diagnostic MultiFab.
     ablastr::coarsen::sample::Coarsen(mf_dst, ptensor, dcomp, 0, nComp(), 0, m_crse_ratio);
+}
+
+std::vector<std::string>
+PressureTensorFunctor::ComponentNames ()
+{
+#if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER)
+    std::string const dir = "rtz";
+#elif defined(WARPX_DIM_RSPHERE)
+    std::string const dir = "rtp";
+#else
+    std::string const dir = "xyz";
+#endif
+    std::vector<std::string> names;
+    for (int i = 0; i < 3; ++i) {
+        for (int j = i; j < 3; ++j) {
+            names.push_back(std::string{'P', dir[i], dir[j]});
+        }
+    }
+    return names;
 }

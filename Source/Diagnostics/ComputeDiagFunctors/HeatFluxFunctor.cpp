@@ -12,6 +12,9 @@
 #include <AMReX_MultiFab.H>
 #include <AMReX_REAL.H>
 
+#include <string>
+#include <vector>
+
 HeatFluxFunctor::HeatFluxFunctor (const int lev,
         const amrex::IntVect crse_ratio, const int ispec, const int ncomp)
     : ComputeDiagFunctor(ncomp, crse_ratio), m_lev(lev), m_ispec(ispec)
@@ -36,4 +39,17 @@ HeatFluxFunctor::operator() (amrex::MultiFab& mf_dst, const int dcomp, const int
 
     // Coarsen and interpolate all 3 components from heatflux to the output diagnostic MultiFab.
     ablastr::coarsen::sample::Coarsen(mf_dst, heatflux, dcomp, 0, nComp(), 0, m_crse_ratio);
+}
+
+std::vector<std::string>
+HeatFluxFunctor::ComponentNames ()
+{
+#if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER)
+    std::string const dir = "rtz";
+#elif defined(WARPX_DIM_RSPHERE)
+    std::string const dir = "rtp";
+#else
+    std::string const dir = "xyz";
+#endif
+    return {std::string{'Q', dir[0]}, std::string{'Q', dir[1]}, std::string{'Q', dir[2]}};
 }

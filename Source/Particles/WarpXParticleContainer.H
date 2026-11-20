@@ -464,13 +464,11 @@ public:
                        WarpXParticleContainer const & electron_species, int lev);
 
     /** Deposit the symmetric pressure tensor P_<species> (Pa) into the field
-     *  registry, as n*m*<(u_i - <u_i>)(u_j - <u_j>)>.
+     *  registry, as n*m*<(u_i - <u_i>)(u_j - <u_j>)>, with u expressed in the
+     *  local curvilinear basis in RZ, RCYLINDER and RSPHERE.
      *
-     *  NOTE: this currently calls DepositTotalNGPTemperature() to obtain the
-     *  pass-1 moments N_<species> and u_<species>, which also computes
-     *  T_<species> even when only the pressure tensor was requested. A
-     *  follow-up should factor that first pass into a shared
-     *  DepositNGPMoments() helper used by all three.
+     *  The first-pass moments N_<species> and u_<species> are obtained from
+     *  DepositTotalNGPTemperature(), which also computes T_<species>.
      */
     void DepositNGPPressureTensor (int lev);
 

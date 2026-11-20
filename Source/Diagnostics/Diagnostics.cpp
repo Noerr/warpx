@@ -2,6 +2,8 @@
 
 #include "Diagnostics/ComputeDiagFunctors/ComputeDiagFunctor.H"
 #include "ComputeDiagFunctors/BackTransformParticleFunctor.H"
+#include "ComputeDiagFunctors/HeatFluxFunctor.H"
+#include "ComputeDiagFunctors/PressureTensorFunctor.H"
 #include "Diagnostics/FlushFormats/FlushFormat.H"
 #include "Diagnostics/ParticleDiag/ParticleDiag.H"
 #include "FlushFormats/FlushFormatCatalyst.H"
@@ -219,9 +221,11 @@ Diagnostics::BaseReadParameters ()
     {
         amrex::Vector<std::string> expanded_varnames;
         for (const auto& f : m_varnames_fields) {
-            if (f.rfind("P_", 0) == 0) {
-                // Pressure tensor: 6 components (Pxx, Pxy, Pxz, Pyy, Pyz, Pzz)
+            if (f.starts_with("P_")) {
+                // Pressure tensor: 6 components (Pxx, Pxy, Pxz, Pyy, Pyz, Pzz, or the
+                // curvilinear equivalents)
                 const std::string sp = f.substr(2);
+                const std::string suffix = "_" + sp;
                 bool species_name_is_wrong = true;
                 for (int i = 0, n = int(m_all_species_names.size()); i < n; i++) {
                     if (sp == m_all_species_names[i]) {
@@ -234,15 +238,13 @@ Diagnostics::BaseReadParameters ()
                     "Input error: string " + f + " in " + m_diag_name
                     + ".fields_to_plot does not match any species"
                 );
-                expanded_varnames.push_back("Pxx_" + sp);
-                expanded_varnames.push_back("Pxy_" + sp);
-                expanded_varnames.push_back("Pxz_" + sp);
-                expanded_varnames.push_back("Pyy_" + sp);
-                expanded_varnames.push_back("Pyz_" + sp);
-                expanded_varnames.push_back("Pzz_" + sp);
-            } else if (f.rfind("Q_", 0) == 0) {
-                // Heat flux: 3 components (Qx, Qy, Qz)
+                for (auto const& comp : PressureTensorFunctor::ComponentNames()) {
+                    expanded_varnames.push_back(comp + suffix);
+                }
+            } else if (f.starts_with("Q_")) {
+                // Heat flux: 3 components (Qx, Qy, Qz, or the curvilinear equivalents)
                 const std::string sp = f.substr(2);
+                const std::string suffix = "_" + sp;
                 bool species_name_is_wrong = true;
                 for (int i = 0, n = int(m_all_species_names.size()); i < n; i++) {
                     if (sp == m_all_species_names[i]) {
@@ -255,9 +257,9 @@ Diagnostics::BaseReadParameters ()
                     "Input error: string " + f + " in " + m_diag_name
                     + ".fields_to_plot does not match any species"
                 );
-                expanded_varnames.push_back("Qx_" + sp);
-                expanded_varnames.push_back("Qy_" + sp);
-                expanded_varnames.push_back("Qz_" + sp);
+                for (auto const& comp : HeatFluxFunctor::ComponentNames()) {
+                    expanded_varnames.push_back(comp + suffix);
+                }
             } else {
                 expanded_varnames.push_back(f);
             }

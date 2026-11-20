@@ -2473,7 +2473,8 @@ WarpXParticleContainer::DepositNGPPressureTensor (const int lev)
     const auto dxi = Geom(lev).InvCellSizeArray();
 
     // Second pass: accumulate sum(w * du_i * du_j) into the 6 tensor
-    // components, ordered xx, xy, xz, yy, yz, zz.
+    // components, ordered xx, xy, xz, yy, yz, zz (rr, rt, rz, tt, tz, zz in
+    // RZ/RCYLINDER; rr, rt, rp, tt, tp, pp in RSPHERE).
 #ifdef AMREX_USE_OMP
 #pragma omp parallel if (amrex::Gpu::notInLaunchRegion())
 #endif
@@ -2486,6 +2487,12 @@ WarpXParticleContainer::DepositNGPPressureTensor (const int lev)
         amrex::ParticleReal const * uxp = pti.GetAttribs(PIdx::ux).dataPtr();
         amrex::ParticleReal const * uyp = pti.GetAttribs(PIdx::uy).dataPtr();
         amrex::ParticleReal const * uzp = pti.GetAttribs(PIdx::uz).dataPtr();
+#if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE)
+        amrex::ParticleReal const * thetap = pti.GetAttribs(PIdx::theta).dataPtr();
+#endif
+#if defined(WARPX_DIM_RSPHERE)
+        amrex::ParticleReal const * phip = pti.GetAttribs(PIdx::phi).dataPtr();
+#endif
 
         amrex::Array4<const amrex::Real> const& ux_array = ux_mf.const_array(pti);
         amrex::Array4<const amrex::Real> const& uy_array = uy_mf.const_array(pti);
@@ -2499,9 +2506,27 @@ WarpXParticleContainer::DepositNGPPressureTensor (const int lev)
                 const auto [ii, jj, kk] = getParticleCell(p, plo, dxi).dim3();
 
                 const amrex::ParticleReal w   = wp[ip];
-                const amrex::ParticleReal dux = uxp[ip] - ux_array(ii, jj, kk);
-                const amrex::ParticleReal duy = uyp[ip] - uy_array(ii, jj, kk);
-                const amrex::ParticleReal duz = uzp[ip] - uz_array(ii, jj, kk);
+#if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE)
+                amrex::ParticleReal ux = uxp[ip];
+                amrex::ParticleReal uy = uyp[ip];
+                amrex::ParticleReal uz = uzp[ip];
+#if defined(WARPX_DIM_RSPHERE)
+                const amrex::ParticleReal phi = phip[ip];
+#else
+                const amrex::ParticleReal phi = 0._prt;
+#endif
+                // The mean velocity from the first pass is in the local curvilinear basis
+                // ([ur,uth,uz] in RZ/RCYLINDER, [ur,uth,uph] in RSPHERE), so the particle
+                // velocity is transformed to the same basis before taking the difference.
+                transform_momentum_to_curvilinear(ux, uy, uz, thetap[ip], phi);
+#else
+                const amrex::ParticleReal ux = uxp[ip];
+                const amrex::ParticleReal uy = uyp[ip];
+                const amrex::ParticleReal uz = uzp[ip];
+#endif
+                const amrex::ParticleReal dux = ux - ux_array(ii, jj, kk);
+                const amrex::ParticleReal duy = uy - uy_array(ii, jj, kk);
+                const amrex::ParticleReal duz = uz - uz_array(ii, jj, kk);
 
                 amrex::Gpu::Atomic::AddNoRet(&pt_array(ii, jj, kk, 0), (amrex::Real)(w*dux*dux)); // xx
                 amrex::Gpu::Atomic::AddNoRet(&pt_array(ii, jj, kk, 1), (amrex::Real)(w*dux*duy)); // xy
@@ -2604,6 +2629,12 @@ WarpXParticleContainer::DepositNGPHeatFlux (const int lev)
         amrex::ParticleReal const * uxp = pti.GetAttribs(PIdx::ux).dataPtr();
         amrex::ParticleReal const * uyp = pti.GetAttribs(PIdx::uy).dataPtr();
         amrex::ParticleReal const * uzp = pti.GetAttribs(PIdx::uz).dataPtr();
+#if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE)
+        amrex::ParticleReal const * thetap = pti.GetAttribs(PIdx::theta).dataPtr();
+#endif
+#if defined(WARPX_DIM_RSPHERE)
+        amrex::ParticleReal const * phip = pti.GetAttribs(PIdx::phi).dataPtr();
+#endif
 
         amrex::Array4<const amrex::Real> const& ux_array = ux_mf.const_array(pti);
         amrex::Array4<const amrex::Real> const& uy_array = uy_mf.const_array(pti);
@@ -2617,9 +2648,27 @@ WarpXParticleContainer::DepositNGPHeatFlux (const int lev)
                 const auto [ii, jj, kk] = getParticleCell(p, plo, dxi).dim3();
 
                 const amrex::ParticleReal w   = wp[ip];
-                const amrex::ParticleReal dux = uxp[ip] - ux_array(ii, jj, kk);
-                const amrex::ParticleReal duy = uyp[ip] - uy_array(ii, jj, kk);
-                const amrex::ParticleReal duz = uzp[ip] - uz_array(ii, jj, kk);
+#if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE)
+                amrex::ParticleReal ux = uxp[ip];
+                amrex::ParticleReal uy = uyp[ip];
+                amrex::ParticleReal uz = uzp[ip];
+#if defined(WARPX_DIM_RSPHERE)
+                const amrex::ParticleReal phi = phip[ip];
+#else
+                const amrex::ParticleReal phi = 0._prt;
+#endif
+                // The mean velocity from the first pass is in the local curvilinear basis
+                // ([ur,uth,uz] in RZ/RCYLINDER, [ur,uth,uph] in RSPHERE), so the particle
+                // velocity is transformed to the same basis before taking the difference.
+                transform_momentum_to_curvilinear(ux, uy, uz, thetap[ip], phi);
+#else
+                const amrex::ParticleReal ux = uxp[ip];
+                const amrex::ParticleReal uy = uyp[ip];
+                const amrex::ParticleReal uz = uzp[ip];
+#endif
+                const amrex::ParticleReal dux = ux - ux_array(ii, jj, kk);
+                const amrex::ParticleReal duy = uy - uy_array(ii, jj, kk);
+                const amrex::ParticleReal duz = uz - uz_array(ii, jj, kk);
                 const amrex::ParticleReal dusq = dux*dux + duy*duy + duz*duz;
 
                 amrex::Gpu::Atomic::AddNoRet(&hf_array(ii, jj, kk, 0), (amrex::Real)(w*dusq*dux)); // Qx

@@ -528,26 +528,25 @@ FullDiagnostics::InitializeFieldFunctorsRZopenPMD (int lev)
         } else if ( m_varnames_fields[comp].starts_with("P_") ){
             // Initialize pressure tensor functor to dump 6-component tensor per species
             const std::string species_name = m_all_species_names[m_P_per_species_index[i_P_species]];
+            const std::string suffix = "_" + species_name;
             m_all_field_functors[lev][comp] = std::make_unique<PressureTensorFunctor>(lev, m_crse_ratio, m_P_per_species_index[i_P_species], 6);
             if (update_varnames) {
                 // Pressure tensor is particle-based (no RZ modes); push 6 component names directly
-                m_varnames.push_back("Pxx_" + species_name);
-                m_varnames.push_back("Pxy_" + species_name);
-                m_varnames.push_back("Pxz_" + species_name);
-                m_varnames.push_back("Pyy_" + species_name);
-                m_varnames.push_back("Pyz_" + species_name);
-                m_varnames.push_back("Pzz_" + species_name);
+                for (auto const& name : PressureTensorFunctor::ComponentNames()) {
+                    m_varnames.push_back(name + suffix);
+                }
             }
             i_P_species++;
         } else if ( m_varnames_fields[comp].starts_with("Q_") ){
             // Initialize heat flux functor to dump 3-component vector per species
             const std::string species_name = m_all_species_names[m_Q_per_species_index[i_Q_species]];
+            const std::string suffix = "_" + species_name;
             m_all_field_functors[lev][comp] = std::make_unique<HeatFluxFunctor>(lev, m_crse_ratio, m_Q_per_species_index[i_Q_species], 3);
             if (update_varnames) {
                 // Heat flux is particle-based (no RZ modes); push 3 component names directly
-                m_varnames.push_back("Qx_" + species_name);
-                m_varnames.push_back("Qy_" + species_name);
-                m_varnames.push_back("Qz_" + species_name);
+                for (auto const& name : HeatFluxFunctor::ComponentNames()) {
+                    m_varnames.push_back(name + suffix);
+                }
             }
             i_Q_species++;
         } else if ( m_varnames_fields[comp] == "F" ){
