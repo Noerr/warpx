@@ -12,7 +12,7 @@
  * \brief Functor to calculate per-cell heat flux vector from particle data.
  *
  * Computes the 3 components of the heat flux vector
- * Q_i = (n * mass / 2) * <|u - <u>|^2 * (u_i - <u_i>)>  [W/m^2]
+ * `Q_i = (n * mass / 2) * <|u - <u>|^2 * (u_i - <u_i>)>` [W/m^2]
  * where u = gamma*v, n is the number density, and the average is weighted
  * over the macroparticles in each cell (nearest-grid-point assignment).
  * In RZ, RCYLINDER and RSPHERE, u is expressed in the local curvilinear basis.

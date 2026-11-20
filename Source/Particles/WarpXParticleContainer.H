@@ -463,17 +463,17 @@ public:
     void CalculateNuei(amrex::MultiFab & species_nuei,
                        WarpXParticleContainer const & electron_species, int lev);
 
-    /** Deposit the symmetric pressure tensor P_<species> (Pa) into the field
-     *  registry, as n*m*<(u_i - <u_i>)(u_j - <u_j>)>, with u expressed in the
+    /** Deposit the symmetric pressure tensor `P_<species>` (Pa) into the field
+     *  registry, as `n*m*<(u_i - <u_i>)(u_j - <u_j>)>`, with u expressed in the
      *  local curvilinear basis in RZ, RCYLINDER and RSPHERE.
      *
-     *  The first-pass moments N_<species> and u_<species> are obtained from
-     *  DepositTotalNGPTemperature(), which also computes T_<species>.
+     *  The first-pass moments `N_<species>` and `u_<species>` are obtained from
+     *  DepositTotalNGPTemperature(), which also computes `T_<species>`.
      */
     void DepositNGPPressureTensor (int lev);
 
-    /** Deposit the heat flux vector Q_<species> (W/m^2) into the field
-     *  registry, as n*m/2*<|u - <u>|^2 (u_i - <u_i>)>.
+    /** Deposit the heat flux vector `Q_<species>` (W/m^2) into the field
+     *  registry, as `n*m/2*<|u - <u>|^2 (u_i - <u_i>)>`.
      *
      *  See the note on DepositNGPPressureTensor() regarding the shared
      *  first-pass moments.

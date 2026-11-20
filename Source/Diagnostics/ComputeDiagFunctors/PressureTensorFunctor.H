@@ -12,7 +12,7 @@
  * \brief Functor to calculate per-cell pressure tensor from particle data.
  *
  * Computes the 6 independent components of the symmetric pressure tensor
- * P_ij = n * mass * <(u_i - <u_i>)(u_j - <u_j>)>  [Pa]
+ * `P_ij = n * mass * <(u_i - <u_i>)(u_j - <u_j>)>` [Pa]
  * where u = gamma*v, n is the number density, and the average is weighted
  * over the macroparticles in each cell (nearest-grid-point assignment).
  * In RZ, RCYLINDER and RSPHERE, u is expressed in the local curvilinear basis.
