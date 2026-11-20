@@ -217,6 +217,28 @@ the kinetic-fluid hybrid model since in the absence of kinetic electrons, and un
 the assumption of zero displacement current, that diagnostic simply calculates the
 hybrid model's electron current.
 
+Azimuthal modes in RZ geometry
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+In RZ geometry the fields are stored as azimuthal modes,
+:math:`F(r,\theta,z) = F_0 + \sum_{m \geq 1} [\mathrm{Re}(F_m)\cos(m\theta) + \mathrm{Im}(F_m)\sin(m\theta)]`.
+With ``n_rz_azimuthal_modes`` :math:`N > 1`, the terms of Ohm's law that are not linear in the fields,
+:math:`(\boldsymbol{J}-\boldsymbol{J}_i)\times\boldsymbol{B}`, the division by :math:`\rho`, the
+electron-pressure closure and the resistivity parsers, couple the modes. They are evaluated on
+:math:`3N` equally spaced azimuthal samples per grid point: the stored modes are transformed to the
+samples, the terms are computed pointwise, and the result is transformed back to the :math:`N` stored
+modes (quadratic products are then free of aliasing). The linear operations (derivatives, the
+hyper-resistive vector Laplacian including its :math:`\theta` cross terms, and the interpolation
+between staggered locations) act on each mode directly.
+
+On the axis, the :math:`m \geq 1` modes of scalars and of the :math:`z` components vanish, while the
+transverse :math:`m = 1` mode is finite, with :math:`F_{\theta,1} = -i F_{r,1}` (a uniform transverse
+vector); the :math:`m \geq 2` transverse modes vanish. These conditions are imposed on the deposited
+charge and ion current and on the Ohm's-law electric field.
+
+The external fields, the electron energy equation, the per-species resistivity, the resistive drag and
+a :math:`|B|`-dependent hyper-resistivity are not available with :math:`N > 1`.
+
 Model derivation
 ----------------
 
