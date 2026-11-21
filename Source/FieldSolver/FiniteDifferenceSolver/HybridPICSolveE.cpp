@@ -1047,7 +1047,7 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
     const bool include_resistivity = solve_for_Faraday;
     const bool include_grad_pe = !solve_for_Faraday;
 
-    auto & warpx = WarpX::GetInstance();
+    auto const& warpx = WarpX::GetInstance();
     const amrex::Real t_new = warpx.gett_new(lev);
 
     amrex::GpuArray<int, 3> const& Er_stag     = hybrid_model->Ex_IndexType;
@@ -1100,8 +1100,8 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
 
             constexpr int NM = 2*MAX_PSEUDO_SPECTRAL_NMODES;
             constexpr int NT = MAX_PSEUDO_SPECTRAL_NTHETA;
-            Real Br_m[NM], Bt_m[NM], Bz_m[NM];
-            Real dJr_m[NM], dJt_m[NM], dJz_m[NM];
+            Real Br_m[NM]{}, Bt_m[NM]{}, Bz_m[NM]{};
+            Real dJr_m[NM]{}, dJt_m[NM]{}, dJz_m[NM]{};
             for (int c = 0; c < ncomps; ++c) {
                 Br_m[c] = Interp(Br, Br_stag, nodal, coarsen, i, j, 0, c);
                 Bt_m[c] = Interp(Btheta, Btheta_stag, nodal, coarsen, i, j, 0, c);
@@ -1123,7 +1123,7 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
                 apply_axis_bc_scalar(nmodes, dJz_m);
             }
 
-            Real Br_th[NT], Bt_th[NT], Bz_th[NT], dJr_th[NT], dJt_th[NT], dJz_th[NT];
+            Real Br_th[NT]{}, Bt_th[NT]{}, Bz_th[NT]{}, dJr_th[NT]{}, dJt_th[NT]{}, dJz_th[NT]{};
             inverse_az_ft(az_tab, Br_m, Br_th);
             inverse_az_ft(az_tab, Bt_m, Bt_th);
             inverse_az_ft(az_tab, Bz_m, Bz_th);
@@ -1131,15 +1131,15 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
             inverse_az_ft(az_tab, dJt_m, dJt_th);
             inverse_az_ft(az_tab, dJz_m, dJz_th);
 
-            Real rho_th[NT];
+            Real rho_th[NT]{};
             if (hall_div_nodes) {
-                Real rho_m[NM];
+                Real rho_m[NM]{};
                 for (int c = 0; c < ncomps; ++c) { rho_m[c] = rho(i, j, 0, c); }
                 if (on_axis) { apply_axis_bc_scalar(nmodes, rho_m); }
                 inverse_az_ft(az_tab, rho_m, rho_th);
             }
 
-            Real er_th[NT], et_th[NT], ez_th[NT];
+            Real er_th[NT]{}, et_th[NT]{}, ez_th[NT]{};
             for (int t = 0; t < n_theta; ++t) {
                 er_th[t] = dJt_th[t] * Bz_th[t] - dJz_th[t] * Bt_th[t];
                 et_th[t] = dJz_th[t] * Br_th[t] - dJr_th[t] * Bz_th[t];
@@ -1153,7 +1153,7 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
                 }
             }
 
-            Real out_m[NM];
+            Real out_m[NM]{};
             forward_az_ft(az_tab, er_th, out_m);
             for (int c = 0; c < ncomps; ++c) { enE_nodal(i, j, 0, c) = out_m[c]; }
             forward_az_ft(az_tab, et_th, out_m);
@@ -1253,7 +1253,7 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
                 const Real r = rmin + (i + 0.5_rt)*dr;
                 const Real one_over_r2 = 1._rt/(r*r);
 
-                Real enE_m[NM], rho_m[NM], gP_m[NM], Jr_m[NM], Jt_m[NM], Jz_m[NM], lapJ_m[NM];
+                Real enE_m[NM]{}, rho_m[NM]{}, gP_m[NM]{}, Jr_m[NM]{}, Jt_m[NM]{}, Jz_m[NM]{}, lapJ_m[NM]{};
                 for (int c = 0; c < ncomps; ++c) {
                     enE_m[c] = Interp(enE, nodal, Er_stag, coarsen, i, j, 0, c);
                     rho_m[c] = Interp(rho, nodal, Er_stag, coarsen, i, j, 0, c);
@@ -1280,8 +1280,8 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
                     }
                 }
 
-                Real enE_th[NT], rho_th[NT], gP_th[NT], Jr_th[NT], Jt_th[NT], Jz_th[NT];
-                Real lapJ_th[NT], E_th[NT];
+                Real enE_th[NT]{}, rho_th[NT]{}, gP_th[NT]{}, Jr_th[NT]{}, Jt_th[NT]{}, Jz_th[NT]{};
+                Real lapJ_th[NT]{}, E_th[NT]{};
                 inverse_az_ft(az_tab, enE_m, enE_th);
                 inverse_az_ft(az_tab, rho_m, rho_th);
                 inverse_az_ft(az_tab, gP_m, gP_th);
@@ -1292,7 +1292,7 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
 
                 pointwise_E(enE_th, gP_th, rho_th, Jr_th, Jt_th, Jz_th, Jr_th, lapJ_th, E_th);
 
-                Real E_m[NM];
+                Real E_m[NM]{};
                 forward_az_ft(az_tab, E_th, E_m);
                 for (int c = 0; c < ncomps; ++c) { Er(i, j, 0, c) = E_m[c]; }
             },
@@ -1315,7 +1315,7 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
                 constexpr int NT = MAX_PSEUDO_SPECTRAL_NTHETA;
                 const Real one_over_r2 = 1._rt/(r*r);
 
-                Real enE_m[NM], rho_m[NM], gP_m[NM], Jr_m[NM], Jt_m[NM], Jz_m[NM], lapJ_m[NM];
+                Real enE_m[NM]{}, rho_m[NM]{}, gP_m[NM]{}, Jr_m[NM]{}, Jt_m[NM]{}, Jz_m[NM]{}, lapJ_m[NM]{};
                 for (int c = 0; c < ncomps; ++c) {
                     enE_m[c] = Interp(enE, nodal, Etheta_stag, coarsen, i, j, 0, ncomps + c);
                     rho_m[c] = Interp(rho, nodal, Etheta_stag, coarsen, i, j, 0, c);
@@ -1348,8 +1348,8 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
                     }
                 }
 
-                Real enE_th[NT], rho_th[NT], gP_th[NT], Jr_th[NT], Jt_th[NT], Jz_th[NT];
-                Real lapJ_th[NT], E_th[NT];
+                Real enE_th[NT]{}, rho_th[NT]{}, gP_th[NT]{}, Jr_th[NT]{}, Jt_th[NT]{}, Jz_th[NT]{};
+                Real lapJ_th[NT]{}, E_th[NT]{};
                 inverse_az_ft(az_tab, enE_m, enE_th);
                 inverse_az_ft(az_tab, rho_m, rho_th);
                 inverse_az_ft(az_tab, gP_m, gP_th);
@@ -1360,7 +1360,7 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
 
                 pointwise_E(enE_th, gP_th, rho_th, Jr_th, Jt_th, Jz_th, Jt_th, lapJ_th, E_th);
 
-                Real E_m[NM];
+                Real E_m[NM]{};
                 forward_az_ft(az_tab, E_th, E_m);
                 for (int c = 0; c < ncomps; ++c) { Etheta(i, j, 0, c) = E_m[c]; }
             },
@@ -1377,7 +1377,7 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
                 const Real r = rmin + i*dr;
                 const bool on_axis = domain_has_axis && (i == 0);
 
-                Real enE_m[NM], rho_m[NM], gP_m[NM], Jr_m[NM], Jt_m[NM], Jz_m[NM], lapJ_m[NM];
+                Real enE_m[NM]{}, rho_m[NM]{}, gP_m[NM]{}, Jr_m[NM]{}, Jt_m[NM]{}, Jz_m[NM]{}, lapJ_m[NM]{};
                 for (int c = 0; c < ncomps; ++c) {
                     enE_m[c] = Interp(enE, nodal, Ez_stag, coarsen, i, j, 0, 2*ncomps + c);
                     rho_m[c] = Interp(rho, nodal, Ez_stag, coarsen, i, j, 0, c);
@@ -1411,8 +1411,8 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
                     if (on_axis) { apply_axis_bc_scalar(nmodes, lapJ_m); }
                 }
 
-                Real enE_th[NT], rho_th[NT], gP_th[NT], Jr_th[NT], Jt_th[NT], Jz_th[NT];
-                Real lapJ_th[NT], E_th[NT];
+                Real enE_th[NT]{}, rho_th[NT]{}, gP_th[NT]{}, Jr_th[NT]{}, Jt_th[NT]{}, Jz_th[NT]{};
+                Real lapJ_th[NT]{}, E_th[NT]{};
                 inverse_az_ft(az_tab, enE_m, enE_th);
                 inverse_az_ft(az_tab, rho_m, rho_th);
                 inverse_az_ft(az_tab, gP_m, gP_th);
@@ -1423,7 +1423,7 @@ void FiniteDifferenceSolver::HybridPICSolveECylindricalMultiMode (
 
                 pointwise_E(enE_th, gP_th, rho_th, Jr_th, Jt_th, Jz_th, Jz_th, lapJ_th, E_th);
 
-                Real E_m[NM];
+                Real E_m[NM]{};
                 forward_az_ft(az_tab, E_th, E_m);
                 if (on_axis) { apply_axis_bc_scalar(nmodes, E_m); }
                 for (int c = 0; c < ncomps; ++c) { Ez(i, j, 0, c) = E_m[c]; }

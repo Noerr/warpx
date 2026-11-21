@@ -88,12 +88,12 @@ void forward_az_ft (AzimuthalFTTable const& tab,
                     amrex::Real* AMREX_RESTRICT A_modes)
 {
     const int n_theta = tab.n_theta;
-    amrex::Real a0 = amrex::Real{0};
+    auto a0 = amrex::Real{0};
     for (int k = 0; k < n_theta; ++k) { a0 += A_theta[k]; }
     A_modes[0] = a0 / n_theta;
     for (int m = 1; m < tab.nmodes; ++m) {
-        amrex::Real ar = amrex::Real{0};
-        amrex::Real ai = amrex::Real{0};
+        auto ar = amrex::Real{0};
+        auto ai = amrex::Real{0};
         for (int k = 0; k < n_theta; ++k) {
             ar += A_theta[k] * tab.cos_mt[m*n_theta + k];
             ai += A_theta[k] * tab.sin_mt[m*n_theta + k];

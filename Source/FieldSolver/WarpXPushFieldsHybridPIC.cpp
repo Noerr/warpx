@@ -399,7 +399,7 @@ void WarpX::HybridPICDepositRhoAndJ ()
     FinalizeRho();
     FinalizeJ();
 
-#if defined(WARPX_DIM_RZ)
+#ifdef WARPX_DIM_RZ
     // Multimode: impose the on-axis regularity of the deposited rho and J_i
     // used by the Ohm's-law solve. Scalars and z components have vanishing
     // m >= 1 modes at r = 0, which the deposition (divided by the small axis
@@ -467,7 +467,7 @@ void WarpX::HybridPICDepositRhoAndJ ()
         }
     }
 
-#if defined(WARPX_DIM_RZ)
+#ifdef WARPX_DIM_RZ
     // The multimode Ohm's-law solve interpolates the cell-centered J_r (and the
     // other components) to the axis nodes through the guard cells below the
     // axis: fill those by parity reflection, mode by mode.

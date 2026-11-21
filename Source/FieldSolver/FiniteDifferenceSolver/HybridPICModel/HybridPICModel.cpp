@@ -563,7 +563,7 @@ void HybridPICModel::InitData (const ablastr::fields::MultiFabRegister& fields)
     const std::set<std::string> hyper_resistivity_symbols = m_hyper_resistivity_parser->symbols();
     m_hyper_resistivity_has_B_dependence += hyper_resistivity_symbols.count("B");
 
-#if defined(WARPX_DIM_RZ)
+#ifdef WARPX_DIM_RZ
     if (WarpX::n_rz_azimuthal_modes > 1) {
         // Features of the hybrid solver that the multimode Ohm's law does not
         // (yet) treat for m >= 1.
@@ -1269,7 +1269,7 @@ void HybridPICModel::FillElectronPressureMF (
     const auto rho_floor =
         floor_density ? PhysConst::q_e * m_n_floor : amrex::Real(0.0);
 
-#if defined(WARPX_DIM_RZ)
+#ifdef WARPX_DIM_RZ
     const int nmodes = WarpX::n_rz_azimuthal_modes;
     const int ncomps = 2*nmodes - 1;
     const int n_theta = HybridPICAzimuthalNTheta(nmodes);
@@ -1295,17 +1295,17 @@ void HybridPICModel::FillElectronPressureMF (
         // Out-of-domain ghosts are handled at the density floor.
         tilebox.grow(Pe_field.nGrowVect());
 
-#if defined(WARPX_DIM_RZ)
+#ifdef WARPX_DIM_RZ
         if (nmodes > 1) {
             // The closure is nonlinear in rho (for gamma != 1, and through the
             // floor), so each azimuthal mode of P_e and T_e couples all modes of
             // rho: evaluate it on an azimuthal sample grid and transform back.
             ParallelFor(tilebox, [=] AMREX_GPU_DEVICE (int i, int j, int k) {
-                Real rho_m[2*MAX_PSEUDO_SPECTRAL_NMODES];
-                Real rho_th[MAX_PSEUDO_SPECTRAL_NTHETA];
-                Real Pe_th[MAX_PSEUDO_SPECTRAL_NTHETA];
-                Real Te_th[MAX_PSEUDO_SPECTRAL_NTHETA];
-                Real out_m[2*MAX_PSEUDO_SPECTRAL_NMODES];
+                Real rho_m[2*MAX_PSEUDO_SPECTRAL_NMODES]{};
+                Real rho_th[MAX_PSEUDO_SPECTRAL_NTHETA]{};
+                Real Pe_th[MAX_PSEUDO_SPECTRAL_NTHETA]{};
+                Real Te_th[MAX_PSEUDO_SPECTRAL_NTHETA]{};
+                Real out_m[2*MAX_PSEUDO_SPECTRAL_NMODES]{};
                 for (int c = 0; c < ncomps; ++c) { rho_m[c] = rho(i, j, k, c); }
                 inverse_az_ft(az_tab, rho_m, rho_th);
                 for (int t = 0; t < n_theta; ++t) {
