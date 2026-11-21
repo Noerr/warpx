@@ -59,6 +59,8 @@ failed = False
 for key, (err, tol) in checks.items():
     ok = err < tol
     failed = failed or not ok
-    print(f"{key:26s} rel. error {err:.3e}  (tolerance {tol:.0e})  {'ok' if ok else 'FAILED'}")
+    print(
+        f"{key:26s} rel. error {err:.3e}  (tolerance {tol:.0e})  {'ok' if ok else 'FAILED'}"
+    )
 
 assert not failed
