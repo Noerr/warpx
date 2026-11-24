@@ -2325,6 +2325,10 @@ class HybridPICSolver(
         default=None,
         description="Flag to determine handling of vacuum region (where rho < n_floor*q_e). Setting to True will solve the simplified Generalized Ohm's Law dropping the Hall and pressure terms in the vacuum region. See `Holmstrom (2013) <https://arxiv.org/abs/1301.0272v1>`_. This flag is useful for suppressing vacuum region fluctuations. A large resistivity value must be used when rho <= rho_floor. (default False)",
     )
+    hall_divide_at_nodes: bool | None = Field(
+        default=None,
+        description="Divide the Hall term (J - J_i) x B by rho at the nodes before averaging it to the Yee grid. False restores the legacy ordering (average the numerator, divide by the averaged rho), which is not energy conserving where rho varies on the grid scale. (default True)",
+    )
     vacuum_seam_switch_mode: Literal["edge", "node", "cell"] | None = Field(
         default=None,
         description='Sampling of the density that decides the vacuum-seam treatment -- the Holmstrom vacuum branch when holmstrom_vacuum_region is True and the density-floor selection of the guarded Hall term otherwise: "edge" (legacy per-component edge average), "node" (endpoint minimum), or "cell" (adjacent-cell minimum -- one decision for all three E components of an index, removing the per-component half-cell decision offsets at the plasma/vacuum seam). Cartesian only. (default "edge")',
@@ -2416,6 +2420,7 @@ class HybridPICSolver(
         pywarpx.hybridpicmodel.substep_max_growth = self.substep_max_growth
         pywarpx.hybridpicmodel.max_substep_attempts = self.max_substep_attempts
         pywarpx.hybridpicmodel.holmstrom_vacuum_region = self.holmstrom_vacuum_region
+        pywarpx.hybridpicmodel.hall_divide_at_nodes = self.hall_divide_at_nodes
         pywarpx.hybridpicmodel.vacuum_seam_switch_mode = self.vacuum_seam_switch_mode
         pywarpx.hybridpicmodel.__setattr__(
             "Jx_external_grid_function(x,y,z,t)",
