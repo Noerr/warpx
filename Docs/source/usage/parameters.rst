@@ -4363,13 +4363,16 @@ Maxwell solver: kinetic-fluid hybrid
 
 .. pp:param:: hybrid_pic_model.hall_divide_at_nodes
     :type: ``bool``
-    :default: ``false``
+    :default: ``true``
     :optional:
 
-    Only in RZ geometry with :pp:param:`warpx.n_rz_azimuthal_modes` > 1. If ``true``, the Hall term
-    :math:`(\boldsymbol{J}-\boldsymbol{J}_i)\times\boldsymbol{B}/\rho` is divided by :math:`\rho` at the
-    nodes, before it is averaged to the staggered locations of :math:`\boldsymbol{E}`. If ``false``, the
-    averaged numerator is divided by the averaged :math:`\rho`. See the
+    If ``true``, the Hall term :math:`(\boldsymbol{J}-\boldsymbol{J}_i)\times\boldsymbol{B}/\rho` is
+    divided by :math:`\rho` at the nodes, before it is averaged to the staggered locations of
+    :math:`\boldsymbol{E}` (in RZ with :pp:param:`warpx.n_rz_azimuthal_modes` > 1, on the azimuthal
+    sample grid). If ``false``, the averaged numerator is divided by the averaged :math:`\rho`, the
+    ordering used before this option existed. That ordering is not energy conserving where
+    :math:`\rho` varies on the grid scale, for example at a density floor or a wall, and drives a
+    grid-scale whistler there that only hyper-resistivity holds back. See the
     :ref:`theory section <theory-kinetic-fluid-hybrid-model>` for the multimode Ohm's law.
 
 .. pp:param:: hybrid_pic_model.vacuum_seam_switch_mode

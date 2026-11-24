@@ -22,8 +22,8 @@ constants = picmi.constants
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
-    "--hall_divide_at_nodes",
-    help="divide the Hall term by rho at the nodes",
+    "--legacy_hall_ordering",
+    help="divide the averaged Hall numerator by the averaged rho (hall_divide_at_nodes = 0)",
     action="store_true",
 )
 args, left = parser.parse_known_args()
@@ -111,10 +111,10 @@ simulation.add_diagnostic(
 )
 
 simulation.initialize_inputs()
-if args.hall_divide_at_nodes:
+if args.legacy_hall_ordering:
     from pywarpx import hybridpicmodel
 
-    hybridpicmodel.hall_divide_at_nodes = 1
+    hybridpicmodel.hall_divide_at_nodes = 0
 simulation.initialize_warpx()
 
 # Start from the stationary E (otherwise the first ion push sees E = 0).

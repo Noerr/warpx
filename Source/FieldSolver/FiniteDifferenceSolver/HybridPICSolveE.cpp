@@ -564,6 +564,7 @@ void FiniteDifferenceSolver::HybridPICSolveECylindrical (
     const bool include_external_fields = hybrid_model->m_add_external_fields;
 
     const bool holmstrom_vacuum_region = hybrid_model->m_holmstrom_vacuum_region;
+    const bool hall_div_nodes = hybrid_model->m_hall_divide_at_nodes;
 
     auto & warpx = WarpX::GetInstance();
     const amrex::Real t_new = warpx.gett_new(lev);
@@ -642,6 +643,7 @@ void FiniteDifferenceSolver::HybridPICSolveECylindrical (
         Array4<Real const> const& Br = Bfield[0]->const_array(mfi);
         Array4<Real const> const& Btheta = Bfield[1]->const_array(mfi);
         Array4<Real const> const& Bz = Bfield[2]->const_array(mfi);
+        Array4<Real const> const& rho = rhofield.const_array(mfi);
 
         Array4<Real> Br_ext, Btheta_ext, Bz_ext;
         if (include_external_fields) {
@@ -687,6 +689,18 @@ void FiniteDifferenceSolver::HybridPICSolveECylindrical (
                 (jr_interp - jir_interp) * Btheta_interp
                 - (jtheta_interp - jit_interp) * Br_interp
             );
+
+            // Divide by rho at the nodes before the average to the Yee grid, so
+            // the Hall term stays energy conserving where rho varies; see
+            // hybrid_pic_model.hall_divide_at_nodes.
+            if (hall_div_nodes) {
+                const Real rho_node = rho(i, j, 0);
+                const Real inv_rho = (rho_node < rho_floor && holmstrom_vacuum_region) ?
+                    0._rt : 1._rt / std::max(rho_node, rho_floor);
+                enE_nodal(i, j, 0, 0) *= inv_rho;
+                enE_nodal(i, j, 0, 1) *= inv_rho;
+                enE_nodal(i, j, 0, 2) *= inv_rho;
+            }
         });
 
         if (cost && WarpX::load_balance_costs_update_algo == LoadBalanceCostsUpdateAlgo::Timers)
@@ -790,7 +804,8 @@ void FiniteDifferenceSolver::HybridPICSolveECylindrical (
                     // safety condition since we divide by rho
                     const auto rho_val_limited = std::max(rho_val, rho_floor);
 
-                    Er(i, j, 0) = (enE_r - grad_Pe) / rho_val_limited;
+                    Er(i, j, 0) = hall_div_nodes ? enE_r - grad_Pe / rho_val_limited
+                        : (enE_r - grad_Pe) / rho_val_limited;
                 }
 
                 // Resistive terms; see include_resistivity above.
@@ -868,7 +883,8 @@ void FiniteDifferenceSolver::HybridPICSolveECylindrical (
                     // safety condition since we divide by rho
                     const auto rho_val_limited = std::max(rho_val, rho_floor);
 
-                    Etheta(i, j, 0) = (enE_t - grad_Pe) / rho_val_limited;
+                    Etheta(i, j, 0) = hall_div_nodes ? enE_t - grad_Pe / rho_val_limited
+                        : (enE_t - grad_Pe) / rho_val_limited;
                 }
 
                 // Resistive terms; see include_resistivity above.
@@ -939,7 +955,8 @@ void FiniteDifferenceSolver::HybridPICSolveECylindrical (
                     // safety condition since we divide by rho
                     const auto rho_val_limited = std::max(rho_val, rho_floor);
 
-                    Ez(i, j, 0) = (enE_z - grad_Pe) / rho_val_limited;
+                    Ez(i, j, 0) = hall_div_nodes ? enE_z - grad_Pe / rho_val_limited
+                        : (enE_z - grad_Pe) / rho_val_limited;
                 }
 
                 // Resistive terms; see include_resistivity above.
@@ -1509,6 +1526,7 @@ void FiniteDifferenceSolver::HybridPICSolveECartesian (
     const bool include_external_fields = hybrid_model->m_add_external_fields;
 
     const bool holmstrom_vacuum_region = hybrid_model->m_holmstrom_vacuum_region;
+    const bool hall_div_nodes = hybrid_model->m_hall_divide_at_nodes;
     // Decision-density sampling for the vacuum seam (VacuumSeamSwitchMode):
     // Edge is the legacy per-component average; Node and Cell give one
     // decision field for all three E components. The decision drives the
@@ -1592,6 +1610,7 @@ void FiniteDifferenceSolver::HybridPICSolveECartesian (
         Array4<Real const> const& Bx = Bfield[0]->const_array(mfi);
         Array4<Real const> const& By = Bfield[1]->const_array(mfi);
         Array4<Real const> const& Bz = Bfield[2]->const_array(mfi);
+        Array4<Real const> const& rho = rhofield.const_array(mfi);
 
         Array4<Real> Bx_ext, By_ext, Bz_ext;
         if (include_external_fields) {
@@ -1637,6 +1656,18 @@ void FiniteDifferenceSolver::HybridPICSolveECartesian (
                 (jx_interp - jix_interp) * By_interp
                 - (jy_interp - jiy_interp) * Bx_interp
             );
+
+            // Divide by rho at the nodes before the average to the Yee grid, so
+            // the Hall term stays energy conserving where rho varies; see
+            // hybrid_pic_model.hall_divide_at_nodes.
+            if (hall_div_nodes) {
+                const Real rho_node = rho(i, j, k);
+                const Real inv_rho = (rho_node < rho_floor && holmstrom_vacuum_region) ?
+                    0._rt : 1._rt / std::max(rho_node, rho_floor);
+                enE_nodal(i, j, k, 0) *= inv_rho;
+                enE_nodal(i, j, k, 1) *= inv_rho;
+                enE_nodal(i, j, k, 2) *= inv_rho;
+            }
         });
 
         if (cost && WarpX::load_balance_costs_update_algo == LoadBalanceCostsUpdateAlgo::Timers)
@@ -1747,7 +1778,8 @@ void FiniteDifferenceSolver::HybridPICSolveECartesian (
                 const auto rho_val_limited = (rho_dec < rho_floor)
                     ? rho_floor : std::max(rho_val, rho_floor);
 
-                Ex(i, j, k) = (enE_x - grad_Pe) / rho_val_limited;
+                Ex(i, j, k) = hall_div_nodes ? enE_x - grad_Pe / rho_val_limited
+                    : (enE_x - grad_Pe) / rho_val_limited;
             }
 
             // Resistive terms; see include_resistivity above.
@@ -1827,7 +1859,8 @@ void FiniteDifferenceSolver::HybridPICSolveECartesian (
                 const auto rho_val_limited = (rho_dec < rho_floor)
                     ? rho_floor : std::max(rho_val, rho_floor);
 
-                Ey(i, j, k) = (enE_y - grad_Pe) / rho_val_limited;
+                Ey(i, j, k) = hall_div_nodes ? enE_y - grad_Pe / rho_val_limited
+                    : (enE_y - grad_Pe) / rho_val_limited;
             }
 
             // Resistive terms; see include_resistivity above.
@@ -1905,7 +1938,8 @@ void FiniteDifferenceSolver::HybridPICSolveECartesian (
                 const auto rho_val_limited = (rho_dec < rho_floor)
                     ? rho_floor : std::max(rho_val, rho_floor);
 
-                Ez(i, j, k) = (enE_z - grad_Pe) / rho_val_limited;
+                Ez(i, j, k) = hall_div_nodes ? enE_z - grad_Pe / rho_val_limited
+                    : (enE_z - grad_Pe) / rho_val_limited;
             }
 
             // Resistive terms; see include_resistivity above.

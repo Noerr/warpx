@@ -550,11 +550,12 @@ public:
     /** Plasma density floor - if n < n_floor it will be set to n_floor */
     amrex::Real m_n_floor = 1.0;
 
-    /** Multimode RZ Ohm's law only: divide the Hall numerators (J - J_i) x B
-     *  by rho at the nodes (on the azimuthal sample grid) before averaging them
-     *  to the Yee points, instead of averaging the numerator and dividing by
-     *  the averaged rho. */
-    bool m_hall_divide_at_nodes = false;
+    /** Divide the Hall numerator (J - J_i) x B by rho at the nodes (in
+     *  multimode RZ, on the azimuthal sample grid) before averaging it to the
+     *  Yee points. The legacy ordering (false) averages the numerator and
+     *  divides by the averaged rho, which is not energy conserving where rho
+     *  varies on the grid scale and drives a grid-scale whistler there. */
+    bool m_hall_divide_at_nodes = true;
 
     /** Plasma resistivity */
     std::string m_eta_expression = "0.0";
